@@ -60,7 +60,7 @@ class TensorParallelPass(GraphPass):
             return graph
 
         g = graph.clone()
-        for node in g.topo_sort():
+        for node in g.topo_sort(debug=True):
             if node.op_type not in _MATMUL_OPS:
                 continue
             rule = _classify(node.scope)

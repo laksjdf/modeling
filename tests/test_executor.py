@@ -5,6 +5,7 @@ from python.zrt.ir.edge import Edge
 from python.zrt.ir.graph import OpGraph
 from python.zrt.ir.types import TensorMeta, DType
 from python.zrt.executor import DAGScheduler, Timeline, ScheduledOp
+from python.zrt.transform import TransformContext, ParallelConfig, StreamConfig, build_default_pipeline
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -264,3 +265,175 @@ def test_schedule_single_device_no_comm():
     assert tl.comm_time_us == pytest.approx(0.0)
     assert tl.overlap_us   == pytest.approx(0.0)
     assert tl.total_latency_us > 0.0
+
+
+# ── OverlapAnalyzer tests ─────────────────────────────────────────────────────
+
+def test_overlap_analyzer_no_comm():
+    """No communication nodes => no overlap."""
+    from python.zrt.executor import OverlapAnalyzer
+    a = _node("a", stream_id=0, stream_type="compute", latency_us=10.0)
+    b = _node("b", stream_id=0, stream_type="compute", latency_us=5.0)
+    g = _graph([a, b], [_edge("a", "b")])
+    tl = DAGScheduler().schedule(g)
+
+    report = OverlapAnalyzer().analyze(tl)
+    assert report.compute_us == pytest.approx(15.0)
+    assert report.comm_us == pytest.approx(0.0)
+    assert report.overlap_us == pytest.approx(0.0)
+    assert report.exposed_comm_us == pytest.approx(0.0)
+    assert report.critical_path_us == pytest.approx(15.0)
+
+
+def test_overlap_analyzer_fully_hidden_comm():
+    """Communication on separate stream, fully masked by compute."""
+    from python.zrt.executor import OverlapAnalyzer
+    root = _node("root", stream_id=0, stream_type="compute", latency_us=10.0)
+    compute = _node("comp", stream_id=0, stream_type="compute", latency_us=8.0)
+    comm = _node("c", stream_id=1, stream_type="comm", latency_us=5.0,
+                 op_type="comm.all_reduce", category="communication")
+    g = _graph([root, compute, comm],
+               [_edge("root", "compute"), _edge("root", "comm")])
+    tl = DAGScheduler().schedule(g)
+
+    report = OverlapAnalyzer().analyze(tl)
+    assert report.compute_us == pytest.approx(18.0)  # 10 + 8
+    assert report.comm_us == pytest.approx(5.0)
+    assert report.overlap_us == pytest.approx(5.0)  # fully overlapped
+    assert report.exposed_comm_us == pytest.approx(0.0)
+
+
+def test_overlap_analyzer_partial_overlap():
+    """Communication partially overlapped."""
+    from python.zrt.executor import OverlapAnalyzer
+    compute = _node("comp", stream_id=0, stream_type="compute", latency_us=3.0)
+    comm = _node("c", stream_id=1, stream_type="comm", latency_us=5.0,
+                 op_type="comm.all_reduce", category="communication")
+    g = _graph([compute, comm], [])
+    tl = DAGScheduler().schedule(g)
+
+    report = OverlapAnalyzer().analyze(tl)
+    assert report.compute_us == pytest.approx(3.0)
+    assert report.comm_us == pytest.approx(5.0)
+    # Both start at time 0, compute ends at 3, comm ends at 5
+    # Overlap interval: [0, 3], duration 3
+    assert report.overlap_us == pytest.approx(3.0)
+    assert report.exposed_comm_us == pytest.approx(2.0)
+    assert abs(report.overlap_ratio - 0.6) < 0.01
+
+
+# ── CommLatencyPass tests ──────────────────────────────────────────────────────
+
+def test_comm_latency_pass_intra_node():
+    """Single-node multi-card: use intra_node bandwidth."""
+    from python.zrt.transform.analysis.comm_latency import CommLatencyPass
+    from python.zrt.ir.types import TensorMeta, DType
+
+    # Create a comm node
+    comm_node = OpNode(
+        id="allreduce_0",
+        op_type="comm.all_reduce",
+        inputs=[TensorMeta.from_shape_dtype("in0", (1024, 1024), DType.BF16)],
+        outputs=[TensorMeta.from_shape_dtype("out0", (1024, 1024), DType.BF16)],
+        attrs={"group_size": 4, "collective": "all_reduce"},
+        category="communication",
+    )
+    g = OpGraph(name="test", phase="prefill",
+                nodes={"allreduce_0": comm_node}, edges=[])
+
+    import python.zrt.hardware.registry as hw_registry
+    hw = hw_registry.load("nvidia_h100_sxm")  # 8 GPUs per node
+    ctx = TransformContext(hw_spec=hw, parallel=ParallelConfig(tp=4))
+
+    # Run the pass
+    result = CommLatencyPass().run(g, ctx)
+    result_node = result.nodes["allreduce_0"]
+
+    # Should use intra_node bandwidth (NVLink)
+    assert result_node.annotations.get("cross_node") is False
+    latency = result_node.annotations.get("latency_us")
+    assert latency is not None and latency > 0.0
+
+
+def test_comm_latency_pass_cross_node():
+    """Multi-node: use inter_node bandwidth when group > intra_node devices."""
+    from python.zrt.transform.analysis.comm_latency import CommLatencyPass
+    from python.zrt.ir.types import TensorMeta, DType
+
+    comm_node = OpNode(
+        id="allreduce_0",
+        op_type="comm.all_reduce",
+        inputs=[TensorMeta.from_shape_dtype("in0", (1024, 1024), DType.BF16)],
+        outputs=[TensorMeta.from_shape_dtype("out0", (1024, 1024), DType.BF16)],
+        attrs={"group_size": 16, "collective": "all_reduce"},  # Exceed 8 GPUs per node
+        category="communication",
+    )
+    g = OpGraph(name="test", phase="prefill",
+                nodes={"allreduce_0": comm_node}, edges=[])
+
+    import python.zrt.hardware.registry as hw_registry
+    hw = hw_registry.load("nvidia_h100_sxm")
+    ctx = TransformContext(hw_spec=hw, parallel=ParallelConfig(tp=16))
+
+    result = CommLatencyPass().run(g, ctx)
+    result_node = result.nodes["allreduce_0"]
+
+    # Should use inter_node bandwidth (RoCE/IB)
+    assert result_node.annotations.get("cross_node") is True
+    latency = result_node.annotations.get("latency_us")
+    assert latency is not None and latency > 0.0
+
+
+def test_comm_latency_pass_zero_group_size():
+    """group_size=1: no communication needed."""
+    from python.zrt.transform.analysis.comm_latency import CommLatencyPass
+    from python.zrt.ir.types import TensorMeta, DType
+
+    comm_node = OpNode(
+        id="allreduce_0",
+        op_type="comm.all_reduce",
+        inputs=[TensorMeta.from_shape_dtype("in0", (1024, 1024), DType.BF16)],
+        outputs=[TensorMeta.from_shape_dtype("out0", (1024, 1024), DType.BF16)],
+        attrs={"group_size": 1, "collective": "all_reduce"},
+        category="communication",
+    )
+    g = OpGraph(name="test", phase="prefill",
+                nodes={"allreduce_0": comm_node}, edges=[])
+
+    import python.zrt.hardware.registry as hw_registry
+    hw = hw_registry.load("nvidia_h100_sxm")
+    ctx = TransformContext(hw_spec=hw)
+
+    result = CommLatencyPass().run(g, ctx)
+    result_node = result.nodes["allreduce_0"]
+
+    # Should be zero latency
+    assert result_node.annotations.get("latency_us") == pytest.approx(0.0)
+
+
+def test_comm_latency_pass_alltoall():
+    """All-to-all uses different latency formula."""
+    from python.zrt.transform.analysis.comm_latency import CommLatencyPass
+    from python.zrt.ir.types import TensorMeta, DType
+
+    comm_node = OpNode(
+        id="a2a_0",
+        op_type="comm.all_to_all",
+        inputs=[TensorMeta.from_shape_dtype("in0", (512, 512), DType.BF16)],
+        outputs=[TensorMeta.from_shape_dtype("out0", (512, 512), DType.BF16)],
+        attrs={"group_size": 8, "collective": "all_to_all"},
+        category="communication",
+    )
+    g = OpGraph(name="test", phase="prefill",
+                nodes={"a2a_0": comm_node}, edges=[])
+
+    import python.zrt.hardware.registry as hw_registry
+    hw = hw_registry.load("nvidia_h100_sxm")
+    ctx = TransformContext(hw_spec=hw, parallel=ParallelConfig(ep=8))
+
+    result = CommLatencyPass().run(g, ctx)
+    result_node = result.nodes["a2a_0"]
+
+    latency = result_node.annotations.get("latency_us")
+    assert latency is not None and latency > 0.0
+    assert result_node.annotations.get("comm_algorithm") == "all_to_all"

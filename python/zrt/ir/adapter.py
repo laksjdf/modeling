@@ -166,12 +166,24 @@ def records_to_opgraph(
 
     for rec in records:
         consumer_id = f"op_{rec['node_id']}"
+        consumer_idx = int(consumer_id.split("_")[1])
         for dst_idx, tid in enumerate(rec.get("_input_ids", [])):
             if tid not in tensor_producer:
                 continue
             producer_id, src_idx = tensor_producer[tid]
             if producer_id == consumer_id:
                 continue  # skip self-loops
+
+            # Skip backward edges (where producer comes after consumer in execution order)
+            # This handles KV cache aliasing in decode phase where tensors produced late
+            # should not feed back to earlier layers
+            producer_idx = int(producer_id.split("_")[1])
+            if producer_idx > consumer_idx:
+                logger.debug(
+                    "Skipping backward edge: %s (op %d) -> %s (op %d) for tensor %d",
+                    producer_id, producer_idx, consumer_id, consumer_idx, tid
+                )
+                continue
 
             # Look up the TensorMeta we built in pass 1
             producer_node = graph.nodes.get(producer_id)
@@ -301,11 +313,21 @@ def fused_records_to_opgraph(
     # ── Pass 3: create data-flow edges ────────────────────────────────────────
     for frec, (ext_in, ext_out) in zip(fused_records, io_list):
         consumer_id = f"fused_{frec['node_id']}"
+        consumer_idx = int(consumer_id.split("_")[1])
         for dst_idx, tid in enumerate(sorted(ext_in)):
             if tid not in tensor_producer:
                 continue
             producer_id = tensor_producer[tid]
             if producer_id == consumer_id:
+                continue
+
+            # Skip backward edges in fused graphs too
+            producer_idx = int(producer_id.split("_")[1])
+            if producer_idx > consumer_idx:
+                logger.debug(
+                    "Skipping backward edge in fused graph: %s (op %d) -> %s (op %d) for tensor %d",
+                    producer_id, producer_idx, consumer_id, consumer_idx, tid
+                )
                 continue
 
             producer_node = graph.nodes.get(producer_id)

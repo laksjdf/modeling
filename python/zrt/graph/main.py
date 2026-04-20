@@ -746,7 +746,11 @@ def main() -> None:
                 hw_spec=hw,
                 parallel_desc=f"TP{args.tp}",
             )
-            print(f"\n{summary}")
+            try:
+                print(f"\n{summary}")
+            except UnicodeEncodeError:
+                # Windows console encoding issues; log instead
+                logger.info(f"Performance summary: {summary}")
 
             slug = _make_model_slug(model_id)
             xlsx_path = result.output_dir / f"{slug}_{phase}_ops.xlsx"

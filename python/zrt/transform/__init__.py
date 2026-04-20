@@ -9,7 +9,10 @@ from python.zrt.transform.parallel import (
 )
 from python.zrt.transform.fusion import FusionPass
 from python.zrt.transform.optim import QuantizationPass, EPLBPass, SharedExpertPass, MTPPass
-from python.zrt.transform.analysis import FlopsPass, RooflinePass, StreamAssignPass
+from python.zrt.transform.analysis import FlopsPass, RooflinePass, StreamAssignPass, CommLatencyPass
+from python.zrt.transform.exporter import (
+    TransformedGraphExcelWriter, export_transformed_graph,
+)
 
 __all__ = [
     # ABC
@@ -22,5 +25,7 @@ __all__ = [
     "TensorParallelPass", "ExpertParallelPass", "CommInserterPass",
     "FusionPass",
     "QuantizationPass", "EPLBPass", "SharedExpertPass", "MTPPass",
-    "FlopsPass", "RooflinePass", "StreamAssignPass",
+    "FlopsPass", "RooflinePass", "CommLatencyPass", "StreamAssignPass",
+    # exporter
+    "TransformedGraphExcelWriter", "export_transformed_graph",
 ]

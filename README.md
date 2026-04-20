@@ -172,6 +172,144 @@ hf_models/
 
 ---
 
+## Transform Pipeline + 导出（Python API）
+
+### 完整工作流：抓图 → Transform → 导出
+
+```python
+from python.zrt.graph import run_trace_phases
+from python.zrt.graph.transform_runner import run_transform
+from python.zrt.transform import ParallelConfig, StreamConfig
+from pathlib import Path
+
+# Step 1: 抓原始图
+result = run_trace_phases(
+    model_id="Qwen/Qwen2.5-7B-Instruct",
+    num_layers=4,
+    batch_size=1,
+    seq_len=128,
+    phases=("prefill",),
+)
+raw_graph, fused_graph = result.graphs["prefill"]
+output_base = Path("output/graph/Qwen2.5-7B-Instruct")
+
+# Step 2: Transform + 导出（TP=1 baseline）
+output_dir, transformed_graph = run_transform(
+    raw_graph=raw_graph,
+    output_dir=output_base,
+    parallel_config=ParallelConfig(tp=1),     # 单卡，无 TP/EP/PP/DP
+    stream_config=StreamConfig(num_compute_streams=1, num_comm_streams=1),
+    hw_spec=hw_spec,  # 可选，用于性能估算
+)
+# 输出：
+#   - {output_base}/Qwen2.5-7B-Instruct_transformed_ops.xlsx  (5个Sheet)
+#   - {output_base}/Qwen2.5-7B-Instruct_transformed_graph.json
+
+# Step 3: Transform + 导出（TP=4）
+_, transformed_graph_tp4 = run_transform(
+    raw_graph=raw_graph,
+    output_dir=output_base,
+    parallel_config=ParallelConfig(tp=4),     # TP=4：4卡张量并行
+    stream_config=StreamConfig(num_compute_streams=1, num_comm_streams=1),
+    hw_spec=hw_spec,
+)
+```
+
+### `run_transform()` 参数说明
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `raw_graph` | OpGraph | — | 从 `run_trace_phases()` 获取的原始图 |
+| `output_dir` | Path | — | 输出目录（自动创建） |
+| `parallel_config` | ParallelConfig | `ParallelConfig()` | TP/EP/PP/DP/SP 配置 |
+| `stream_config` | StreamConfig | `StreamConfig(1, 1)` | 计算流数 + 通信流数 |
+| `pipeline` | TransformPipeline | `build_default_pipeline()` | 自定义 transform 管道 |
+| `hw_spec` | HardwareSpec | `A100_40GB` | GPU 规格（用于 FLOPs 估算） |
+
+### 导出文件详解
+
+#### Excel：`*_transformed_ops.xlsx`（5个Sheet）
+
+| Sheet | 内容 |
+|-------|------|
+| **Metadata** | 图的基本信息 + 并行策略 + 流配置 |
+| **Transformed Operators** | 所有算子（注入了 FLOPs / 延迟 / bound / stream_id） |
+| **Communication Ops** | 通信算子详情（all-reduce / all-to-all / send-recv） |
+| **Parallelism Summary** | 按层统计计算/通信/内存算子数 + 并行类型 |
+| **Stream Assignment** | 流分配统计（哪些节点在 compute/comm stream） |
+
+#### JSON：`*_transformed_graph.json`
+
+结构化数据（用于自动化分析）：
+```json
+{
+  "graph": {
+    "name": "Qwen2.5-7B-Instruct",
+    "phase": "prefill",
+    "num_nodes": 150,
+    "num_edges": 200
+  },
+  "parallelism": {
+    "strategy": "TP=1, EP=1, PP=1, DP=1, SP=False",
+    "tp": 1, "ep": 1, "pp": 1, "dp": 1, "sp": false
+  },
+  "stream_config": {
+    "compute_streams": 1,
+    "comm_streams": 1
+  },
+  "nodes": [
+    {
+      "id": "op_0",
+      "op_type": "mm",
+      "category": "compute",
+      "scope": "layers.0.self_attn.q_proj",
+      "layer": "0",
+      "annotations": {
+        "flops": 134217728,
+        "latency_us": 12.5,
+        "bound": "compute",
+        "stream_id": 0,
+        "stream_type": "compute"
+      },
+      "input_shapes": [[1, 128, 4096]],
+      "output_shapes": [[1, 128, 4096]]
+    },
+    ...
+  ],
+  "edges": [...]
+}
+```
+
+### ParallelConfig 常见配置
+
+```python
+from python.zrt.transform import ParallelConfig
+
+# 单卡（baseline）
+ParallelConfig(tp=1)
+
+# TP=4（4卡张量并行，需要 4× all-reduce）
+ParallelConfig(tp=4)
+
+# TP=8 + EP=2（8卡 TP，2卡专家并行）
+ParallelConfig(tp=8, ep=2)
+
+# TP=4 + PP=2（4卡 TP，2阶段流水线）
+ParallelConfig(tp=4, pp=2)
+
+# TP=4 + DP=2（4卡 TP，2卡数据并行）
+ParallelConfig(tp=4, dp=2)
+
+# 序列并行（需 transformers 5.0+ 支持）
+ParallelConfig(tp=4, sp=True)
+
+# 获取配置描述
+cfg = ParallelConfig(tp=4, ep=2, pp=2)
+print(cfg.describe())  # "TP=4, EP=2, PP=2, DP=1, SP=False"
+```
+
+---
+
 ## 输出 Excel 说明
 
 工作簿包含 6 个 Sheet：
@@ -282,20 +420,56 @@ transformers 4.50+ 的 RoPE 实现会将 tensor 的 device type 直接传给 `to
 
 ```
 modeling/
-├── screenshot_ops.py              # 入口（转发到 package）
-├── screenshot_ops/
-│   ├── __init__.py                # 公开 API 导出
-│   ├── main.py                    # run_trace / build_config_summary / main
-│   ├── dispatch.py                # RecordingDispatch + TensorTracker
-│   ├── tracker.py                 # ModuleTracker（forward hooks）
-│   ├── fusion.py                  # FusionEngine + FusionSpec
-│   ├── model_loader.py            # 通用 HF 模型加载 + 兼容性修补
-│   ├── classifier.py              # 组件分类 + 颜色映射
-│   ├── excel_writer.py            # Excel + JSON 输出
-│   └── tensor_utils.py            # 张量工具 + SKIP_OPS
+├── e2e_check.py                   # 完整 e2e 流程（抓图 + transform + 导出 + 调度 + 性能报告）
 ├── test_screenshot_ops.py         # pytest 自验用例
 ├── requirements.txt               # 依赖声明
-└── hf_models/
+│
+├── python/zrt/graph/              # 图追踪模块（抓原始图）
+│   ├── __init__.py                # 公开 API: run_trace / run_trace_phases / load_model
+│   ├── main.py                    # CLI 入口
+│   ├── model_loader.py            # 通用 HF 模型加载 + 兼容性修补
+│   ├── dispatch.py                # RecordingDispatch + TensorTracker（aten 拦截）
+│   ├── tracker.py                 # ModuleTracker（forward hooks）
+│   ├── fusion.py                  # FusionEngine（两阶段算子融合）
+│   ├── classifier.py              # 组件分类 + 颜色映射
+│   ├── graph_builder.py           # build_op_graph / build_fused_op_graph
+│   ├── graph_exporter.py          # 导出 JSON / ONNX（原始图）
+│   ├── excel_writer.py            # Excel + JSON（原始图）
+│   ├── transform_runner.py        # run_transform: 原始图 → transform pipeline → 导出
+│   ├── patches.py                 # 运行时 patch（MoE、Indexer、legacy 属性）
+│   ├── compat.py                  # transformers 版本 shim + 本地模型注册表
+│   └── tensor_utils.py            # 张量工具 + SKIP_OPS
+│
+├── python/zrt/transform/          # Transform 管道模块（注入并行/流/通信）
+│   ├── __init__.py                # API 导出
+│   ├── context.py                 # TransformContext / ParallelConfig / StreamConfig
+│   ├── pipeline.py                # TransformPipeline / build_default_pipeline
+│   ├── passes/                    # 各种 transform 遍历（FLOPs / Roofline / Communication 等）
+│   ├── exporter.py                # export_transformed_graph: 导出 Excel/JSON（转换后的图）
+│   └── …
+│
+├── python/zrt/executor/           # 执行调度模块
+│   ├── dag_scheduler.py           # DAGScheduler（拓扑排序 + 流调度）
+│   └── …
+│
+├── python/zrt/simulator/          # 性能模拟
+│   └── …
+│
+├── python/zrt/report/             # 报告生成
+│   └── …
+│
+├── python/zrt/hardware/           # 硬件规格
+│   ├── spec.py                    # HardwareSpec 数据类
+│   ├── gpu.py                     # GPU_SPECS
+│   └── registry.py                # hw_registry.load("nvidia_h100_sxm")
+│
+├── python/zrt/ir/                 # 中间表示（IR）
+│   ├── graph.py                   # OpGraph
+│   ├── node.py                    # OpNode
+│   ├── edge.py                    # OpEdge
+│   └── tensor.py                  # Tensor（形状、dtype、内存占用）
+│
+└── hf_models/                     # 模型本地副本（只读！）
     ├── deepseek_v3/               # config.json + 建模代码（含 auto_map）
     ├── deepseek_v3_2/
     ├── llama3_8b/                 # 仅 config.json
@@ -305,6 +479,115 @@ modeling/
     ├── mistral_7b/
     ├── mixtral_8x7b/
     └── modeling_sources/
+```
+
+### 核心数据流
+
+```
+HF config.json
+       ↓
+    load_model()  ← model_loader.py
+       ↓ (返回 model, config, fake_mode)
+   forward pass  ← TorchDispatchMode (dispatch.py)
+       ↓
+ aten 算子序列   ← ModuleTracker (tracker.py)
+       ↓
+  raw OpGraph    ← graph_builder.py
+       ↓
+run_transform()  ← transform_runner.py [NEW]
+       ↓ (应用 transform pipeline)
+ transformed     ← pipeline.py
+ OpGraph         ← passes/
+       ↓
+ export 结果     ← exporter.py [NEW]
+       ↓
+  Excel/JSON     输出: metadata + operators + communication + parallelism + streams
+  
+       ↓ (可选)
+  DAGScheduler   ← executor.py (调度)
+       ↓
+  性能报告       ← report.py (TTFT / TPOT / MFU / 内存)
+```
+
+---
+
+## 自验输出文件
+
+### 方式一：运行 e2e_check.py（完整流程）
+
+```bash
+# 完整 e2e 检查：抓图 + transform (TP=1, TP=4) + 导出 Excel/JSON + 性能报告
+python e2e_check.py
+
+# 输出位置：
+# - output/graph/Qwen2.5-7B-Instruct/
+#   ├── Qwen2.5-7B-Instruct_transformed_ops.xlsx  (TP=1, 5个Sheet)
+#   ├── Qwen2.5-7B-Instruct_transformed_graph.json  (TP=1)
+#   ├── Qwen2.5-7B-Instruct_transformed_ops.xlsx  (TP=4 覆盖，需要改进)
+#   └── Qwen2.5-7B-Instruct_transformed_graph.json  (TP=4 覆盖，需要改进)
+```
+
+> **提示**：e2e_check.py 的 Step 8 会自动调用 `run_transform()` 导出结果。
+
+### 方式二：Python API（按需导出）
+
+```python
+from python.zrt.graph import run_trace_phases
+from python.zrt.graph.transform_runner import run_transform
+from python.zrt.transform import ParallelConfig, StreamConfig
+import python.zrt.hardware.registry as hw_registry
+from pathlib import Path
+
+model_id = "Qwen/Qwen2.5-7B-Instruct"
+
+# 步骤 1：抓图
+result = run_trace_phases(
+    model_id=model_id,
+    num_layers=4,
+    batch_size=1,
+    seq_len=128,
+    phases=("prefill",),
+)
+raw_graph, _ = result.graphs["prefill"]
+
+# 步骤 2：获取硬件规格
+hw = hw_registry.load("nvidia_h100_sxm")
+
+# 步骤 3a：导出 TP=1 版本
+output_dir = Path(f"output/graph/{model_id.split('/')[-1]}")
+_, _ = run_transform(
+    raw_graph=raw_graph,
+    output_dir=output_dir,
+    parallel_config=ParallelConfig(tp=1),
+    stream_config=StreamConfig(num_compute_streams=1, num_comm_streams=1),
+    hw_spec=hw,
+)
+print(f"✓ TP=1 导出到: {output_dir}")
+
+# 步骤 3b：导出 TP=4 版本（输出文件名相同，会覆盖）
+# 建议：为 TP=4 指定不同的输出目录
+output_dir_tp4 = Path(f"output/graph/{model_id.split('/')[-1]}_tp4")
+_, _ = run_transform(
+    raw_graph=raw_graph,
+    output_dir=output_dir_tp4,
+    parallel_config=ParallelConfig(tp=4),
+    stream_config=StreamConfig(num_compute_streams=1, num_comm_streams=1),
+    hw_spec=hw,
+)
+print(f"✓ TP=4 导出到: {output_dir_tp4}")
+```
+
+### 方式三：命令行（仅抓图，不做 transform）
+
+```bash
+# 抓图 + 自动应用默认 transform（TP=1）
+python -m python.zrt.graph.main Qwen/Qwen2.5-7B-Instruct --layers 4 -o output/my_qwen
+
+# 指定硬件规格（用于 FLOPs 估算）
+python -m python.zrt.graph.main Qwen/Qwen2.5-7B-Instruct --layers 4 --hw nvidia_h100_sxm
+
+# 测试 TP=4 配置（仅 transform，不修改原始图）
+python -m python.zrt.graph.main Qwen/Qwen2.5-7B-Instruct --layers 4 --tp 4 --hw nvidia_h100_sxm
 ```
 
 ---

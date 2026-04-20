@@ -257,3 +257,49 @@ def test_str_contains_key_fields():
     assert "MFU" in text
     assert "HBM BW util" in text
     assert "Throughput" in text
+
+
+# ── memory budget integration ────────────────────────────────────────────────
+
+def test_build_summary_with_memory_budget():
+    """Verify that memory_budget can be passed and stored in E2ESummary."""
+    from python.zrt.memory import MemoryBudget
+
+    n = _node("a", latency_us=1_000.0)
+    g = _graph([n], [])
+    tl = DAGScheduler().schedule(g)
+
+    budget = MemoryBudget(
+        weights_mb=100.0,
+        kv_cache_mb=50.0,
+        activation_peak_mb=30.0,
+        comm_buffer_mb=10.0,
+        framework_overhead_mb=5.0,
+        total_mb=195.0,
+        capacity_mb=80000.0,
+        is_feasible=True,
+    )
+
+    s = build_summary(
+        "DeepSeek-V3", "nvidia_h100_sxm", "prefill", 1, 128,
+        g, {"a": _sim("a", 1_000.0)}, tl, _hw(),
+        memory_budget=budget,
+    )
+
+    assert s.memory_budget is not None
+    assert s.memory_budget.total_mb == 195.0
+    assert s.memory_budget.is_feasible is True
+
+
+def test_build_summary_without_memory_budget():
+    """Verify backward compatibility: memory_budget is optional and defaults to None."""
+    n = _node("a", latency_us=1_000.0)
+    g = _graph([n], [])
+    tl = DAGScheduler().schedule(g)
+
+    s = build_summary(
+        "DeepSeek-V3", "nvidia_h100_sxm", "prefill", 1, 128,
+        g, {"a": _sim("a", 1_000.0)}, tl, _hw(),
+    )
+
+    assert s.memory_budget is None

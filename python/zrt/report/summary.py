@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from python.zrt.simulator.result import SimResult
     from python.zrt.executor.scheduler import Timeline
     from python.zrt.hardware.spec import HardwareSpec
+    from python.zrt.memory import MemoryBudget
 
 
 @dataclass
@@ -64,6 +65,9 @@ class E2ESummary:
     by_component: dict[str, float]              # component → % of total serial latency
     by_layer:     list[float]                   # per-layer latency (ms), ordered by index
     top_bottleneck_ops: list[tuple[str, float]] # [(op_desc, latency_us), ...]
+
+    # ── memory budget (optional) ──────────────────────────────────────────────
+    memory_budget: "MemoryBudget | None" = None    # memory breakdown estimate
 
     # ── string representation ─────────────────────────────────────────────────
 
@@ -130,6 +134,7 @@ def build_summary(
     hw_spec:       "HardwareSpec",
     parallel_desc: str = "single",
     top_n:         int = 10,
+    memory_budget: "MemoryBudget | None" = None,
 ) -> E2ESummary:
     """Build an E2ESummary from simulation outputs.
 
@@ -244,4 +249,5 @@ def build_summary(
         by_component   = by_component,
         by_layer       = by_layer,
         top_bottleneck_ops = top_bottleneck_ops,
+        memory_budget  = memory_budget,
     )

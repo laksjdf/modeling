@@ -86,7 +86,7 @@ class OpGraph:
         """All edges whose src == node_id."""
         return [e for e in self.edges if e.src == node_id]
 
-    def topo_sort(self) -> list[OpNode]:
+    def topo_sort(self, debug: bool = False) -> list[OpNode]:
         """Return nodes in topological order (Kahn's algorithm).
 
         Raises RuntimeError if the graph has a cycle.
@@ -106,9 +106,18 @@ class OpGraph:
                 if in_deg[s] == 0:
                     q.append(s)
         if len(result) != len(self.nodes):
+            unreachable = [nid for nid in self.nodes if nid not in {n.id for n in result}]
+            if debug:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.error(f"Cycle detected in {self.name}. Unreachable nodes ({len(unreachable)}):")
+                for nid in unreachable[:10]:
+                    preds = self._pred.get(nid, [])
+                    logger.error(f"  {nid}: {self.nodes[nid].op_type} (preds: {preds})")
             raise RuntimeError(
                 f"OpGraph '{self.name}' contains a cycle; "
-                f"only {len(result)}/{len(self.nodes)} nodes reached."
+                f"only {len(result)}/{len(self.nodes)} nodes reached. "
+                f"Unreachable: {unreachable[:5]}..."
             )
         return result
 

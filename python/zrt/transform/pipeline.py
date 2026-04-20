@@ -59,7 +59,7 @@ def build_default_pipeline() -> TransformPipeline:
     from python.zrt.transform.optim import (
         QuantizationPass, EPLBPass, SharedExpertPass, MTPPass,
     )
-    from python.zrt.transform.analysis import FlopsPass, RooflinePass, StreamAssignPass
+    from python.zrt.transform.analysis import FlopsPass, RooflinePass, CommLatencyPass, StreamAssignPass
 
     pipe = TransformPipeline()
 
@@ -87,6 +87,7 @@ def build_default_pipeline() -> TransformPipeline:
     # ── Stage 4: Analyze ──────────────────────────────────────────────────────
     pipe.add("analyze", FlopsPass())
     pipe.add("analyze", RooflinePass())
+    pipe.add("analyze", CommLatencyPass())  # Override comm latency with interconnect BW
     pipe.add("analyze", StreamAssignPass())
 
     return pipe
