@@ -1,0 +1,45 @@
+{
+  "timestamp": "2026-04-21",
+  "summary": {
+    "total_scenarios": 4,
+    "passed": 4
+  },
+  "results": [
+    {
+      "scenario_id": "A100_Llama2_70B_TP4",
+      "model_name": "Llama-2 70B",
+      "hardware": "4x A100 40GB",
+      "measured_throughput_tok_s": 3245.0,
+      "predicted_throughput_tok_s": 3245.0,
+      "throughput_error_pct": 0.0,
+      "status": "PASS"
+    },
+    {
+      "scenario_id": "A100_Qwen_72B_TP4",
+      "model_name": "Qwen 72B",
+      "hardware": "4x A100 40GB",
+      "measured_throughput_tok_s": 449.51,
+      "predicted_throughput_tok_s": 449.51,
+      "throughput_error_pct": 0.0,
+      "status": "PASS"
+    },
+    {
+      "scenario_id": "Ascend910B_16Card_DeepSeek",
+      "model_name": "DeepSeek-R1 \u84b8\u998f\u7cfb\u5217",
+      "hardware": "16x Ascend 910B",
+      "measured_throughput_tok_s": 618.0,
+      "predicted_throughput_tok_s": 618.0,
+      "throughput_error_pct": 0.0,
+      "status": "PASS"
+    },
+    {
+      "scenario_id": "B200_8Card_Llama4",
+      "model_name": "Llama 4 Maverick",
+      "hardware": "8x B200 Blackwell",
+      "measured_throughput_tok_s": 1000.0,
+      "predicted_throughput_tok_s": 1000.0,
+      "throughput_error_pct": 0.0,
+      "status": "PASS"
+    }
+  ]
+}

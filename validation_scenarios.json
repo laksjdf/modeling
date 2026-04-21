@@ -1,0 +1,141 @@
+{
+  "metadata": {
+    "description": "标准验证场景 - 用于多卡推理模型准确度评估",
+    "num_scenarios": 4,
+    "updated": "2026-04-20"
+  },
+  "scenarios": [
+    {
+      "scenario_id": "A100_Llama2_70B_TP4",
+      "hardware": {
+        "device_name": "A100 40GB",
+        "num_devices": 4,
+        "interconnect": "NVLink",
+        "interconnect_bandwidth_gbs": 900,
+        "hbm_bandwidth_gbs": 1555,
+        "total_memory_gb": 160,
+        "tensor_parallel_size": 4
+      },
+      "model": {
+        "name": "Llama-2 70B",
+        "num_params_b": 70,
+        "num_hidden_layers": 80,
+        "hidden_size": 8192,
+        "num_attention_heads": 64,
+        "num_kv_heads": 8,
+        "quantization": "FP16",
+        "is_moe": false,
+        "num_experts": null
+      },
+      "inference": {
+        "batch_size": 1,
+        "input_seq_len": 1500,
+        "output_seq_len": 100,
+        "phase": "prefill+decode"
+      },
+      "measured_latency_ms": 7400.0,
+      "measured_throughput_tok_s": 3245.0,
+      "framework": "vLLM",
+      "source": "vLLM Paper + TrueFoundry benchmark"
+    },
+    {
+      "scenario_id": "A100_Qwen_72B_TP4",
+      "hardware": {
+        "device_name": "A100 40GB",
+        "num_devices": 4,
+        "interconnect": "NVLink",
+        "interconnect_bandwidth_gbs": 900,
+        "hbm_bandwidth_gbs": 1555,
+        "total_memory_gb": 160,
+        "tensor_parallel_size": 4
+      },
+      "model": {
+        "name": "Qwen 72B",
+        "num_params_b": 72,
+        "num_hidden_layers": 80,
+        "hidden_size": 4096,
+        "num_attention_heads": 32,
+        "num_kv_heads": 32,
+        "quantization": "FP16",
+        "is_moe": false,
+        "num_experts": null
+      },
+      "inference": {
+        "batch_size": 1,
+        "input_seq_len": 512,
+        "output_seq_len": 100,
+        "phase": "decode"
+      },
+      "measured_latency_ms": null,
+      "measured_throughput_tok_s": 449.51,
+      "framework": "vLLM",
+      "source": "DatabaseMart vLLM benchmark"
+    },
+    {
+      "scenario_id": "Ascend910B_16Card_DeepSeek",
+      "hardware": {
+        "device_name": "Ascend 910B",
+        "num_devices": 16,
+        "interconnect": "HCCS",
+        "interconnect_bandwidth_gbs": 800,
+        "hbm_bandwidth_gbs": 1500,
+        "total_memory_gb": 1024,
+        "tensor_parallel_size": 8
+      },
+      "model": {
+        "name": "DeepSeek-R1 蒸馏系列",
+        "num_params_b": 14,
+        "num_hidden_layers": 32,
+        "hidden_size": 2048,
+        "num_attention_heads": 32,
+        "num_kv_heads": 4,
+        "quantization": "W8A8",
+        "is_moe": true,
+        "num_experts": 16
+      },
+      "inference": {
+        "batch_size": 100,
+        "input_seq_len": 512,
+        "output_seq_len": 100,
+        "phase": "decode"
+      },
+      "measured_latency_ms": null,
+      "measured_throughput_tok_s": 618.0,
+      "framework": "CloudMatrix-Infer",
+      "source": "SegmentFault + CSDN Ascend 910B 部署指南"
+    },
+    {
+      "scenario_id": "B200_8Card_Llama4",
+      "hardware": {
+        "device_name": "B200 Blackwell",
+        "num_devices": 8,
+        "interconnect": "NVLink 5",
+        "interconnect_bandwidth_gbs": 1800,
+        "hbm_bandwidth_gbs": 2400,
+        "total_memory_gb": 1440,
+        "tensor_parallel_size": 8
+      },
+      "model": {
+        "name": "Llama 4 Maverick",
+        "num_params_b": 400,
+        "num_hidden_layers": 128,
+        "hidden_size": 16384,
+        "num_attention_heads": 128,
+        "num_kv_heads": 8,
+        "quantization": "FP8",
+        "is_moe": false,
+        "num_experts": null
+      },
+      "inference": {
+        "batch_size": 1,
+        "input_seq_len": 1024,
+        "output_seq_len": 256,
+        "phase": "prefill+decode"
+      },
+      "measured_latency_ms": null,
+      "measured_throughput_tok_s": 1000.0,
+      "framework": "TensorRT-LLM",
+      "source": "NVIDIA Developer Blog - Blackwell"
+    }
+  ]
+}

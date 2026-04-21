@@ -1,0 +1,228 @@
+{
+  "metadata": {
+    "description": "多卡推理公开性能数据（用于模型验证）",
+    "updated": "2026-04-20",
+    "sources": {
+      "vllm_paper": "https://arxiv.org/pdf/2511.17593",
+      "ollama_databasemart": "https://www.databasemart.com/blog/ollama-gpu-benchmark-a100-40gb",
+      "ascend_tom_hardware": "https://www.tomshardware.com/tech-industry/artificial-intelligence/deepseek-research-suggests-huaweis-ascend-910c-delivers-60-percent-nvidia-h100-inference-performance",
+      "nvidia_b200_blog": "https://developer.nvidia.com/blog/blackwell-breaks-the-1000-tps-user-barrier-with-metas-llama-4-maverick",
+      "hf_transformers_perf": "https://huggingface.co/docs/transformers/en/perf_infer_gpu_multi"
+    }
+  },
+  "benchmarks": [
+    {
+      "id": "A100_Llama2_70B_TP4",
+      "hardware": {
+        "device": "NVIDIA A100 40GB",
+        "num_devices": 4,
+        "interconnect": "NVLink",
+        "interconnect_bandwidth_gbs": 900,
+        "total_memory_gb": 160
+      },
+      "model": {
+        "name": "Llama-2 70B",
+        "num_params_b": 70,
+        "quantization": "FP16"
+      },
+      "configuration": {
+        "tensor_parallel_size": 4,
+        "batch_size": 1,
+        "input_tokens": 1500,
+        "output_tokens": 100
+      },
+      "measured_metrics": {
+        "latency_ms": 7400.0,
+        "throughput_tok_s": 3245.0,
+        "framework": "vLLM",
+        "note": "vLLM vs HF TGI comparison: vLLM 2.1x higher throughput"
+      },
+      "source": "vLLM paper + TrueFoundry benchmark"
+    },
+    {
+      "id": "A100_Qwen_72B_TP4",
+      "hardware": {
+        "device": "NVIDIA A100 40GB",
+        "num_devices": 4,
+        "interconnect": "NVLink",
+        "interconnect_bandwidth_gbs": 900,
+        "total_memory_gb": 160
+      },
+      "model": {
+        "name": "Qwen 72B",
+        "num_params_b": 72,
+        "quantization": "FP16"
+      },
+      "configuration": {
+        "tensor_parallel_size": 4,
+        "batch_size": 1
+      },
+      "measured_metrics": {
+        "throughput_tok_s": 449.51,
+        "tpot_ms": 92.95,
+        "framework": "vLLM",
+        "note": "Median TPOT for Qwen2.5 on A100"
+      },
+      "source": "DatabaseMart vLLM benchmark"
+    },
+    {
+      "id": "A100_DeepSeek_32B_TP2",
+      "hardware": {
+        "device": "NVIDIA A100 80GB",
+        "num_devices": 2,
+        "interconnect": "NVLink",
+        "interconnect_bandwidth_gbs": 900,
+        "total_memory_gb": 160
+      },
+      "model": {
+        "name": "DeepSeek-R1 32B",
+        "num_params_b": 32,
+        "quantization": "FP16"
+      },
+      "configuration": {
+        "tensor_parallel_size": 2,
+        "batch_size": 1
+      },
+      "measured_metrics": {
+        "throughput_tok_s": 36.36,
+        "framework": "Ollama",
+        "gpu_utilization_pct": 40
+      },
+      "source": "Ollama Dual A100 benchmark"
+    },
+    {
+      "id": "Ascend910C_SingleCard",
+      "hardware": {
+        "device": "Huawei Ascend 910C",
+        "num_devices": 1,
+        "memory_gb": 96,
+        "bandwidth_gbs": 1800
+      },
+      "model": {
+        "name": "Generic LLM",
+        "quantization": "FP16"
+      },
+      "configuration": {
+        "phase": "prefill"
+      },
+      "measured_metrics": {
+        "throughput_tok_s": 6688.0,
+        "note": "Single NPU prefill performance"
+      },
+      "source": "Huawei official / Tom's Hardware"
+    },
+    {
+      "id": "Ascend910C_SingleCard_Decode",
+      "hardware": {
+        "device": "Huawei Ascend 910C",
+        "num_devices": 1,
+        "memory_gb": 96,
+        "bandwidth_gbs": 1800
+      },
+      "model": {
+        "name": "Generic LLM",
+        "quantization": "FP16"
+      },
+      "configuration": {
+        "phase": "decode"
+      },
+      "measured_metrics": {
+        "throughput_tok_s": 1943.0,
+        "note": "Single NPU decode performance"
+      },
+      "source": "Huawei official / Tom's Hardware"
+    },
+    {
+      "id": "Ascend910B_16Card_DeepSeek",
+      "hardware": {
+        "device": "Huawei Ascend 910B",
+        "num_devices": 16,
+        "interconnect": "HCCS",
+        "cluster_scale": "2x 8卡服务器"
+      },
+      "model": {
+        "name": "DeepSeek-R1 蒸馏系列",
+        "quantization": "W8A8"
+      },
+      "configuration": {
+        "batch_size": "variable",
+        "concurrent_requests": 100
+      },
+      "measured_metrics": {
+        "throughput_tok_s": 618.0,
+        "single_card_baseline_tok_s": 11.3,
+        "latency_stability": "stable",
+        "note": "Multi-machine multi-card: 100并发下吞吐618 tok/s"
+      },
+      "source": "SegmentFault / CSDN - Ascend 910B 部署指南"
+    },
+    {
+      "id": "NVIDIA_B200_8Card_Llama4",
+      "hardware": {
+        "device": "NVIDIA B200 Blackwell",
+        "num_devices": 8,
+        "interconnect": "NVLink 5",
+        "interconnect_bandwidth_gbs": 1800,
+        "total_memory_gb": 1440
+      },
+      "model": {
+        "name": "Llama 4 Maverick",
+        "num_params_b": 400,
+        "quantization": "FP8"
+      },
+      "configuration": {
+        "batch_size_per_user": 1,
+        "concurrent_users": 1
+      },
+      "measured_metrics": {
+        "throughput_tok_s_per_user": 1000.0,
+        "throughput_tok_s_max": 72000.0,
+        "note": "DGX B200: 1000 TPS/user sustained; 72K TPS max throughput"
+      },
+      "source": "NVIDIA Developer Blog - Blackwell world record"
+    },
+    {
+      "id": "NVIDIA_B200_96Card_Qwen3.5",
+      "hardware": {
+        "device": "NVIDIA B200 Blackwell",
+        "num_devices": 96,
+        "cluster_scale": "large distributed",
+        "interconnect": "NVLink 5 + optical"
+      },
+      "model": {
+        "name": "Qwen 3.5 27B",
+        "num_params_b": 27,
+        "quantization": "FP8"
+      },
+      "configuration": {
+        "tensor_parallel_size": "variable",
+        "batch_size": "large"
+      },
+      "measured_metrics": {
+        "throughput_tok_s": 1100000.0,
+        "note": "GKE deployment: 1.1M tok/s sustained on 96 B200 GPUs"
+      },
+      "source": "Google Cloud - Medium article"
+    },
+    {
+      "id": "B200_DeepSeek_R1_Optimized",
+      "hardware": {
+        "device": "NVIDIA B200 Blackwell",
+        "num_devices": 8,
+        "interconnect": "NVLink 5"
+      },
+      "model": {
+        "name": "DeepSeek-R1",
+        "quantization": "NVFP4 optimized"
+      },
+      "configuration": {
+        "framework": "TensorRT LLM"
+      },
+      "measured_metrics": {
+        "latency_improvement": "significant",
+        "note": "TensorRT-LLM optimization for B200: pushing latency boundaries"
+      },
+      "source": "NVIDIA TensorRT-LLM blog"
+    }
+  ]
+}
