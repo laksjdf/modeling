@@ -1,0 +1,23 @@
+# 3D parallel strategy for Llama-3 70B on 64 H100s
+
+strategy:
+  tp: 8
+  cp: 1
+  pp: 2
+  ep: 1
+  dp: 4
+  micro_batch: 1
+  global_batch: 32      # 1 * 4 * 8 microbatches
+  pp_schedule: 1f1b
+  vpp_chunks: 1
+  cp_kind: none
+  zero_stage: 1
+  recompute:
+    per_layer:
+      dense: ["attn"]
+  offload: {opt_state: false, grads: false, params: false}
+  tp_overlap: none
+  ep_overlap: false
+  dualbatch: false
+  dp_overlap_in_bubble: true
+  optimizer: adam

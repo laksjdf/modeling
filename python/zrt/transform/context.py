@@ -60,11 +60,35 @@ class QuantConfig:
 
 
 @dataclass
+class TrainingConfig:
+    """Training-specific configuration for performance modelling."""
+
+    # Optimizer settings
+    optimizer: str = "adam"  # "adam", "adamw", "muon"
+    zero_stage: int = 1  # 0=none, 1=opt_state, 2=grads+opt, 3=weights+grads+opt
+
+    # Batch size
+    micro_batch: int = 1
+    global_batch: int = 32
+
+    # Recompute policy
+    recompute_policy: str = "none"  # "none", "full", "selective"
+
+    # Pipeline schedule
+    pp_schedule: str = "1f1b"  # "1f1b", "interleaved", "dualpipe"
+
+    @property
+    def num_microbatches(self) -> int:
+        return self.global_batch // self.micro_batch
+
+
+@dataclass
 class TransformContext:
     hw_spec:      "HardwareSpec"
     parallel:     ParallelConfig  = field(default_factory=ParallelConfig)
     stream_config: StreamConfig   = field(default_factory=StreamConfig)
     quant:        QuantConfig | None = None
+    training:     TrainingConfig | None = None  # Training-specific config
     optim_flags:  set[str]        = field(default_factory=set)
     phase:        str             = "prefill"
     profile:      Any             = None   # ModelProfile (optional)

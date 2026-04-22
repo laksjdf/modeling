@@ -7,9 +7,13 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
+try:
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
 
 from python.zrt.ir.graph import OpGraph
 from python.zrt.ir.node import OpNode
@@ -97,6 +101,8 @@ class TransformedGraphExcelWriter:
     """Write transformed OpGraph to Excel with parallelism, communication, and stream info."""
 
     def __init__(self):
+        if not HAS_OPENPYXL:
+            raise ImportError("openpyxl is required for Excel export. Install with: pip install openpyxl")
         self._header_fill = PatternFill(start_color="1a237e", end_color="1a237e", fill_type="solid")
         self._header_font = Font(bold=True, color="FFFFFF", size=11)
         self._comm_fill = PatternFill(start_color="ffebee", end_color="ffebee", fill_type="solid")
