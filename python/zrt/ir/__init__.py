@@ -22,6 +22,7 @@ Adapters (bridge to existing code)::
     from zrt.ir import nx_to_opgraph             # NetworkX DiGraph → OpGraph
     from zrt.ir import opgraph_to_nx             # OpGraph → NetworkX DiGraph
     from zrt.ir import records_pair_to_opgraphs  # (raw, fused) records → (OpGraph, OpGraph)
+    from zrt.ir import stitch_fwd_bwd           # (fwd_graph, bwd_graph) → unified training OpGraph
 
 Utilities::
 
@@ -63,6 +64,7 @@ from .adapter import (
     nx_to_opgraph,
     opgraph_to_nx,
     records_pair_to_opgraphs,
+    stitch_fwd_bwd,
 )
 
 __all__ = [
@@ -89,4 +91,5 @@ __all__ = [
     "nx_to_opgraph",
     "opgraph_to_nx",
     "records_pair_to_opgraphs",
+    "stitch_fwd_bwd",
 ]

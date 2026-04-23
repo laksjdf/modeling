@@ -295,6 +295,7 @@ def _trace_phase(
     past_key_values: Any = None,
     target_layers: Optional[List[int]] = None,
     gradient_checkpointing: bool = False,
+    tensor_tracker: Optional["TensorTracker"] = None,
 ) -> Tuple[List[Dict[str, Any]], "ModuleTracker", Any]:
     """Run one forward pass for *phase* and return ``(records, tracker, output)``.
 
@@ -361,7 +362,7 @@ def _trace_phase(
             model.gradient_checkpointing_enable()
             logger.info("Gradient checkpointing enabled.")
 
-    tensor_tracker = TensorTracker()
+    tensor_tracker = tensor_tracker or TensorTracker()
     tracker = ModuleTracker(model)
     recorder = RecordingDispatch(
         tensor_tracker=tensor_tracker,
@@ -864,6 +865,12 @@ def run_trace_phases(
     past_key_values: Any = None
     canonical_phases = [_PHASE_ALIASES.get(p, p) for p in phases]
 
+    # Create a shared TensorTracker for training phases so that tensor IDs are
+    # globally unique across train_forward and train_backward.  This enables
+    # exact tensor-ID matching in stitch_fwd_bwd.
+    has_training = any(p in _TRAINING_PHASES for p in canonical_phases)
+    shared_tracker = TensorTracker() if has_training else None
+
     try:
         for phase in canonical_phases:
             if graph_mode:
@@ -878,11 +885,13 @@ def run_trace_phases(
                     "Tracing %s phase (batch=%d, query_len=%d, grad=%s) …",
                     phase, batch_size, query_len, phase in _TRAINING_PHASES,
                 )
-                # target_layers filtering is done inside RecordingDispatch
+                # Pass shared tracker for training phases so IDs are unique
+                phase_tracker = shared_tracker if phase in _TRAINING_PHASES else None
                 records, tracker, output = _trace_phase(
                     model, config, batch_size, seq_len, phase, past_key_values,
                     target_layers=target_layers,
-                    gradient_checkpointing=gradient_checkpointing)
+                    gradient_checkpointing=gradient_checkpointing,
+                    tensor_tracker=phase_tracker)
                 logger.info("  Captured %d ops.", len(records))
 
                 # Pass KV cache from prefill into the subsequent decode pass.

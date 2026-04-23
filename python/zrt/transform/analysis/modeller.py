@@ -290,22 +290,45 @@ def estimate_training_from_graphs(
     # Run each phase through the training pipeline
     pipe = build_training_pipeline()
     results: dict[str, "OpGraph"] = {}
-    results["train_forward"] = pipe.run(forward_graph, ctx)
+
     if backward_graph is not None:
-        results["train_backward"] = pipe.run(backward_graph, ctx)
+        # Stitch forward + backward into a single unified graph
+        from python.zrt.ir.adapter import stitch_fwd_bwd
+        unified = stitch_fwd_bwd(forward_graph, backward_graph)
+        # Inject shared metadata into unified graph
+        for key, val in metadata.items():
+            if key not in unified.metadata:
+                unified.metadata[key] = val
+        results["unified"] = pipe.run(unified, ctx)
+    else:
+        results["train_forward"] = pipe.run(forward_graph, ctx)
 
-    # Aggregate: forward graph carries FLOPs/memory metadata.
-    fwd = results["train_forward"]
-    fwd_metrics = fwd.metadata.get("pipeline_metrics")
-    per_stage_ms = fwd_metrics.per_stage_ms if fwd_metrics else 0.0
+    # Aggregate metrics from the appropriate graph
+    if "unified" in results:
+        g = results["unified"]
+        pipeline_metrics = g.metadata.get("pipeline_metrics")
+        per_stage_ms = pipeline_metrics.per_stage_ms if pipeline_metrics else 0.0
+        memory_breakdown = g.metadata.get("memory_breakdown")
+        training_flops = g.metadata.get("training_flops", 0.0)
+        forward_flops = g.metadata.get("forward_flops", 0.0)
+        backward_flops = g.metadata.get("backward_flops", 0.0)
+        total_params = g.metadata.get("total_params", 0)
+    else:
+        fwd = results["train_forward"]
+        fwd_metrics = fwd.metadata.get("pipeline_metrics")
+        per_stage_ms = fwd_metrics.per_stage_ms if fwd_metrics else 0.0
 
-    bwd = results.get("train_backward")
-    if bwd:
-        bwd_metrics = bwd.metadata.get("pipeline_metrics")
-        if bwd_metrics:
-            per_stage_ms += bwd_metrics.per_stage_ms
+        bwd = results.get("train_backward")
+        if bwd:
+            bwd_metrics = bwd.metadata.get("pipeline_metrics")
+            if bwd_metrics:
+                per_stage_ms += bwd_metrics.per_stage_ms
 
-    memory_breakdown = fwd.metadata.get("memory_breakdown")
+        memory_breakdown = fwd.metadata.get("memory_breakdown")
+        training_flops = fwd.metadata.get("training_flops", 0.0)
+        forward_flops = fwd.metadata.get("forward_flops", 0.0)
+        backward_flops = fwd.metadata.get("backward_flops", 0.0)
+        total_params = fwd.metadata.get("total_params", 0)
 
     # Step time with 1F1B schedule
     # Correct formula: step = (M + pp - 1) * t_stage
@@ -320,7 +343,6 @@ def estimate_training_from_graphs(
     steady_steps = num_microbatches
 
     # MFU
-    training_flops = fwd.metadata.get("training_flops", 0.0)
     world_size = ctx.parallel.total_devices
     step_time_sec = step_time_ms / 1000.0
     achieved_flops = training_flops / step_time_sec if step_time_sec > 0 else 0.0
@@ -354,15 +376,15 @@ def estimate_training_from_graphs(
         step_time_ms=step_time_ms,
         per_stage_ms=per_stage_ms,
         mfu=mfu,
-        training_flops=fwd.metadata.get("training_flops", 0.0),
-        forward_flops=fwd.metadata.get("forward_flops", 0.0),
-        backward_flops=fwd.metadata.get("backward_flops", 0.0),
+        training_flops=training_flops,
+        forward_flops=forward_flops,
+        backward_flops=backward_flops,
         memory_breakdown=memory_breakdown.to_dict() if memory_breakdown else {},
         warmup_steps=warmup_steps,
         cooldown_steps=cooldown_steps,
         steady_steps=steady_steps,
         bubble_fraction=bubble_fraction,
-        total_params=fwd.metadata.get("total_params", 0),
+        total_params=total_params,
     )
 
 

@@ -570,3 +570,215 @@ def records_pair_to_opgraphs(
     raw   = records_to_opgraph(raw_records,   f"{name}_raw",   phase, metadata)
     fused = fused_records_to_opgraph(fused_records, f"{name}_fused", phase, metadata)
     return raw, fused
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. stitch_fwd_bwd  (forward + backward OpGraph → unified training OpGraph)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Scope suffixes that carry trainable weight parameters.
+_PARAM_SCOPE_SUFFIXES = (
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "gate_proj", "up_proj", "down_proj",
+    "embed_tokens", "lm_head",
+    "q_a_proj", "kv_a_proj", "q_b_proj", "kv_b_proj",
+    "shared_expert.gate_proj", "shared_expert.up_proj", "shared_expert.down_proj",
+)
+
+# Op types that represent weight/parameter reads (as opposed to data-path ops).
+_PARAM_READ_OPS = frozenset({
+    "aten.mm.default", "aten.addmm.default", "aten.linear.default",
+    "aten.bmm.default", "aten.matmul.default",
+    "aten.embedding.default",
+    "aten._convolution.default",
+})
+
+
+def _is_param_node(node: OpNode) -> bool:
+    """Heuristic: does this node read a weight parameter?
+
+    Detects by either:
+    1. Scope-suffix match (Llama/DeepSeek-style naming) + param-read op type.
+    2. Op type alone for embedding/conv ops (always param reads).
+    """
+    if node.op_type not in _PARAM_READ_OPS:
+        return False
+    # Embedding and conv ops are always parameter reads regardless of scope
+    if node.op_type in ("aten.embedding.default", "aten._convolution.default"):
+        return True
+    scope = node.scope
+    return any(scope.rstrip(".").endswith(s) for s in _PARAM_SCOPE_SUFFIXES)
+
+
+def stitch_fwd_bwd(
+    fwd_graph: OpGraph,
+    bwd_graph: OpGraph,
+    name: str | None = None,
+) -> OpGraph:
+    """Merge a forward and backward *OpGraph* into a single unified graph.
+
+    The result represents one complete training step (single rank, single PP
+    stage).  Backward node IDs are prefixed with ``"bwd_"`` to avoid
+    collisions with forward IDs.  Every node receives an ``annotations["phase"]``
+    of ``"fwd"`` or ``"bwd"``, and weight-read nodes are annotated with
+    ``annotations["is_param"] = True``.
+
+    Cross-graph dependency edges are added when a backward node consumes a
+    tensor that was produced by a forward node.  Matching uses **tensor ID**
+    (when the same *TensorTracker* was shared across phases) as the primary
+    strategy, with (shape, dtype) as a fallback for tensors without IDs.
+
+    Parameters
+    ----------
+    fwd_graph : OpGraph
+        Computation graph from a ``train_forward`` trace.
+    bwd_graph : OpGraph
+        Computation graph from a ``train_backward`` trace.
+    name : str or None
+        Name for the unified graph.  Defaults to ``fwd_graph.name``.
+
+    Returns
+    -------
+    OpGraph
+        Unified graph with ``phase="train"``.
+    """
+    combined = OpGraph(
+        name=name or fwd_graph.name,
+        phase="train",
+        metadata={
+            **bwd_graph.metadata,     # bwd first so fwd wins on conflicts
+            **fwd_graph.metadata,
+            "fwd_graph_name": fwd_graph.name,
+            "bwd_graph_name": bwd_graph.name,
+            "fwd_metadata": dict(fwd_graph.metadata),
+            "bwd_metadata": dict(bwd_graph.metadata),
+        },
+    )
+
+    # ── Phase 1: add forward nodes ──────────────────────────────────────────
+    for node in fwd_graph:
+        n = node.clone()
+        n.annotations["phase"] = "fwd"
+        if _is_param_node(n):
+            n.annotations["is_param"] = True
+        combined.add_node(n)
+
+    # ── Phase 2: add backward nodes (with bwd_ prefix) ─────────────────────
+    for node in bwd_graph:
+        n = node.clone()
+        n.id = f"bwd_{n.id}"
+        n.annotations["phase"] = "bwd"
+        combined.add_node(n)
+
+    # ── Phase 3: copy forward→forward edges ─────────────────────────────────
+    for edge in fwd_graph.edges:
+        combined.add_edge(Edge(
+            src=edge.src,
+            src_idx=edge.src_idx,
+            dst=edge.dst,
+            dst_idx=edge.dst_idx,
+            tensor=edge.tensor,
+            tensor_id=edge.tensor_id,
+        ))
+
+    # ── Phase 4: copy backward→backward edges (prefixed IDs) ────────────────
+    for edge in bwd_graph.edges:
+        combined.add_edge(Edge(
+            src=f"bwd_{edge.src}",
+            src_idx=edge.src_idx,
+            dst=f"bwd_{edge.dst}",
+            dst_idx=edge.dst_idx,
+            tensor=edge.tensor,
+            tensor_id=edge.tensor_id,
+        ))
+
+    # ── Phase 5: cross-graph dependency edges ───────────────────────────────
+    # Primary strategy: match by tensor_id (exact, when shared TensorTracker)
+    # Fallback: match by (shape, dtype) with same-layer preference
+    fwd_id_index: dict[str, tuple[str, int]] = {}  # tensor_id_str → (node_id, slot)
+    fwd_tensor_index: dict[tuple[tuple[int, ...], Any], list[tuple[str, int]]] = {}
+    for node in fwd_graph:
+        for slot, tmeta in enumerate(node.outputs):
+            fwd_id_index[tmeta.id] = (node.id, slot)
+            key = (tmeta.shape, tmeta.dtype)
+            fwd_tensor_index.setdefault(key, []).append((node.id, slot))
+
+    cross_edges = 0
+    for node in bwd_graph:
+        bwd_id = f"bwd_{node.id}"
+        for dst_idx, tmeta in enumerate(node.inputs):
+            fwd_node_id: str | None = None
+            src_idx = 0
+            matched_tensor: TensorMeta | None = None
+
+            # Strategy 1: exact tensor ID match
+            if tmeta.id in fwd_id_index:
+                fwd_node_id, src_idx = fwd_id_index[tmeta.id]
+                src_node = fwd_graph.nodes.get(fwd_node_id)
+                if src_node and src_idx < len(src_node.outputs):
+                    matched_tensor = src_node.outputs[src_idx]
+
+            # Strategy 2: shape+dtype heuristic with same-layer preference
+            if fwd_node_id is None:
+                key = (tmeta.shape, tmeta.dtype)
+                candidates = fwd_tensor_index.get(key)
+                if candidates:
+                    fwd_node_id, src_idx = _best_cross_match(
+                        candidates, node.layer, fwd_graph, node.scope)
+                    src_node = fwd_graph.nodes.get(fwd_node_id)
+                    if src_node and src_idx < len(src_node.outputs):
+                        matched_tensor = src_node.outputs[src_idx]
+
+            if fwd_node_id is None:
+                continue
+
+            combined.add_edge(Edge(
+                src=fwd_node_id,
+                src_idx=src_idx,
+                dst=bwd_id,
+                dst_idx=dst_idx,
+                tensor=matched_tensor or tmeta,
+            ))
+            cross_edges += 1
+
+    logger.debug(
+        "stitch_fwd_bwd: %d fwd + %d bwd nodes, %d cross-graph edges",
+        len(fwd_graph), len(bwd_graph), cross_edges,
+    )
+    return combined
+
+
+def _best_cross_match(
+    candidates: list[tuple[str, int]],
+    bwd_layer: str,
+    fwd_graph: OpGraph,
+    bwd_scope: str = "",
+) -> tuple[str, int]:
+    """Pick the best forward-output candidate for a backward input.
+
+    Priority order:
+    1. Same layer AND scope prefix match (most specific).
+    2. Same layer only.
+    3. Last candidate (LIFO — most recently produced tensor is most
+       likely the immediate input to the gradient op).
+    """
+    if len(candidates) == 1:
+        return candidates[0]
+
+    same_layer = []
+    for nid, slot in candidates:
+        fwd_node = fwd_graph.nodes.get(nid)
+        if fwd_node and fwd_node.layer == bwd_layer:
+            same_layer.append((nid, slot, fwd_node.scope))
+
+    if same_layer:
+        # Among same-layer candidates, prefer scope prefix match
+        if bwd_scope:
+            for nid, slot, scope in same_layer:
+                if bwd_scope.startswith(scope) or scope.startswith(bwd_scope):
+                    return (nid, slot)
+        # LIFO: return last same-layer candidate (most recently produced)
+        return (same_layer[-1][0], same_layer[-1][1])
+
+    # No same-layer match; LIFO fallback
+    return candidates[-1]

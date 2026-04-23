@@ -120,6 +120,16 @@ class RecordingDispatch(TorchDispatchMode):
         kwargs = kwargs or {}
         out = func(*args, **kwargs)
 
+        # Always track tensor IDs even when paused — this ensures forward tensors
+        # seen during a paused-forward pass of train_backward get IDs that persist
+        # when those same tensor objects appear as inputs to backward ops.
+        input_tensors = collect_tensors(args, kwargs)
+        output_tensors = collect_output_tensors(out)
+        for t in input_tensors:
+            self.tensor_tracker.get_id(t)
+        for t in output_tensors:
+            self.tensor_tracker.get_id(t)
+
         if not self.active:
             return out
 
@@ -128,9 +138,6 @@ class RecordingDispatch(TorchDispatchMode):
             op_short = func.overloadpacket.__name__
         except AttributeError:
             op_short = str(func.overloadpacket).split(".")[-1]
-
-        input_tensors = collect_tensors(args, kwargs)
-        output_tensors = collect_output_tensors(out)
 
         input_ids = [self.tensor_tracker.get_id(t) for t in input_tensors]
         output_ids = [self.tensor_tracker.get_id(t) for t in output_tensors]
