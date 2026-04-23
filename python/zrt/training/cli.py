@@ -35,10 +35,8 @@ def main():
     mt.add_argument("--hidden", type=int, default=7168, help="Hidden dimension (default: 7168)")
     mt.add_argument("--num-layers-full", type=int, default=None, help="Total layers in full model")
     # Hardware
-    mt.add_argument("--gpu-name", default="h100", help="GPU name (default: h100)")
-    mt.add_argument("--gpu-bf16-tflops", type=float, default=989, help="GPU BF16 TFLOP/s (default: 989)")
-    mt.add_argument("--gpu-hbm-gbps", type=float, default=3350, help="GPU HBM bandwidth GB/s (default: 3350)")
-    mt.add_argument("--gpu-hbm-gb", type=float, default=80, help="GPU HBM capacity GB (default: 80)")
+    mt.add_argument("--hw", default="nvidia_h100_sxm",
+                    help="Hardware registry name (see zrt.hardware.registry.list_available())")
     # Parallelism
     mt.add_argument("--tp", type=int, default=1)
     mt.add_argument("--pp", type=int, default=1)
@@ -77,20 +75,10 @@ def _cmd_estimate(config_path: str, output_path: str | None) -> None:
 
 
 def _cmd_model_training(args) -> None:
-    from zrt.hardware.spec import HardwareSpec, ComputeSpec, MemorySpec, InterconnectSpec, LinkSpec
+    from zrt.hardware import registry as hw_registry
     from zrt.transform.analysis import model_training
 
-    hw = HardwareSpec(
-        name=args.gpu_name,
-        vendor="nvidia",
-        device_type="gpu",
-        compute=ComputeSpec(bf16_tflops=args.gpu_bf16_tflops),
-        memory=MemorySpec(capacity_gb=args.gpu_hbm_gb, hbm_bandwidth_gbps=args.gpu_hbm_gbps),
-        interconnect=InterconnectSpec(
-            intra_node=LinkSpec(type="nvlink", num_devices=8, bandwidth_gbps=900, latency_us=1.0),
-            inter_node=LinkSpec(type="ib", num_devices=64, bandwidth_gbps=400, latency_us=5.0),
-        ),
-    )
+    hw = hw_registry.load(args.hw)
 
     total_params = int(args.total_params) if args.total_params is not None else None
 

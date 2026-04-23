@@ -14,17 +14,33 @@ from zrt.training.spec.strategy import (
 )
 from zrt.training.spec.system import GPU, NetTier, SystemSpec
 
+_MODELS_DIR = Path(__file__).parent.parent / "configs" / "models"
+
 
 def load_specs(config_path: str | Path) -> tuple[ModelSpec, SystemSpec, Strategy]:
     """Load model + system + strategy from a single YAML file."""
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
 
-    model = _parse_model(cfg["model"])
+    model = _resolve_model(cfg["model"])
     system = _parse_system(cfg["system"])
     strategy = _parse_strategy(cfg["strategy"])
 
     return model, system, strategy
+
+
+def _resolve_model(model_ref: str | dict) -> ModelSpec:
+    if isinstance(model_ref, str):
+        path = _MODELS_DIR / f"{model_ref}.yaml"
+        if not path.exists():
+            raise KeyError(
+                f"Model {model_ref!r} not found in {_MODELS_DIR}. "
+                f"Available: {[p.stem for p in sorted(_MODELS_DIR.glob('*.yaml'))]}"
+            )
+        with open(path) as f:
+            model_d = yaml.safe_load(f)
+        return _parse_model(model_d)
+    return _parse_model(model_ref)
 
 
 def _parse_model(d: dict) -> ModelSpec:
@@ -54,24 +70,31 @@ def _parse_model(d: dict) -> ModelSpec:
 
 
 def _parse_system(d: dict) -> SystemSpec:
-    gpu_d = d["gpu"]
+    from zrt.hardware import registry as hw_registry
+
+    hw = hw_registry.load(d["hw"])
+
     gpu = GPU(
-        name=gpu_d["name"],
-        flops_bf16=gpu_d["flops_bf16"],
-        flops_fp8=gpu_d.get("flops_fp8", gpu_d["flops_bf16"] * 2),
-        hbm_gb=gpu_d["hbm_gb"],
-        hbm_bw_gbps=gpu_d["hbm_bw_gbps"],
+        name=hw.name,
+        flops_bf16=hw.compute.bf16_tflops,
+        flops_fp8=hw.compute.fp8_tops or hw.compute.bf16_tflops * 2,
+        hbm_gb=hw.memory.capacity_gb,
+        hbm_bw_gbps=hw.memory.hbm_bandwidth_gbps,
     )
-
-    nets = []
-    for nd in d.get("nets", []):
-        nets.append(NetTier(
-            scope=nd["scope"],
-            bw_gbps=nd["bw_gbps"],
-            latency_us=nd["latency_us"],
-            topology=nd["topology"],
-        ))
-
+    nets = [
+        NetTier(
+            scope="intra_node",
+            bw_gbps=hw.interconnect.intra_node.bandwidth_gbps,
+            latency_us=hw.interconnect.intra_node.latency_us,
+            topology=hw.interconnect.intra_node.topology,
+        ),
+        NetTier(
+            scope="inter_node",
+            bw_gbps=hw.interconnect.inter_node.bandwidth_gbps,
+            latency_us=hw.interconnect.inter_node.latency_us,
+            topology=hw.interconnect.inter_node.topology,
+        ),
+    ]
     return SystemSpec(
         gpu=gpu,
         host_mem_gb=d.get("host_mem_gb", 256),

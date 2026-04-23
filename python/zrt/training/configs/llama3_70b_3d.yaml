@@ -1,4 +1,13 @@
-# 3D parallel strategy for Llama-3 70B on 64 H100s
+# Llama-3 70B training estimate — 3D parallel on 64 H100s
+# References model spec from models/llama3_70b.yaml + hw registry
+
+model: llama3_70b
+
+system:
+  hw: nvidia_h100_sxm
+  nodes: 8
+  gpus_per_node: 8
+  host_mem_gb: 2048
 
 strategy:
   tp: 8
@@ -7,17 +16,12 @@ strategy:
   ep: 1
   dp: 4
   micro_batch: 1
-  global_batch: 32      # 1 * 4 * 8 microbatches
+  global_batch: 32
   pp_schedule: 1f1b
-  vpp_chunks: 1
-  cp_kind: none
   zero_stage: 1
   recompute:
     per_layer:
       dense: ["attn"]
   offload: {opt_state: false, grads: false, params: false}
   tp_overlap: none
-  ep_overlap: false
-  dualbatch: false
-  dp_overlap_in_bubble: true
   optimizer: adam

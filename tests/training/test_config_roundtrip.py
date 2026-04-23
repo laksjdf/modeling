@@ -11,7 +11,7 @@ from zrt.training.search.report import report_to_dict, report_to_json, report_su
 from zrt.training.spec.model import LayerKind
 
 
-CONFIGS_DIR = Path(__file__).parent.parent.parent / "configs" / "training"
+CONFIGS_DIR = Path(__file__).parent.parent.parent / "python" / "zrt" / "training" / "configs"
 
 
 def test_parse_layers_list():
@@ -40,7 +40,7 @@ def test_config_loading():
     assert model.hidden == 8192
     assert model.num_heads == 64
     assert len(model.layers) == 80
-    assert system.gpu.name == "h100"
+    assert system.gpu.name == "NVIDIA H100 SXM"
     assert system.world_size == 64
     assert strategy.tp == 8
     assert strategy.pp == 2

@@ -1,0 +1,16 @@
+# Llama-3 70B dense model specification
+# Reference: https://huggingface.co/meta-llama/Meta-Llama-3-70B
+
+name: llama3-70b
+hidden: 8192
+ffn: 28672
+num_heads: 64
+num_kv_heads: 8       # GQA
+head_dim: 128
+vocab: 128256
+seq_len: 4096
+layers: "[dense]*80"
+param_dtype: bf16
+grad_dtype: fp32
+master_dtype: fp32
+act_dtype: bf16

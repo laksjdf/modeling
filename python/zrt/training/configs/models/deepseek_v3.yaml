@@ -1,0 +1,22 @@
+# DeepSeek-V3-like model specification
+# Reference: https://arxiv.org/pdf/2412.19437
+
+name: deepseek-v3
+hidden: 7168
+ffn: 18432
+num_heads: 128
+num_kv_heads: 128
+head_dim: 128
+vocab: 129280
+seq_len: 4096
+layers: "[dense]*1+[moe]*58+[mtp]*1"
+num_experts: 256
+moe_ffn: 1536         # per-expert FFN hidden
+top_k: 8
+capacity_factor: 1.0
+expert_imbalance: 0.10
+mtp_depth: 1
+param_dtype: bf16
+grad_dtype: fp32
+master_dtype: fp32
+act_dtype: bf16

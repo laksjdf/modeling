@@ -239,6 +239,19 @@ python -m python.zrt hf_models/llama3_8b --train --layers 2
 
 ### 训练建模 CLI 参数
 
+除了统一入口 `python -m python.zrt`，训练建模也可通过独立 CLI 使用：
+
+```bash
+# 基于捕获图的训练建模
+PYTHONPATH=python python -m zrt.training model-training \
+    hf_models/llama3_8b --num-layers 2 \
+    --hw nvidia_h100_sxm --tp 2 --dp 4
+
+# 基于 YAML 配置的训练估算（引用 model + hw registry）
+PYTHONPATH=python python -m zrt.training estimate \
+    --config python/zrt/training/configs/llama3_70b_3d.yaml
+```
+
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--pp` | `1` | 流水线并行度 |
@@ -736,13 +749,21 @@ modeling/
 ├── python/zrt/hardware/           # 硬件规格
 │   ├── spec.py                    # HardwareSpec 数据类
 │   ├── gpu.py                     # GPU_SPECS
-│   └── registry.py                # hw_registry.load("nvidia_h100_sxm")
+│   ├── registry.py                # hw_registry.load("nvidia_h100_sxm")
+│   └── configs/                   # 硬件配置 YAML (H100, A100, Ascend 910B/C, ...)
 │
 ├── python/zrt/ir/                 # 中间表示（IR）
 │   ├── graph.py                   # OpGraph
 │   ├── node.py                    # OpNode
 │   ├── edge.py                    # OpEdge
 │   └── tensor.py                  # Tensor（形状、dtype、内存占用）
+│
+├── python/zrt/training/           # 训练性能建模
+│   ├── cli.py                     # CLI: model-training / estimate 子命令
+│   ├── io/config_loader.py        # YAML 加载（model ref + hw registry + strategy）
+│   ├── configs/models/            # 模型规格 YAML（llama3_70b, deepseek_v3, ...）
+│   ├── configs/*.yaml             # 训练配置（引用 model + hw + strategy）
+│   └── ...                        # search/ spec/ compose/ 模块
 │
 └── hf_models/                     # 模型本地副本（只读！）
     ├── deepseek_v3/               # config.json + 建模代码（含 auto_map）
