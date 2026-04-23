@@ -19,7 +19,7 @@ _MODELS_DIR = Path(__file__).parent.parent / "configs" / "models"
 
 def load_specs(config_path: str | Path) -> tuple[ModelSpec, SystemSpec, Strategy]:
     """Load model + system + strategy from a single YAML file."""
-    with open(config_path) as f:
+    with open(config_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
     model = _resolve_model(cfg["model"])
@@ -37,7 +37,7 @@ def _resolve_model(model_ref: str | dict) -> ModelSpec:
                 f"Model {model_ref!r} not found in {_MODELS_DIR}. "
                 f"Available: {[p.stem for p in sorted(_MODELS_DIR.glob('*.yaml'))]}"
             )
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             model_d = yaml.safe_load(f)
         return _parse_model(model_d)
     return _parse_model(model_ref)

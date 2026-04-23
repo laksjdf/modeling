@@ -275,25 +275,27 @@ class TrainingPipelinePass(GraphPass):
             # Bottleneck stage (max per-stage fwd latency)
             per_stage_us = max(stage_latencies.values(), default=0.0)
         else:
-            # pp=1 (or stage_id not yet annotated): whole graph is one stage
+            # pp=1 (or stage_id not yet annotated): whole graph is scheduled as one
+            # unit. total_latency_us covers all pp stages linearly, so divide by pp.
             tl = sched.schedule(g)
-            per_stage_us = tl.total_latency_us
+            per_stage_us = tl.total_latency_us / pp
             if layer_scale != 1.0:
                 per_stage_us *= layer_scale
 
+        # 1F1B schedule formulas (standard):
+        #   step_time = (M + pp - 1) * t_stage
+        #   bubble     = (pp - 1) / (M + pp - 1)
+        #   steady_steps = M  (the M back-to-back 1F1B microbatches)
         warmup_steps = max(0, pp - 1)
         cooldown_steps = max(0, pp - 1)
         steady_steps = max(0, num_microbatches - pp + 1)
-        total_steps = warmup_steps + num_microbatches + cooldown_steps
+        effective_steps = num_microbatches + pp - 1
 
-        # 1F1B step time: warmup + M microbatches through bottleneck + cooldown
-        step_time_us = per_stage_us * total_steps
+        step_time_us = per_stage_us * effective_steps
         step_time_ms = step_time_us / 1000.0
         per_stage_ms = per_stage_us / 1000.0
 
-        bubble_fraction = (
-            (warmup_steps + cooldown_steps) / total_steps if total_steps > 0 else 0.0
-        )
+        bubble_fraction = (pp - 1) / effective_steps if effective_steps > 0 else 0.0
 
         training_flops = g.metadata.get("training_flops", 0.0)
         world_size = ctx.parallel.total_devices if ctx.parallel else 1

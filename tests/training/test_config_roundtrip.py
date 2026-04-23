@@ -70,9 +70,10 @@ def test_estimate_and_report():
     assert "Training Estimation Report" in summary
     assert "Step time" in summary
 
-    # Test JSON output
+    # Test JSON output — close file before unlink (required on Windows)
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
-        report_to_json(report, f.name)
-        assert os.path.exists(f.name)
-        assert os.path.getsize(f.name) > 0
-        os.unlink(f.name)
+        fname = f.name
+    report_to_json(report, fname)
+    assert os.path.exists(fname)
+    assert os.path.getsize(fname) > 0
+    os.unlink(fname)

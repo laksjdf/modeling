@@ -226,6 +226,6 @@ def test_steady_steps_equals_num_microbatches():
         result = TrainingPipelinePass().run(g, ctx)
 
     metrics = result.metadata["pipeline_metrics"]
-    assert metrics.steady_steps == M
+    assert metrics.steady_steps == M - pp + 1  # standard 1F1B: F+B pairs on stage 0
     assert metrics.warmup_steps == pp - 1
     assert metrics.cooldown_steps == pp - 1

@@ -66,11 +66,11 @@ class TrainFlopsPass(GraphPass):
         
         # Calculate read bytes
         for inp in inputs:
-            read_bytes += inp.memory_bytes
-        
+            read_bytes += inp.mem_bytes
+
         # Calculate write bytes
         for out in outputs:
-            write_bytes += out.memory_bytes
+            write_bytes += out.mem_bytes
         
         # Calculate FLOPs based on op type
         if op_type in ("aten.mm", "aten.linear", "aten.addmm"):
