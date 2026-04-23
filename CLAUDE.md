@@ -23,8 +23,8 @@ pytest tests/test_screenshot_ops.py -v -k "deepseek_v3"
 pytest tests/test_screenshot_ops.py -v -m "not network"
 
 # CLI: trace a model and export Excel
-python -m python.zrt.graph.main Qwen/Qwen2.5-7B-Instruct --layers 4
-python -m python.zrt.graph.main deepseek-ai/DeepSeek-V3-0324 --layers 4 --hw nvidia_h100_sxm --tp 8
+python -m python.zrt Qwen/Qwen2.5-7B-Instruct --layers 4
+python -m python.zrt deepseek-ai/DeepSeek-V3-0324 --layers 4 --hw nvidia_h100_sxm --tp 8
 
 # End-to-end validation
 python e2e_check.py

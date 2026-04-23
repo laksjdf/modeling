@@ -310,16 +310,16 @@ DAGScheduler.schedule(graph)
 
 ```bash
 # Basic tracing (downloads config only, not weights)
-python -m python.zrt.graph.main deepseek-ai/DeepSeek-V3-0324 --layers 4
+python -m python.zrt deepseek-ai/DeepSeek-V3-0324 --layers 4
 
 # Specify phases, output directory, hardware target
-python -m python.zrt.graph.main Qwen/Qwen2.5-7B-Instruct \
+python -m python.zrt Qwen/Qwen2.5-7B-Instruct \
     --layers 4 --phases prefill decode \
     --hw ascend_910b --tp 8 \
     -o output/qwen25_7b
 
 # Local config directory
-python -m python.zrt.graph.main ./hf_models/deepseek_v3 --layers 4
+python -m python.zrt ./hf_models/deepseek_v3 --layers 4
 ```
 
 Output per run:

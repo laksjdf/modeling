@@ -47,25 +47,25 @@ openpyxl>=3.1.0
 
 ```bash
 # HF Hub 模型（只下载 config.json，不下载权重）
-python -m python.zrt.graph.main deepseek-ai/DeepSeek-V3-0324 --layers 4
-python -m python.zrt.graph.main deepseek-ai/DeepSeek-V3      --layers 4
-python -m python.zrt.graph.main Qwen/Qwen2.5-7B-Instruct     --layers 4
-python -m python.zrt.graph.main mistralai/Mistral-7B-v0.1    --layers 2
+python -m python.zrt deepseek-ai/DeepSeek-V3-0324 --layers 4
+python -m python.zrt deepseek-ai/DeepSeek-V3      --layers 4
+python -m python.zrt Qwen/Qwen2.5-7B-Instruct     --layers 4
+python -m python.zrt mistralai/Mistral-7B-v0.1    --layers 2
 
 # 本地目录（包含 config.json 即可）
-python -m python.zrt.graph.main ./hf_models/deepseek_v3   --layers 4
-python -m python.zrt.graph.main ./hf_models/llama3_8b     --layers 2
+python -m python.zrt ./hf_models/deepseek_v3   --layers 4
+python -m python.zrt ./hf_models/llama3_8b     --layers 2
 
 # 仅抓 prefill 阶段；指定输出目录
-python -m python.zrt.graph.main Qwen/Qwen2.5-7B-Instruct --layers 4 --phases prefill -o output/my_run
+python -m python.zrt Qwen/Qwen2.5-7B-Instruct --layers 4 --phases prefill -o output/my_run
 
 # 抓图 + 打印性能报告（需指定硬件）
-python -m python.zrt.graph.main Qwen/Qwen2.5-7B-Instruct --layers 4 --hw nvidia_h100_sxm
-python -m python.zrt.graph.main deepseek-ai/DeepSeek-V3-0324 --layers 4 --hw nvidia_h100_sxm --tp 8
+python -m python.zrt Qwen/Qwen2.5-7B-Instruct --layers 4 --hw nvidia_h100_sxm
+python -m python.zrt deepseek-ai/DeepSeek-V3-0324 --layers 4 --hw nvidia_h100_sxm --tp 8
 
 # 向后兼容的 --model 简写
-python -m python.zrt.graph.main --model v3
-python -m python.zrt.graph.main --model v3.2
+python -m python.zrt --model v3
+python -m python.zrt --model v3.2
 ```
 
 输出文件默认保存在 `output/graph/<model_slug>/`，每个阶段（prefill / decode）各生成一组文件：`_ops.xlsx`、`_raw_graph.json/.onnx`、`_fused_graph.json/.onnx`。
@@ -126,18 +126,18 @@ output_dir, records = run_trace(
 
 ```bash
 # 快捷 flag：同时抓 train_forward + train_backward
-python -m python.zrt.graph.main Qwen/Qwen2.5-7B-Instruct --layers 2 --train
+python -m python.zrt deepseek-ai/DeepSeek-V3 --layers 2 --train
 
 # 等价写法（显式指定阶段列表）
-python -m python.zrt.graph.main Qwen/Qwen2.5-7B-Instruct --layers 2 \
+python -m python.zrt Qwen/Qwen2.5-7B-Instruct --layers 2 \
     --phases train_forward train_backward
 
 # 仅抓训练前向
-python -m python.zrt.graph.main Qwen/Qwen2.5-7B-Instruct --layers 2 \
+python -m python.zrt Qwen/Qwen2.5-7B-Instruct --layers 2 \
     --phases train_forward
 
 # 推理 + 训练混合（四阶段一次完成）
-python -m python.zrt.graph.main Qwen/Qwen2.5-7B-Instruct --layers 4 \
+python -m python.zrt Qwen/Qwen2.5-7B-Instruct --layers 4 \
     --phases prefill decode train_forward train_backward
 ```
 
@@ -231,10 +231,10 @@ print(f"反向图节点数: {raw_g.num_nodes()}")
 
 ```bash
 # 图模式抓 DSv3 训练计算图（前向 + 反向）
-python -m python.zrt.graph.main deepseek-ai/DeepSeek-V3 --layers 2 --phases train_backward --graph-mode
+python -m python.zrt deepseek-ai/DeepSeek-V3 --layers 2 --phases train_backward --graph-mode
 
 # 图模式抓推理阶段
-python -m python.zrt.graph.main deepseek-ai/DeepSeek-V3-0324 --layers 4 --phases prefill decode --graph-mode
+python -m python.zrt deepseek-ai/DeepSeek-V3-0324 --layers 4 --phases prefill decode --graph-mode
 ```
 
 ### Python API
@@ -762,13 +762,13 @@ print(f"✓ TP=4 导出到: {output_dir_tp4}")
 
 ```bash
 # 抓图 + 自动应用默认 transform（TP=1）
-python -m python.zrt.graph.main Qwen/Qwen2.5-7B-Instruct --layers 4 -o output/my_qwen
+python -m python.zrt Qwen/Qwen2.5-7B-Instruct --layers 4 -o output/my_qwen
 
 # 指定硬件规格（用于 FLOPs 估算）
-python -m python.zrt.graph.main Qwen/Qwen2.5-7B-Instruct --layers 4 --hw nvidia_h100_sxm
+python -m python.zrt Qwen/Qwen2.5-7B-Instruct --layers 4 --hw nvidia_h100_sxm
 
 # 测试 TP=4 配置（仅 transform，不修改原始图）
-python -m python.zrt.graph.main Qwen/Qwen2.5-7B-Instruct --layers 4 --tp 4 --hw nvidia_h100_sxm
+python -m python.zrt Qwen/Qwen2.5-7B-Instruct --layers 4 --tp 4 --hw nvidia_h100_sxm
 ```
 
 ---

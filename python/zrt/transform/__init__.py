@@ -16,6 +16,7 @@ from python.zrt.transform.analysis import (
 )
 from python.zrt.transform.exporter import (
     TransformedGraphExcelWriter, export_transformed_graph,
+    TrainingGraphExcelWriter, export_training_graphs,
 )
 
 __all__ = [
@@ -34,4 +35,5 @@ __all__ = [
     "estimate_training", "model_training", "TrainingReport",
     # exporter
     "TransformedGraphExcelWriter", "export_transformed_graph",
+    "TrainingGraphExcelWriter", "export_training_graphs",
 ]

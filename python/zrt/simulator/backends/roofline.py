@@ -817,3 +817,279 @@ class RooflineSimulator(OpSimulator):
         total_write = max(total_write, float(node.total_output_bytes()))
 
         return total_flops, total_read, total_write
+
+
+# ── Op formula string generation for Excel export ────────────────────────────
+# Returns dicts with keys: flops_sym, flops_num, read_sym, read_num, write_sym, write_num
+
+def _bw(node: "OpNode") -> int:
+    """Return dtype itemsize as int (avoids '2.0' in formula strings)."""
+    if node.inputs:
+        return int(node.inputs[0].dtype.itemsize)
+    if node.outputs:
+        return int(node.outputs[0].dtype.itemsize)
+    return 2
+
+
+def _mk(fs: str, fn: str, rs: str, rn: str, ws: str, wn: str) -> dict:
+    return {"flops_sym": fs, "flops_num": fn,
+            "read_sym": rs, "read_num": rn,
+            "write_sym": ws, "write_num": wn}
+
+
+def _fs_mm(node: "OpNode") -> dict:
+    if len(node.inputs) < 2: return _fs_default(node)
+    a, b = node.inputs[0], node.inputs[1]
+    if len(a.shape) < 2 or len(b.shape) < 2: return _fs_default(node)
+    M, K, N, bw = a.shape[-2], a.shape[-1], b.shape[-1], _bw(node)
+    return _mk("2·M·K·N", f"2·{M}·{K}·{N}",
+               "(M·K+K·N)·b", f"({M}·{K}+{K}·{N})·{bw}",
+               "M·N·b", f"{M}·{N}·{bw}")
+
+
+def _fs_addmm(node: "OpNode") -> dict:
+    if len(node.inputs) < 3: return _fs_default(node)
+    bias, mat1, mat2 = node.inputs[0], node.inputs[1], node.inputs[2]
+    if len(mat1.shape) < 2 or len(mat2.shape) < 2: return _fs_default(node)
+    M, K, N, bw = mat1.shape[0], mat1.shape[1], mat2.shape[1], _bw(node)
+    Nb = _numel(bias.shape)
+    return _mk("2·M·K·N+M·N", f"2·{M}·{K}·{N}+{M}·{N}",
+               "(M·K+K·N+|bias|)·b", f"({M}·{K}+{K}·{N}+{Nb})·{bw}",
+               "M·N·b", f"{M}·{N}·{bw}")
+
+
+def _fs_bmm(node: "OpNode") -> dict:
+    if len(node.inputs) < 2: return _fs_default(node)
+    a, b = node.inputs[0], node.inputs[1]
+    if len(a.shape) < 3 or len(b.shape) < 3: return _fs_mm(node)
+    B, M, K, N, bw = a.shape[0], a.shape[1], a.shape[2], b.shape[2], _bw(node)
+    return _mk("2·B·M·K·N", f"2·{B}·{M}·{K}·{N}",
+               "(B·M·K+B·K·N)·b", f"({B}·{M}·{K}+{B}·{K}·{N})·{bw}",
+               "B·M·N·b", f"{B}·{M}·{N}·{bw}")
+
+
+def _fs_linear(node: "OpNode") -> dict:
+    if len(node.inputs) < 2: return _fs_default(node)
+    inp, w = node.inputs[0], node.inputs[1]
+    if len(inp.shape) < 1 or len(w.shape) < 2: return _fs_default(node)
+    I, O, batch, bw = inp.shape[-1], w.shape[0], _numel(inp.shape[:-1]), _bw(node)
+    if len(node.inputs) >= 3:
+        Nb = _numel(node.inputs[2].shape)
+        return _mk("2·batch·I·O+batch·O", f"2·{batch}·{I}·{O}+{batch}·{O}",
+                   "(batch·I+O·I+O)·b", f"({batch}·{I}+{O}·{I}+{Nb})·{bw}",
+                   "batch·O·b", f"{batch}·{O}·{bw}")
+    return _mk("2·batch·I·O", f"2·{batch}·{I}·{O}",
+               "(batch·I+O·I)·b", f"({batch}·{I}+{O}·{I})·{bw}",
+               "batch·O·b", f"{batch}·{O}·{bw}")
+
+
+def _fs_linear_proj(node: "OpNode") -> dict:
+    if len(node.inputs) < 2: return _fs_default(node)
+    inp, w = node.inputs[0], node.inputs[1]
+    if len(inp.shape) < 1 or len(w.shape) < 2: return _fs_default(node)
+    I, N, batch, bw = inp.shape[-1], w.shape[-1], _numel(inp.shape[:-1]), _bw(node)
+    return _mk("2·batch·I·N", f"2·{batch}·{I}·{N}",
+               "(batch·I+I·N)·b", f"({batch}·{I}+{I}·{N})·{bw}",
+               "batch·N·b", f"{batch}·{N}·{bw}")
+
+
+def _fs_sdpa(node: "OpNode") -> dict:
+    if len(node.inputs) < 3: return _fs_default(node)
+    q, k = node.inputs[0], node.inputs[1]
+    if len(q.shape) < 4: return _fs_default(node)
+    N, H, Sq, D = q.shape[0], q.shape[1], q.shape[2], q.shape[3]
+    Sk, bw = (k.shape[2] if len(k.shape) >= 3 else Sq), _bw(node)
+    return _mk("4·N·H·Sq·Sk·D+5·N·H·Sq·Sk",
+               f"4·{N}·{H}·{Sq}·{Sk}·{D}+5·{N}·{H}·{Sq}·{Sk}",
+               "(Q+K+V)·b",
+               f"({N}·{H}·{Sq}·{D}+{N}·{H}·{Sk}·{D}+{N}·{H}·{Sk}·{D})·{bw}",
+               "N·H·Sq·D·b", f"{N}·{H}·{Sq}·{D}·{bw}")
+
+
+def _fs_rms_norm(node: "OpNode") -> dict:
+    if not node.inputs: return _fs_default(node)
+    inp = node.inputs[0]
+    N, W, bw = _numel(inp.shape), (inp.shape[-1] if inp.shape else 1), _bw(node)
+    return _mk("4·N", f"4·{N}", "(N+|W|)·b", f"({N}+{W})·{bw}", "N·b", f"{N}·{bw}")
+
+
+def _fs_layer_norm(node: "OpNode") -> dict:
+    if not node.inputs: return _fs_default(node)
+    inp = node.inputs[0]
+    N, W, bw = _numel(inp.shape), (inp.shape[-1] if inp.shape else 1), _bw(node)
+    return _mk("5·N", f"5·{N}", "(N+2·|W|)·b", f"({N}+2·{W})·{bw}", "N·b", f"{N}·{bw}")
+
+
+def _fs_add_norm(node: "OpNode") -> dict:
+    if not node.inputs: return _fs_default(node)
+    inp = node.inputs[0]
+    N, W, bw = _numel(inp.shape), (inp.shape[-1] if inp.shape else 1), _bw(node)
+    return _mk("6·N", f"6·{N}", "(2·N+|W|)·b", f"(2·{N}+{W})·{bw}", "N·b", f"{N}·{bw}")
+
+
+def _fs_softmax(node: "OpNode") -> dict:
+    if not node.inputs: return _fs_default(node)
+    inp = node.inputs[0]
+    N, bw = _numel(inp.shape), _bw(node)
+    return _mk("5·N", f"5·{N}", "N·b", f"{N}·{bw}", "N·b", f"{N}·{bw}")
+
+
+def _fs_elementwise(node: "OpNode", k: float, ks: str) -> dict:
+    if not node.outputs: return _fs_default(node)
+    out = node.outputs[0]
+    N, bw = _numel(out.shape), _bw(node)
+    ri = node.total_input_bytes()
+    return _mk(f"{ks}·N", f"{ks}·{N}", "Σ|inputs|·b", str(ri), "|output|·b", f"{N}·{bw}")
+
+
+def _fs_embedding(node: "OpNode") -> dict:
+    if not node.outputs: return _fs_default(node)
+    out = node.outputs[0]
+    N, bw = _numel(out.shape), _bw(node)
+    return _mk("0 (lookup)", "0", "|output|·b", f"{N}·{bw}", "|output|·b", f"{N}·{bw}")
+
+
+def _fs_gather(node: "OpNode") -> dict:
+    if not node.outputs: return _fs_default(node)
+    out = node.outputs[0]
+    N, bw = _numel(out.shape), _bw(node)
+    ri = node.total_input_bytes()
+    return _mk("0 (index)", "0", "Σ|inputs|·b", str(ri), "|output|·b", f"{N}·{bw}")
+
+
+def _fs_shape(node: "OpNode") -> dict:
+    if not node.outputs: return _mk("0", "0", "0", "0", "0", "0")
+    out = node.outputs[0]
+    N, bw = _numel(out.shape), _bw(node)
+    return _mk("0 (shape)", "0", "~|output|·b", f"~{N}·{bw}", "~|output|·b", f"~{N}·{bw}")
+
+
+def _fs_mlp(node: "OpNode") -> dict:
+    if len(node.inputs) < 2: return _fs_default(node)
+    h = node.inputs[0]
+    if len(h.shape) < 2: return _fs_default(node)
+    batch, H, bw = _numel(h.shape[:-1]), h.shape[-1], h.dtype.itemsize
+    ws = [w for w in node.inputs[1:] if len(w.shape) >= 2]
+    ri = h.mem_bytes + sum(w.mem_bytes for w in ws)
+    wo = node.outputs[0].mem_bytes if node.outputs else 0
+    return _mk("Σᵢ(2·batch·H·Oᵢ)+4·N_act",
+               f"Σ(2·{batch}·{H}·Oᵢ) [{len(ws)} weights]",
+               "hidden+Σweights·b", str(ri),
+               "|output|·b", str(wo))
+
+
+def _fs_comm(node: "OpNode") -> dict:
+    vol = sum(t.mem_bytes for t in node.outputs)
+    return _mk("0 (comm)", "0", "comm_vol·b", str(vol), "comm_vol·b", str(vol))
+
+
+def _fs_default(node: "OpNode") -> dict:
+    n_out = sum(_numel(o.shape) for o in node.outputs) if node.outputs else 1
+    ri, wo = node.total_input_bytes(), node.total_output_bytes()
+    return _mk("N_out", str(n_out), "Σ|inputs|·b", str(ri), "Σ|outputs|·b", str(wo))
+
+
+_EW_DISPATCH: dict[str, tuple] = {
+    "aten.add.Tensor": (1.0, "1"), "aten.add_.Tensor": (1.0, "1"),
+    "aten.add.Scalar": (1.0, "1"), "aten.sub.Tensor": (1.0, "1"),
+    "aten.sub.Scalar": (1.0, "1"), "aten.rsub.Scalar": (1.0, "1"),
+    "aten.rsub.default": (1.0, "1"), "aten.mul.Tensor": (1.0, "1"),
+    "aten.mul.Scalar": (1.0, "1"), "aten.div.Tensor": (1.0, "1"),
+    "aten.div.Scalar": (1.0, "1"), "aten.neg.default": (1.0, "1"),
+    "aten.abs.default": (1.0, "1"), "aten.relu.default": (1.0, "1"),
+    "aten.relu_.default": (1.0, "1"), "aten.tanh.default": (1.0, "1"),
+    "aten.exp.default": (1.0, "1"), "aten.log.default": (1.0, "1"),
+    "aten.sqrt.default": (1.0, "1"), "aten.rsqrt.default": (1.0, "1"),
+    "aten.pow.Tensor_Scalar": (1.0, "1"), "aten.pow.Tensor_Tensor": (1.0, "1"),
+    "aten.masked_fill.Scalar": (1.0, "1"), "aten.masked_fill_.Scalar": (1.0, "1"),
+    "aten.masked_fill.Tensor": (1.0, "1"),
+    "aten.mean.dim": (1.0, "1"), "aten.mean.default": (1.0, "1"),
+    "aten.sum.dim_IntList": (1.0, "1"), "aten.sum.default": (1.0, "1"),
+    "aten.amax.default": (1.0, "1"), "aten.amin.default": (1.0, "1"),
+    "aten.reciprocal.default": (2.0, "2"), "aten.clamp.default": (2.0, "2"),
+    "aten.clamp.Scalar": (2.0, "2"), "aten.clamp.Tensor": (2.0, "2"),
+    "aten.clamp_min.default": (2.0, "2"), "aten.clamp_max.default": (2.0, "2"),
+    "aten.var.correction": (3.0, "3"),
+    "aten.silu.default": (4.0, "4"), "aten.silu_.default": (4.0, "4"),
+    "aten.gelu.default": (4.0, "4"), "aten.sigmoid.default": (4.0, "4"),
+    "aten.sin.default": (10.0, "10"), "aten.cos.default": (10.0, "10"),
+    "aten.atan2.default": (10.0, "10"),
+}
+
+_FORMULA_DISPATCH: dict[str, "callable"] = {
+    "aten.mm.default": _fs_mm, "aten.mm": _fs_mm,
+    "aten.addmm.default": _fs_addmm, "aten.addmm": _fs_addmm,
+    "aten.bmm.default": _fs_bmm, "aten.bmm": _fs_bmm,
+    "aten.matmul.default": _fs_mm, "aten.matmul": _fs_mm,
+    "aten.linear.default": _fs_linear, "aten.linear": _fs_linear,
+    "aten._scaled_dot_product_flash_attention.default": _fs_sdpa,
+    "aten.scaled_dot_product_attention.default": _fs_sdpa,
+    "aten._scaled_dot_product_efficient_attention.default": _fs_sdpa,
+    "aten.layer_norm.default": _fs_layer_norm, "aten.layer_norm": _fs_layer_norm,
+    "aten.native_layer_norm.default": _fs_layer_norm,
+    "aten._softmax.default": _fs_softmax, "aten.softmax.int": _fs_softmax,
+    "aten.special_softmax.int": _fs_softmax,
+    "aten.embedding.default": _fs_embedding,
+    "aten.index.Tensor": _fs_gather, "aten.index_select.default": _fs_gather,
+    "aten.gather.default": _fs_gather, "aten.scatter.src": _fs_gather,
+    "aten.scatter_.src": _fs_gather, "aten.scatter_add.default": _fs_gather,
+    "aten._to_copy.default": lambda n: _mk(
+        "0 (cast)", "0", "|input|·b_in", str(n.total_input_bytes()),
+        "|output|·b_out", str(n.total_output_bytes())),
+    "aten.copy_.default": lambda n: _mk(
+        "0 (copy)", "0", "Σ|inputs|·b", str(n.total_input_bytes()),
+        "Σ|outputs|·b", str(n.total_output_bytes())),
+    "aten.new_empty.default": lambda n: _mk(
+        "0 (alloc)", "0", "0", "0", "|output|·b", str(n.total_output_bytes())),
+    "aten.new_empty_strided.default": lambda n: _mk(
+        "0 (alloc)", "0", "0", "0", "|output|·b", str(n.total_output_bytes())),
+    "aten.fill_.Scalar": lambda n: _mk(
+        "0 (fill)", "0", "0", "0", "|output|·b", str(n.total_output_bytes())),
+    "aten.zero_.default": lambda n: _mk(
+        "0 (zero)", "0", "0", "0", "|output|·b", str(n.total_output_bytes())),
+    # fused semantic labels
+    "rms_norm": _fs_rms_norm, "layer_norm": _fs_layer_norm,
+    "add_rms_norm": _fs_add_norm, "add_layer_norm": _fs_add_norm,
+    "npu_add_rms_norm": _fs_add_norm, "norm_backward": _fs_add_norm,
+    "flash_attn": _fs_sdpa, "sdpa": _fs_sdpa, "sdpa_backward": _fs_sdpa,
+    "npu_fusion_attention": _fs_sdpa, "attn": _fs_sdpa, "attn_grad": _fs_sdpa,
+    "mla_attn": _fs_sdpa,
+    "gated_mlp": _fs_mlp, "gated_mlp_backward": _fs_mlp,
+    "mlp": _fs_mlp, "mlp_backward": _fs_mlp,
+    "moe_block": _fs_mlp, "moe_expert": _fs_mlp, "moe_shared": _fs_mlp,
+    "moe_gate": _fs_linear, "moe_gate_topk": _fs_linear,
+    "npu_moe_gate": _fs_linear, "npu_moe_gate_topk": _fs_linear,
+    "moe_dispatch": _fs_gather, "npu_moe_dispatch": _fs_gather,
+    "embedding": _fs_embedding, "embedding_backward": _fs_embedding,
+    "rope": lambda n: _fs_elementwise(n, 2.0, "2"),
+    "Linear": _fs_linear_proj, "lm_head": _fs_linear_proj,
+}
+
+
+def get_op_formulas(node: "OpNode") -> dict[str, str]:
+    """Return symbolic and numeric formula strings for a node (used for Excel export).
+
+    Returns a dict with keys:
+      flops_sym, flops_num  — compute formula (symbolic / with actual numbers)
+      read_sym,  read_num   — read bytes formula
+      write_sym, write_num  — write bytes formula
+    """
+    op = node.op_type
+
+    if node.is_comm:
+        return _fs_comm(node)
+
+    fn = _FORMULA_DISPATCH.get(op)
+    if fn is not None:
+        return fn(node)
+
+    ew = _EW_DISPATCH.get(op)
+    if ew is not None:
+        k, ks = ew
+        return _fs_elementwise(node, k, ks)
+
+    for prefix in _SHAPE_OP_PREFIXES:
+        if op.startswith(prefix):
+            return _fs_shape(node)
+
+    return _fs_default(node)
