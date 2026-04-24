@@ -119,3 +119,27 @@
 
 **Follow-up A（已修复）**：新增 `test_stitch_cross_edges_use_tensor_ids` 验证 tensor ID 主键匹配路径（69/69 pass）
 **Follow-up B（延迟）**：非 Llama/DeepSeek matmul 命名（c_attn, w1/w2/w3 等）延后至实际需要时处理
+
+## 已完成（2026-04-24）：Phase 4 — 高级调度、搜索与验证
+
+**设计文档**：`docs/training_modeller_zh.md` Phase 4
+
+**新增/修改文件**：
+- `python/zrt/training/compose/pipeline.py`：新增 `_interleaved_1f1b`、`_dualpipe`、`_dualpipe_v` 调度器
+- `python/zrt/training/compose/stage.py`：EP 负载不均衡因子应用于 MoE 算子
+- `python/zrt/training/search/sweep.py`：网格搜索 + 剪枝 + 帕累托前沿（~180 行）
+- `python/zrt/training/compose/chrome_trace.py`：Chrome tracing 格式导出（~280 行）
+- `tests/training/anchors/test_anchor_validation.py`：GPT-3/Llama-3/DeepSeek-V3 MFU 基准验证（6 测试）
+- `pytest.ini`：注册 `anchor` mark
+
+**核心设计**：
+- VPP/Interleaved 1F1B：bubble 公式 `(pp-1)/(vpp*M)`，warmup/cooldown 除以 vpp_chunks
+- DualPipe：并发 fwd+bwd，bubble 约为 I1F1B 的一半；`dualbatch=True` 时 EP A2A 隐藏
+- DualPipeV：VPP + DualPipe 组合，bubble `(pp-1)/(2*vpp*M)`
+- EP imbalance：MoE matmul/swiglu 算子时延乘 `1+expert_imbalance`
+- Sweep：剪枝规则（跨节点 TP 禁止、CP 仅 seq≥32k、EP 仅 num_experts>1）
+- Pareto：按 (step_time, peak_hbm) 双目标优化
+- Chrome Trace：每 PP 阶段一个 track，fwd/bwd 为 events
+
+**测试**：94/94 training tests pass（不含 anchor tests），零回归
+- 锚点测试：6 个测试收集成功，需 `pytest -m anchor` 运行

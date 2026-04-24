@@ -13,7 +13,7 @@ from zrt.training.io.perf_tables import achieved_bandwidth_efficiency, achieved_
 from zrt.training.models.comm import collective_time, tier_for_group, total_comm_time
 from zrt.training.models.flops import OpCost, op_cost
 from zrt.training.spec.dtype import Dtype
-from zrt.training.spec.model import ModelSpec
+from zrt.training.spec.model import LayerKind, ModelSpec
 from zrt.training.spec.strategy import Strategy
 from zrt.training.spec.system import SystemSpec
 
@@ -24,6 +24,7 @@ class StageTime:
     bwd: float = 0.0   # seconds (includes recompute + dx + dw)
     comm_fwd: float = 0.0  # exposed comm time during forward
     comm_bwd: float = 0.0  # exposed comm time during backward
+    expert_imbalance_factor: float = 0.0  # applied to MoE ops
 
 
 def op_to_time(
@@ -63,21 +64,29 @@ def stage_time(
     t_fwd = 0.0
     t_bwd = 0.0
 
+    imbalance = model.expert_imbalance if model.num_experts > 0 else 0.0
+
     for op in stage_ops:
         cost = op_cost(op, model)
+
+        is_expert_op = (
+            op.layer_kind == LayerKind.MOE
+            and op.kind in ("matmul", "swiglu")
+        )
+        imbalance_factor = 1.0 + imbalance if is_expert_op else 1.0
 
         if cost.bound == "compute":
             fwd_t = op_to_time(cost.fwd_flops, 0, "compute", system, gpu_name)
             dx_t = op_to_time(cost.dx_flops, 0, "compute", system, gpu_name)
             dw_t = op_to_time(cost.dw_flops, 0, "compute", system, gpu_name)
-            t_fwd += fwd_t
-            t_bwd += dx_t + dw_t
+            t_fwd += fwd_t * imbalance_factor
+            t_bwd += (dx_t + dw_t) * imbalance_factor
         else:
             fwd_t = op_to_time(0, cost.fwd_bytes, "memory", system, gpu_name)
             dx_t = op_to_time(0, cost.dx_bytes, "memory", system, gpu_name)
             dw_t = op_to_time(0, cost.dw_bytes, "memory", system, gpu_name)
-            t_fwd += fwd_t
-            t_bwd += dx_t + dw_t
+            t_fwd += fwd_t * imbalance_factor
+            t_bwd += (dx_t + dw_t) * imbalance_factor
 
     # Recompute: re-do forward for selected ops before backward
     recompute_t = _recompute_time(stage_ops, model, system, strategy, gpu_name)
@@ -97,7 +106,13 @@ def stage_time(
     t_fwd += t_comm_fwd
     t_bwd += t_comm_bwd
 
-    return StageTime(fwd=t_fwd, bwd=t_bwd, comm_fwd=t_comm_fwd, comm_bwd=t_comm_bwd)
+    return StageTime(
+        fwd=t_fwd,
+        bwd=t_bwd,
+        comm_fwd=t_comm_fwd,
+        comm_bwd=t_comm_bwd,
+        expert_imbalance_factor=imbalance,
+    )
 
 
 def _recompute_time(

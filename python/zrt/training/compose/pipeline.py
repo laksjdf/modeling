@@ -1,6 +1,9 @@
-"""Pipeline composer — 1F1B schedule → step time.
+"""Pipeline composer — multiple PP schedules → step time.
 
-Reference: Megatron-LM (Narayanan et al. 2021) §3.2.
+References:
+- 1F1B: Megatron-LM (Narayanan et al. 2021) §3.2
+- VPP/Interleaved: Megatron-LM 2.0 (Narayanan et al. 2021) §4
+- DualPipe: DeepSeek-V3 Technical Report §5.4
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ class StepResult:
     dp_ar_exposed: float = 0.0
     memory: MemBreakdown | None = None
     mfu: float = 0.0
+    schedule_name: str = "1f1b"
 
 
 def pipeline_step_time(
@@ -66,8 +70,13 @@ def pipeline_step_time(
     # Compose according to schedule
     if strategy.pp_schedule == PPSched.ONE_F_ONE_B:
         step = _one_f_one_b(stage_times, M, pp, dp_ar_time, strategy)
+    elif strategy.pp_schedule == PPSched.INTERLEAVED:
+        step = _interleaved_1f1b(stage_times, M, pp, dp_ar_time, strategy)
+    elif strategy.pp_schedule == PPSched.DUALPIPE:
+        step = _dualpipe(stage_times, M, pp, dp_ar_time, strategy)
+    elif strategy.pp_schedule == PPSched.DUALPIPE_V:
+        step = _dualpipe_v(stage_times, M, pp, dp_ar_time, strategy)
     else:
-        # Phase 1: default to 1F1B for unsupported schedules
         step = _one_f_one_b(stage_times, M, pp, dp_ar_time, strategy)
 
     step.per_stage = stage_times
@@ -109,6 +118,7 @@ def _one_f_one_b(
             steady=step * M,
             cooldown=0.0,
             dp_ar_exposed=dp_exposed,
+            schedule_name="1f1b",
         )
 
     # With pipeline parallelism
@@ -138,6 +148,7 @@ def _one_f_one_b(
         steady=steady,
         cooldown=cooldown,
         dp_ar_exposed=dp_exposed,
+        schedule_name="1f1b",
     )
 
 
@@ -189,3 +200,180 @@ def compute_mfu(
 
     mfu = model_flops / (peak * step_time)
     return min(mfu, 1.0)  # cap at 100%
+
+
+def _interleaved_1f1b(
+    stage_times: list[StageTime], M: int, pp: int,
+    dp_ar_time: float, strategy: Strategy,
+) -> StepResult:
+    """VPP / Interleaved 1F1B pipeline schedule.
+
+    Reference: Megatron-LM 2.0 (Narayanan et al. 2021) §4
+
+    Bubble formula: (pp - 1) / (vpp_chunks * M)
+
+    Each stage interleaves vpp_chunks microbatches, reducing bubble fraction
+    by factor of vpp_chunks compared to standard 1F1B.
+    """
+    vpp = strategy.vpp_chunks
+
+    if pp == 1:
+        st = stage_times[0] if stage_times else StageTime()
+        step = st.fwd + st.bwd
+        dp_exposed = dp_ar_time
+        ideal_step = M * (st.fwd + st.bwd)
+        return StepResult(
+            step_time=step * M + dp_exposed,
+            bubble_fraction=0.0,
+            warmup=0.0,
+            steady=step * M,
+            cooldown=0.0,
+            dp_ar_exposed=dp_exposed,
+            schedule_name="i1f1b",
+        )
+
+    t_fwd_max = max(st.fwd for st in stage_times) if stage_times else 0
+    t_bwd_max = max(st.bwd for st in stage_times) if stage_times else 0
+    t_stage_max = max(st.fwd + st.bwd for st in stage_times) if stage_times else 0
+
+    warmup = (pp - 1) * t_fwd_max / vpp
+    steady = M * t_stage_max
+    cooldown = (pp - 1) * t_bwd_max / vpp
+
+    bubble = warmup + cooldown
+    dp_exposed = dp_ar_time
+    if strategy.dp_overlap_in_bubble and dp_ar_time > 0:
+        hidden = min(bubble, dp_ar_time)
+        dp_exposed = dp_ar_time - hidden
+
+    step = warmup + steady + cooldown + dp_exposed
+
+    bubble_frac = (pp - 1) / (vpp * M) if M > 0 else 0.0
+
+    return StepResult(
+        step_time=step,
+        bubble_fraction=bubble_frac,
+        warmup=warmup,
+        steady=steady,
+        cooldown=cooldown,
+        dp_ar_exposed=dp_exposed,
+        schedule_name="i1f1b",
+    )
+
+
+def _dualpipe(
+    stage_times: list[StageTime], M: int, pp: int,
+    dp_ar_time: float, strategy: Strategy,
+) -> StepResult:
+    """DualPipe schedule from DeepSeek-V3.
+
+    Reference: DeepSeek-V3 Technical Report §5.4
+
+    Key insight: Each stage concurrently runs fwd of μbatch_i and bwd of μbatch_{i-1},
+    reducing bubble to approximately half of interleaved 1F1B.
+
+    When dualbatch=True, EP A2A is hidden by paired μbatch computation.
+    """
+    if pp == 1:
+        st = stage_times[0] if stage_times else StageTime()
+        step = max(st.fwd, st.bwd)
+        dp_exposed = dp_ar_time
+        ideal_step = M * (st.fwd + st.bwd)
+        return StepResult(
+            step_time=step * M + dp_exposed,
+            bubble_fraction=0.0,
+            warmup=0.0,
+            steady=step * M,
+            cooldown=0.0,
+            dp_ar_exposed=dp_exposed,
+            schedule_name="dualpipe",
+        )
+
+    t_fwd_max = max(st.fwd for st in stage_times) if stage_times else 0
+    t_bwd_max = max(st.bwd for st in stage_times) if stage_times else 0
+    t_stage_max = max(max(st.fwd, st.bwd) for st in stage_times) if stage_times else 0
+
+    warmup = (pp - 1) * t_fwd_max
+    steady = M * t_stage_max
+    cooldown = (pp - 1) * t_bwd_max
+
+    bubble = warmup + cooldown
+    dp_exposed = dp_ar_time
+    if strategy.dp_overlap_in_bubble and dp_ar_time > 0:
+        hidden = min(bubble, dp_ar_time)
+        dp_exposed = dp_ar_time - hidden
+
+    step = warmup + steady + cooldown + dp_exposed
+
+    bubble_frac = (pp - 1) / (2 * M) if M > 0 else 0.0
+
+    if strategy.dualbatch:
+        bubble_frac = bubble_frac * 0.5
+
+    return StepResult(
+        step_time=step,
+        bubble_fraction=bubble_frac,
+        warmup=warmup,
+        steady=steady,
+        cooldown=cooldown,
+        dp_ar_exposed=dp_exposed,
+        schedule_name="dualpipe",
+    )
+
+
+def _dualpipe_v(
+    stage_times: list[StageTime], M: int, pp: int,
+    dp_ar_time: float, strategy: Strategy,
+) -> StepResult:
+    """DualPipe-V (virtual pipeline parallel with dual batching).
+
+    Combines VPP interleaving with DualPipe concurrent fwd+bwd execution.
+
+    Bubble formula: (pp - 1) / (2 * vpp_chunks * M)
+    """
+    vpp = strategy.vpp_chunks
+
+    if pp == 1:
+        st = stage_times[0] if stage_times else StageTime()
+        step = max(st.fwd, st.bwd)
+        dp_exposed = dp_ar_time
+        return StepResult(
+            step_time=step * M + dp_exposed,
+            bubble_fraction=0.0,
+            warmup=0.0,
+            steady=step * M,
+            cooldown=0.0,
+            dp_ar_exposed=dp_exposed,
+            schedule_name="dualpipev",
+        )
+
+    t_fwd_max = max(st.fwd for st in stage_times) if stage_times else 0
+    t_bwd_max = max(st.bwd for st in stage_times) if stage_times else 0
+    t_stage_max = max(max(st.fwd, st.bwd) for st in stage_times) if stage_times else 0
+
+    warmup = (pp - 1) * t_fwd_max / vpp
+    steady = M * t_stage_max
+    cooldown = (pp - 1) * t_bwd_max / vpp
+
+    bubble = warmup + cooldown
+    dp_exposed = dp_ar_time
+    if strategy.dp_overlap_in_bubble and dp_ar_time > 0:
+        hidden = min(bubble, dp_ar_time)
+        dp_exposed = dp_ar_time - hidden
+
+    step = warmup + steady + cooldown + dp_exposed
+
+    bubble_frac = (pp - 1) / (2 * vpp * M) if M > 0 else 0.0
+
+    if strategy.dualbatch:
+        bubble_frac = bubble_frac * 0.5
+
+    return StepResult(
+        step_time=step,
+        bubble_fraction=bubble_frac,
+        warmup=warmup,
+        steady=steady,
+        cooldown=cooldown,
+        dp_ar_exposed=dp_exposed,
+        schedule_name="dualpipev",
+    )
