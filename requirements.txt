@@ -17,3 +17,5 @@ networkx>=3.0
 
 # onnx: export computation graph for Netron visualization
 onnx>=1.14.0
+
+openpyxl

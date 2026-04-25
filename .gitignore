@@ -1,5 +1,8 @@
 .claude/worktrees/
+.clauderules
+.idea
 __pycache__/
+.codemate
 AGENTS.md
 output
 .venv
@@ -14,3 +17,5 @@ SESSION_PROGRESS.md
 .omx/
 /.omc/
 .codex
+SESSION_HISTORY.md
+SESSION_PROGRESS.md
