@@ -26,6 +26,9 @@ class ModelSpec:
     # layer composition — order matters for PP balance
     layers: list[LayerKind]
 
+    # attention
+    attn_compression_ratio: float = 1.0
+
     # MoE (ignored when no MOE layers)
     num_experts: int = 0
     moe_ffn: int = 0
@@ -41,6 +44,14 @@ class ModelSpec:
     grad_dtype: Dtype = Dtype.FP32
     master_dtype: Dtype = Dtype.FP32
     act_dtype: Dtype = Dtype.BF16
+
+    def __post_init__(self) -> None:
+        self.attn_compression_ratio = float(self.attn_compression_ratio)
+        if not (0.0 < self.attn_compression_ratio <= 1.0):
+            raise ValueError(
+                "attn_compression_ratio must be in (0, 1], "
+                f"got {self.attn_compression_ratio}"
+            )
 
     @property
     def head_dim_total(self) -> int:

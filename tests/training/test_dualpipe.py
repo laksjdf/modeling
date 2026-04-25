@@ -8,6 +8,7 @@ from zrt.training.compose.pipeline import (
     DualPipeVComposer,
     OneF1BComposer,
     StepResult,
+    ZeroBubbleComposer,
 )
 from zrt.training.compose.stage import StageTime
 from zrt.training.spec.strategy import PPSched, Strategy
@@ -110,3 +111,42 @@ def test_standard_1f1b_schedule_identity():
     result = OneF1BComposer().compose(st, M, 4, 0.0, s)
 
     assert result.schedule_name == "1f1b"
+
+
+def test_zero_bubble_uses_weight_grad_to_reduce_bubble():
+    st = [
+        StageTime(fwd=0.01, bwd=0.02, bwd_dx=0.01, bwd_dw=0.01),
+        StageTime(fwd=0.01, bwd=0.02, bwd_dx=0.01, bwd_dw=0.01),
+        StageTime(fwd=0.01, bwd=0.02, bwd_dx=0.01, bwd_dw=0.01),
+        StageTime(fwd=0.01, bwd=0.02, bwd_dx=0.01, bwd_dw=0.01),
+    ]
+    s = _make_strategy(pp=4, schedule=PPSched.ZERO_BUBBLE)
+    M = s.num_microbatches()
+
+    zb = ZeroBubbleComposer().compose(st, M, 4, 0.0, s)
+    dp = DualPipeComposer().compose(st, M, 4, 0.0, _make_strategy(pp=4))
+
+    t_stage = 0.03
+    t_w = 0.01
+    expected = M * t_stage + (4 - 1) * (t_stage - t_w)
+    assert zb.step_time == pytest.approx(expected, rel=1e-9)
+    assert zb.bubble_fraction < dp.bubble_fraction
+    assert zb.schedule_name == "zb"
+
+
+def test_zero_bubble_uses_bottleneck_stage_weight_grad():
+    st = [
+        StageTime(fwd=0.01, bwd=0.03, bwd_dx=0.03, bwd_dw=0.00),
+        StageTime(fwd=0.01, bwd=0.02, bwd_dx=0.00, bwd_dw=0.02),
+        StageTime(fwd=0.01, bwd=0.02, bwd_dx=0.01, bwd_dw=0.01),
+        StageTime(fwd=0.01, bwd=0.02, bwd_dx=0.01, bwd_dw=0.01),
+    ]
+    s = _make_strategy(pp=4, schedule=PPSched.ZERO_BUBBLE)
+    M = s.num_microbatches()
+
+    zb = ZeroBubbleComposer().compose(st, M, 4, 0.0, s)
+
+    bottleneck_stage = 0.04
+    bottleneck_dw = 0.0
+    expected = M * bottleneck_stage + (4 - 1) * (bottleneck_stage - bottleneck_dw)
+    assert zb.step_time == pytest.approx(expected, rel=1e-9)

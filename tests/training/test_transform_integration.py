@@ -8,7 +8,7 @@ from zrt.transform.context import (
     TransformContext, ParallelConfig, TrainingConfig,
 )
 from zrt.transform.analysis import (
-    TrainingFlopsPass, TrainingMemoryPass, TrainingPipelinePass,
+    TrainFlopsPass, TrainingFlopsPass, TrainingMemoryPass, TrainingPipelinePass,
 )
 
 
@@ -108,6 +108,152 @@ def test_training_flops_pass():
     assert "backward_flops" in result.metadata
     assert result.metadata["training_flops"] > 0
     assert result.metadata["backward_flops"] == 2 * result.metadata["forward_flops"]
+
+
+def test_train_flops_pass_scales_attention_with_graph_compression_ratio():
+    """Graph-native attention FLOPs use graph-level compressed attention ratio."""
+    attn_node = OpNode(
+        id="attn_0",
+        op_type="aten.scaled_dot_product_attention",
+        inputs=[
+            TensorMeta(id="q", shape=(1, 1024, 4096), dtype=DType.BF16, mem_bytes=1*1024*4096*2),
+        ],
+        outputs=[
+            TensorMeta(id="out", shape=(1, 1024, 4096), dtype=DType.BF16, mem_bytes=1*1024*4096*2),
+        ],
+        scope="model.layers.0.self_attn",
+        category="compute",
+    )
+    graph = OpGraph(
+        name="test_model",
+        phase="train_forward",
+        nodes={"attn_0": attn_node},
+        edges=[],
+        metadata={"attn_compression_ratio": 0.27},
+    )
+    hw = _make_hardware_spec()
+    ctx = TransformContext(
+        hw_spec=hw,
+        parallel=ParallelConfig(tp=1, pp=1, dp=1),
+        training=TrainingConfig(micro_batch=1, global_batch=8),
+    )
+
+    result = TrainFlopsPass().run(graph, ctx)
+
+    dense_fwd = 2 * 1 * 1024 * 1024 * 64 * 64
+    expected_fwd = dense_fwd * 0.27
+    node = result.nodes["attn_0"]
+    assert node.annotations["flops_fwd"] == int(expected_fwd)
+    assert node.annotations["flops_dx"] == int(2.5 * expected_fwd)
+    assert node.annotations["flops_dw"] == 0
+
+
+def test_train_flops_pass_node_compression_ratio_overrides_graph_ratio():
+    """Node annotations can override graph-level compressed attention ratio."""
+    attn_node = OpNode(
+        id="attn_0",
+        op_type="aten.scaled_dot_product_attention",
+        inputs=[
+            TensorMeta(id="q", shape=(1, 512, 1024), dtype=DType.BF16, mem_bytes=1*512*1024*2),
+        ],
+        outputs=[
+            TensorMeta(id="out", shape=(1, 512, 1024), dtype=DType.BF16, mem_bytes=1*512*1024*2),
+        ],
+        scope="model.layers.0.self_attn",
+        category="compute",
+        annotations={"attn_compression_ratio": 0.5},
+    )
+    graph = OpGraph(
+        name="test_model",
+        phase="train_forward",
+        nodes={"attn_0": attn_node},
+        edges=[],
+        metadata={"attn_compression_ratio": 0.27},
+    )
+    hw = _make_hardware_spec()
+    ctx = TransformContext(
+        hw_spec=hw,
+        parallel=ParallelConfig(tp=1, pp=1, dp=1),
+        training=TrainingConfig(micro_batch=1, global_batch=8),
+    )
+
+    result = TrainFlopsPass().run(graph, ctx)
+
+    dense_fwd = 2 * 1 * 512 * 512 * 16 * 64
+    assert result.nodes["attn_0"].annotations["flops_fwd"] == int(dense_fwd * 0.5)
+
+
+def test_train_flops_pass_reads_attention_head_dim_from_attrs():
+    """Graph-native attention dimension inference should not hardcode 64."""
+    attn_node = OpNode(
+        id="attn_0",
+        op_type="aten.scaled_dot_product_attention",
+        inputs=[
+            TensorMeta(id="q", shape=(1, 40, 512, 80), dtype=DType.BF16, mem_bytes=1*40*512*80*2),
+        ],
+        outputs=[
+            TensorMeta(id="out", shape=(1, 512, 3200), dtype=DType.BF16, mem_bytes=1*512*3200*2),
+        ],
+        attrs={"heads": 40, "head_dim": 80},
+        scope="model.layers.0.self_attn",
+        category="compute",
+    )
+    graph = OpGraph(
+        name="test_model",
+        phase="train_forward",
+        nodes={"attn_0": attn_node},
+        edges=[],
+        metadata={},
+    )
+    hw = _make_hardware_spec()
+    ctx = TransformContext(
+        hw_spec=hw,
+        parallel=ParallelConfig(tp=1, pp=1, dp=1),
+        training=TrainingConfig(micro_batch=1, global_batch=8),
+    )
+
+    result = TrainFlopsPass().run(graph, ctx)
+
+    expected_fwd = 2 * 1 * 512 * 512 * 40 * 80
+    assert result.nodes["attn_0"].annotations["flops_fwd"] == expected_fwd
+    assert TrainFlopsPass()._attention_dims(attn_node, graph) == (1, 512, 40, 80)
+
+
+def test_train_flops_pass_invalid_compression_ratio_warns_and_uses_dense(caplog):
+    """Bad graph-native ratio annotations should not abort the whole pass."""
+    attn_node = OpNode(
+        id="attn_0",
+        op_type="aten.scaled_dot_product_attention",
+        inputs=[
+            TensorMeta(id="q", shape=(1, 512, 1024), dtype=DType.BF16, mem_bytes=1*512*1024*2),
+        ],
+        outputs=[
+            TensorMeta(id="out", shape=(1, 512, 1024), dtype=DType.BF16, mem_bytes=1*512*1024*2),
+        ],
+        scope="model.layers.0.self_attn",
+        category="compute",
+        annotations={"attn_compression_ratio": 1.5},
+    )
+    graph = OpGraph(
+        name="test_model",
+        phase="train_forward",
+        nodes={"attn_0": attn_node},
+        edges=[],
+        metadata={},
+    )
+    hw = _make_hardware_spec()
+    ctx = TransformContext(
+        hw_spec=hw,
+        parallel=ParallelConfig(tp=1, pp=1, dp=1),
+        training=TrainingConfig(micro_batch=1, global_batch=8),
+    )
+
+    with caplog.at_level("WARNING"):
+        result = TrainFlopsPass().run(graph, ctx)
+
+    dense_fwd = 2 * 1 * 512 * 512 * 16 * 64
+    assert result.nodes["attn_0"].annotations["flops_fwd"] == dense_fwd
+    assert "Invalid attn_compression_ratio=1.5 on node attn_0" in caplog.text
 
 
 def test_training_memory_pass_zero_1():

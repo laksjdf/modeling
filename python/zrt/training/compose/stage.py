@@ -23,6 +23,8 @@ from zrt.training.spec.system import SystemSpec
 class StageTime:
     fwd: float = 0.0
     bwd: float = 0.0
+    bwd_dx: float = 0.0
+    bwd_dw: float = 0.0
     comm_fwd: float = 0.0
     comm_bwd: float = 0.0
 
@@ -82,7 +84,8 @@ def stage_time(
     gpu_name = system.gpu.name
 
     t_fwd = 0.0
-    t_bwd = 0.0
+    t_bwd_dx = 0.0
+    t_bwd_dw = 0.0
 
     for op in stage_ops:
         cost = op_cost(op, model)
@@ -92,17 +95,19 @@ def stage_time(
             dx_t = op_to_time(cost.dx_flops, 0, "compute", system, gpu_name)
             dw_t = op_to_time(cost.dw_flops, 0, "compute", system, gpu_name)
             t_fwd += fwd_t
-            t_bwd += dx_t + dw_t
+            t_bwd_dx += dx_t
+            t_bwd_dw += dw_t
         else:
             fwd_t = op_to_time(0, cost.fwd_bytes, "memory", system, gpu_name)
             dx_t = op_to_time(0, cost.dx_bytes, "memory", system, gpu_name)
             dw_t = op_to_time(0, cost.dw_bytes, "memory", system, gpu_name)
             t_fwd += fwd_t
-            t_bwd += dx_t + dw_t
+            t_bwd_dx += dx_t
+            t_bwd_dw += dw_t
 
     # Recompute: re-do forward for selected ops before backward
     recompute_t = _recompute_time(stage_ops, model, system, strategy, gpu_name)
-    t_bwd += recompute_t
+    t_bwd_dx += recompute_t
 
     # Communication time for this stage's collectives
     t_comm_fwd = 0.0
@@ -116,7 +121,7 @@ def stage_time(
         t_comm_bwd += ct * 0.5
 
     t_fwd += t_comm_fwd
-    t_bwd += t_comm_bwd
+    t_bwd_dx += t_comm_bwd
 
     if strategy.ep > 1 and model.num_experts > 0:
         has_moe = any(op.layer_kind == LayerKind.MOE for op in stage_ops)
@@ -124,9 +129,18 @@ def stage_time(
             imb = ep_imbalance_factor(model.num_experts, strategy.ep,
                                        getattr(model, 'top_k', 1))
             t_fwd *= imb
-            t_bwd *= imb
+            t_bwd_dx *= imb
+            t_bwd_dw *= imb
 
-    return StageTime(fwd=t_fwd, bwd=t_bwd, comm_fwd=t_comm_fwd, comm_bwd=t_comm_bwd)
+    t_bwd = t_bwd_dx + t_bwd_dw
+    return StageTime(
+        fwd=t_fwd,
+        bwd=t_bwd,
+        bwd_dx=t_bwd_dx,
+        bwd_dw=t_bwd_dw,
+        comm_fwd=t_comm_fwd,
+        comm_bwd=t_comm_bwd,
+    )
 
 
 def _recompute_time(
@@ -143,14 +157,34 @@ def _recompute_time(
         if op.layer_id < 0:
             continue
         lk = model.layers[op.layer_id].value if op.layer_id < len(model.layers) else ""
-        tiers = policy.get(lk, set())
-        if not tiers:
+        cats = policy.get(lk, set())
+        if not cats:
             continue
-        if "full" in tiers:
+
+        op_cats = _op_recompute_categories(op)
+        if "full" in cats or (op_cats & cats):
             cost = op_cost(op, model)
             t += op_to_time(cost.fwd_flops, cost.fwd_bytes, cost.bound, system, gpu_name)
 
     return t
+
+
+def _op_recompute_categories(op: Op) -> set[str]:
+    """Map an op to its recompute category set."""
+    if op.kind == "attn_core":
+        return {"attn"}
+    if op.kind == "matmul":
+        name = op.name.lower()
+        if "qkv" in name or "o_proj" in name:
+            return {"attn"}
+        if "up_proj" in name or "gate_proj" in name or "down_proj" in name:
+            return {"ffn_swiglu"}
+        return set()
+    if op.kind == "swiglu":
+        return {"ffn_swiglu"}
+    if op.kind == "ln":
+        return {"ln"}
+    return set()
 
 
 def _group_size(group: str, strategy: Strategy) -> int:

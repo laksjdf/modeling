@@ -1,89 +1,62 @@
 # Session Progress
 
-## 当前阶段：modeller step_time 修复 — 已完成
+## 当前阶段：P4 HFU Metric follow-up — 已完成
 
 ## 最新变更（2026-04-25）
 
-- 已检查提交 `a4f8c6c6cb5b3ed6f4e23ec6bc0a8794fd11ecd7` 中的 `python/zrt/transform/analysis/modeller.py` 实现。
-- 已恢复图原生训练建模入口：`TrainingReport`、`estimate_training()`、`estimate_training_from_graphs()`、`model_training()`。
-- 已恢复 `python/zrt/transform/analysis/__init__.py` 中的 modeller API 导出。
-- 已在 `python/zrt/ir/adapter.py::stitch_fwd_bwd()` 元数据中补充 `fwd_bwd_stitched=True`，解除 `TrainingMemoryPass` graph-native activation 分支的 metadata gate。
-- 已撤回被中断轮次中对 `python/zrt/training/compose/stage.py` 的无关临时改动。
-- 已修复 `python/zrt/cli.py::_run_training_modelling()` 绕过 modeller 的问题：`--train --hw` 现在调用 `estimate_training_from_graphs()`，由 modeller 执行 graph-native stitch + training pipeline。
-- `estimate_training_from_graphs()` / `model_training()` 新增 `cp` 透传，避免 CLI `--cp` 在恢复后的 graph-native 路径中丢失。
-- 新增 `tests/training/test_cli_modeller_wiring.py`，防止 CLI 退回旧的 forward/backward 分离 pipeline。
-- 已修复 `estimate_training_from_graphs()` 重算 `step_time_ms` 的结构性错误：现在直接读取 `TrainingPipelinePass` 的 `pipeline_metrics.step_time_ms` / `mfu` / bubble 与 warmup/cooldown/steady 指标。
-- `estimate_training_from_graphs()` / `model_training()` 新增 `pp_schedule`、`vpp_chunks` 参数，graph-native modeller 入口可选择 VPP/DualPipe 调度。
-- `tests/training/test_captured_graph_modelling.py` 新增 DualPipe schedule-adjusted step_time 回归测试，防止退回 `(M + pp - 1) * per_stage_ms` 简化公式。
+- P0–P3 所有子项已完成（详见 SESSION_HISTORY.md）。
+- **P4 HFU metric**：新增 `hfu` 字段到 `StepResult`（spec 路径）、`PipelineStepMetrics`（graph-native 路径）、`Report`（estimator）。
+- `python/zrt/training/models/flops.py` 新增 `recompute_overhead_flops()` 和 `_op_recompute_categories()`，根据 `RecomputePolicy.per_layer` 计算 recompute 额外 FLOPs；**已修正为按 layer_kind 限定作用域**，避免 mixed dense/MoE 时错误跨层计数。
+- `python/zrt/training/compose/pipeline.py` 新增 `compute_hfu()`，HFU = (model_flops + recompute_overhead) / (peak * step_time)。
+- `python/zrt/training/compose/stage.py::_recompute_time()` **已修正**：从仅处理 `"full"` 扩展为处理 selective categories（`"attn"`, `"ffn_swiglu"`, `"ln"`），确保 selective recompute 正确增加 step time，避免 HFU 虚高。
+- graph-native `TrainingFlopsPass` 新增 `recompute_flops` 到 metadata，从 recomputed nodes 的 `flops_fwd // 2` 提取 recompute 额外 FLOPs。
+- graph-native `TrainingPipelinePass` MFU 计算修正：MFU 使用 `training_flops - recompute_flops`（不含 recompute），HFU 使用完整 `training_flops`。
+- **`python/zrt/transform/analysis/modeller.py`**：`TrainingReport` 新增 `hfu` 字段；`to_dict()` 和 `summary()` 输出 HFU；`estimate_training()` 和 `estimate_training_from_graphs()` 从 `PipelineStepMetrics` 传播 HFU。
+- **`python/zrt/training/search/report.py`**：`report_to_dict()` 和 `report_summary()` 输出 HFU。
+- `tests/training/test_flops.py` 新增 6 个 HFU 回归测试：无 recompute 时 HFU==MFU、selective recompute 时 HFU>MFU、默认无额外 FLOPs、full recompute 覆盖所有 compute-bound ops、selective recompute 增加 step time、layer_kind 限定 recompute 作用域。
 
 ## 本轮验证
 
 ```
-python -m py_compile python/zrt/transform/analysis/modeller.py python/zrt/transform/analysis/__init__.py python/zrt/training/compose/stage.py
-PYTHONPATH=python python -c "from python.zrt.transform.analysis import TrainingReport, estimate_training, estimate_training_from_graphs, model_training; print('analysis exports ok')"
-PYTHONPATH=python pytest tests/training/test_captured_graph_modelling.py -q
-python -m py_compile python/zrt/cli.py python/zrt/transform/analysis/modeller.py tests/training/test_cli_modeller_wiring.py
-PYTHONPATH=python pytest tests/training/test_cli_modeller_wiring.py -q
-PYTHONPATH=python pytest tests/training/test_graph_schedule.py -q
-python -m py_compile python/zrt/transform/analysis/modeller.py tests/training/test_captured_graph_modelling.py
-PYTHONPATH=python pytest tests/training/test_graph_schedule.py tests/training/test_cli_modeller_wiring.py -q
-PYTHONPATH=python pytest tests/training/anchors/test_anchors.py -q
+python -m py_compile python/zrt/training/models/flops.py python/zrt/training/compose/stage.py python/zrt/training/compose/pipeline.py python/zrt/transform/analysis/training.py python/zrt/transform/analysis/modeller.py python/zrt/training/search/report.py python/zrt/training/search/estimator.py
+PYTHONPATH=python pytest tests/training/test_flops.py -v
+PYTHONPATH=python pytest tests/training/ -q
+git diff --check
 ```
 
-结果：`test_cli_modeller_wiring.py` 1 passed；`test_captured_graph_modelling.py` 16 passed；`test_graph_schedule.py` 5 passed。
-
-已知剩余风险：`tests/training/anchors/test_anchors.py -q` 目前 12 passed / 1 failed，失败为 GPT-3 strict MFU calibration gap（estimated=0.2264，anchor=0.5200，deviation=56.5%）。本轮修复 graph-native modeller 的 step_time 传播问题，但 spec anchor 校准仍需后续 P3/P2 工作继续处理。
-
-参考计划：`/Users/sky/.claude/plans/based-on-the-above-bright-hopcroft.md`
-补充计划：`/Users/sky/.claude/plans/details-of-the-content-lively-stonebraker.md`
+结果：flops 15 passed；full training suite 202 passed（含 6 个新增 HFU 测试）；`git diff --check` passed。
 
 ## 所有子项完成状态
 
 | 子项 | 状态 | 说明 |
 |------|------|------|
-| 4.0/4.1/4.2 spec 路径 Composer | ✅ 完成 | `compose/pipeline.py` 4 个 Composer 类 |
-| 4.1 VPP 测试（spec 路径） | ✅ 完成 | `test_interleaved_1f1b.py` |
-| 4.2 DualPipe 测试（spec 路径） | ✅ 完成 | `test_dualpipe.py` |
-| 4.3 EP 负载不均衡 | ✅ 完成 | `compose/stage.py::ep_imbalance_factor` |
-| 4.4 搜索 / Pareto | ✅ 完成 | `search/space.py` + `estimator.py` |
-| 4.5 Anchor 验证 | ✅ 完成 | `anchor/validate.py` + 3 个 YAML + `test_anchors.py` |
-| 4.6 Chrome Trace | ✅ 完成 | `training/trace/exporter.py` + `report/chrome_trace.py` + `report/summary.py` chrome_trace 字段 + CLI `--trace` |
-| **图路径调度分派** | ✅ 完成 | `training.py:285-298` + `modeller.py:307-343` + `test_graph_schedule.py` |
+| P0 graph-native path | ✅ 完成 | modeller 恢复、stitch metadata、CLI 接线、step_time 直读 |
+| P1 ZeroBubble Composer | ✅ 完成 | `ZeroBubbleComposer` + graph-native `zb` dispatch |
+| P2 compressed attention | ✅ 完成 | `attn_compression_ratio` 接入 spec 与 graph-native attention FLOPs |
+| P3 anchor integration/calibration | ✅ 完成 | GPT-3 strict MFU gate 通过；其他 anchors 保持 calibration-mode |
+| P4 HFU metric | ✅ 完成 | MFU/HFU 区分已实现；spec + graph-native 双路径；6 个回归测试 |
 
-## 完成的变更（2026-04-24，第二轮）
+## 本轮修改文件
 
-### 变更 1：图路径调度分派（CRITICAL）
-
-- **`python/zrt/transform/context.py`**：`TrainingConfig` 新增 `vpp_chunks: int = 1`
-- **`python/zrt/transform/analysis/training.py:285-298`**：替换硬编码 1F1B 为按 `ctx.training.pp_schedule` 分派（interleaved / dualpipev / dualpipe / 1f1b）
-- **`python/zrt/transform/analysis/modeller.py:307-343`**：unified 路径直接读取 `pipeline_metrics.step_time_ms`，不再重新计算
-- **`tests/training/test_graph_schedule.py`**：5 个图路径测试（VPP/DualPipe/DualPipeV/bubble_fraction/pp1）全部通过
-
-### 变更 2：Chrome Trace 报告集成（MEDIUM）
-
-- **`python/zrt/report/chrome_trace.py`**：新建，`build_chrome_trace(timeline) -> dict`
-- **`python/zrt/report/summary.py`**：`TrainingSummary` 新增 `chrome_trace: dict | None = None`
-- **`python/zrt/training/cli.py`**：`model-training` 子命令新增 `--trace <path>` 参数
-
-### 变更 3：Anchor YAML 文件（LOW）
-
-- **`tests/training/anchors/gpt3_175b_megatron.yaml`**：GPT-3 175B，H100 SXM，TP8 PP1 DP64，MFU 0.52
-- **`tests/training/anchors/llama3_70b_meta.yaml`**：LLaMA-3 70B，TP4 PP2 DP16，MFU 0.48
-- **`tests/training/anchors/deepseek_v3.yaml`**：DeepSeek-V3，TP8 EP64 PP16，MFU 0.35
-- **`tests/training/anchors/test_anchors.py`**：8 个测试（YAML 格式验证 + anchor/report 集成），全部通过
-
-## 全量测试结果
-
-```
-252 passed, 34 warnings in 55.84s
-```
-
-零回归，无失败。
+- `python/zrt/training/models/flops.py`
+- `python/zrt/training/compose/pipeline.py`
+- `python/zrt/training/compose/stage.py`
+- `python/zrt/training/search/estimator.py`
+- `python/zrt/training/search/report.py`
+- `python/zrt/transform/analysis/training.py`
+- `python/zrt/transform/analysis/modeller.py`
+- `tests/training/test_flops.py`
+- `SESSION_HISTORY.md`
+- `SESSION_PROGRESS.md`
 
 ## 历史里程碑摘要
 
-- Phase 0：`stitch_fwd_bwd()` 前向+反向图拼接（69/69 training tests pass）
-- Phase 1：步骤时间公式修复 + 激活内存 + FLOPs 修复
-- Phase 2：`PipelineParallelPass` + 逐阶段 `DAGScheduler` + 1F1B 公式
-- Phase 3：`context_parallel.py` / `data_parallel.py` / CoC/MC2 overlap 注解
-- Phase 4（完成）：spec 路径 Composer ✅；Chrome Trace ✅；图路径调度分派 ✅；EP 不均衡 ✅；搜索/Pareto ✅；Anchor 验证 ✅
+- Phase 0：`stitch_fwd_bwd()` 前向+反向图拼接；graph-native modeller 入口恢复。
+- Phase 1：步骤时间公式修复 + 激活内存 + FLOPs 修复。
+- Phase 2：`PipelineParallelPass` + 逐阶段 `DAGScheduler` + 1F1B 公式。
+- Phase 3：`context_parallel.py` / `data_parallel.py` / CoC/MC2 overlap 注解。
+- Phase 4：spec 路径 Composer、Chrome Trace、图路径调度分派、EP 不均衡、搜索/Pareto、Anchor 验证。
+- P1 follow-up：ZeroBubble Composer 已接入 spec 与 graph-native training pipeline。
+- P2 follow-up：Compressed attention FLOPs ratio 已接入 spec 与 graph-native attention cost。
+- P3 follow-up：Anchor estimate integration 已启用 strict gate，GPT-3 175B strict anchor 通过。
+- P4 follow-up：HFU metric 已实现，recompute overhead 从 RecomputePolicy 按 layer_kind 推导；selective recompute 正确影响 step time；modeller/report 输出管线完整。

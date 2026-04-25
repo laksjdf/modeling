@@ -71,6 +71,14 @@ def test_build_graph_with_tp():
     assert ag_count == 4  # 2 AG per layer
     assert rs_count == 4  # 2 RS per layer
 
+    layer_ops = graph.ops_for_layer(0)
+    attn = next(op for op in layer_ops if op.kind == "attn_core")
+    swiglu = next(op for op in layer_ops if op.kind == "swiglu")
+    assert attn.meta["heads"] == 16
+    assert attn.inputs[0].shape_local == (2048, 2048)
+    assert swiglu.meta["bytes_fwd"] == 2048 * 16384 * Dtype.BF16.bytes * 3 // 2
+    assert isinstance(swiglu.meta["bytes_fwd"], int)
+
 
 def test_ops_for_layer():
     """ops_for_layer should return the correct ops."""

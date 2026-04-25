@@ -98,6 +98,7 @@ def _parse_model(d: dict) -> ModelSpec:
         vocab=d["vocab"],
         seq_len=d["seq_len"],
         layers=layers,
+        attn_compression_ratio=d.get("attn_compression_ratio", 1.0),
         num_experts=d.get("num_experts", 0),
         moe_ffn=d.get("moe_ffn", 0),
         top_k=d.get("top_k", 0),

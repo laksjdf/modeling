@@ -13,6 +13,7 @@ def report_to_dict(report: Report) -> dict:
     d = {
         "step_time_ms": round(report.step_time_ms, 3),
         "mfu": round(report.mfu, 4),
+        "hfu": round(report.hfu, 4),
         "total_flops": report.total_flops,
         "warnings": report.warnings,
         "config_summary": report.config_summary,
@@ -59,6 +60,7 @@ def report_summary(report: Report) -> str:
 
     lines.append(f"  Step time:  {report.step_time_ms:.1f} ms")
     lines.append(f"  MFU:        {report.mfu:.1%}")
+    lines.append(f"  HFU:        {report.hfu:.1%}")
 
     if report.memory is not None:
         gb = report.memory.to_gb()

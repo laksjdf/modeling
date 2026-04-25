@@ -144,3 +144,17 @@ def _apply_tp_sharding(
                 for t in op.inputs:
                     if t.shape_logical[-1] == k:
                         t.shape_local = (t.shape_logical[0], k_local)
+        elif op.kind == "attn_core":
+            if "heads" in op.meta:
+                op.meta["heads"] = max(1, op.meta["heads"] // shard.tp)
+            if "h_kv" in op.meta:
+                op.meta["h_kv"] = max(1, op.meta["h_kv"] // shard.tp)
+            for t in op.inputs + op.outputs:
+                if t.shape_logical and t.shape_logical[-1] in (h_attn, h_kv):
+                    t.shape_local = (t.shape_logical[0], max(1, t.shape_logical[-1] // shard.tp))
+        elif op.kind in ("ln", "rope", "swiglu", "add"):
+            if "bytes_fwd" in op.meta:
+                op.meta["bytes_fwd"] = int(op.meta["bytes_fwd"]) // shard.tp
+            for t in op.inputs + op.outputs:
+                if t.shape_logical and t.shape_logical[-1] in (h, h_attn, h_kv, ffn):
+                    t.shape_local = (t.shape_logical[0], max(1, t.shape_logical[-1] // shard.tp))

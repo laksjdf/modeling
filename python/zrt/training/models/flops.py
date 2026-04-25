@@ -62,12 +62,16 @@ def _attn_cost(op: Op, model: ModelSpec) -> OpCost:
     if model.num_heads > h > 0:
         tp_factor = model.num_heads // h
 
+    compression_ratio = _attn_compression_ratio(
+        op.meta.get("attn_compression_ratio", model.attn_compression_ratio)
+    )
+
     # Fwd: flash-attn ≈ 2*b*s^2*h*d for causal (halved due to causal mask)
     # Non-causal: 4*b*s^2*h*d
     mult = 2.0 if causal else 4.0
-    fwd = mult * b * s * s * h * d
+    fwd = mult * b * s * s * h * d * compression_ratio
 
-    # Bwd: flash-attn bwd ≈ 2.5× fwd in practice (recompute + backward pass)
+    # Bwd derives from compressed fwd, so dx inherits the same CSA/HCA ratio.
     dx = 2.5 * fwd
 
     return OpCost(
@@ -75,6 +79,13 @@ def _attn_cost(op: Op, model: ModelSpec) -> OpCost:
         dx_flops=dx,
         dw_flops=0.0,  # Attention has no learnable parameters
     )
+
+
+def _attn_compression_ratio(value: float) -> float:
+    ratio = float(value)
+    if not (0.0 < ratio <= 1.0):
+        raise ValueError(f"attn_compression_ratio must be in (0, 1], got {value}")
+    return ratio
 
 
 def _memory_bound_cost(op: Op) -> OpCost:
@@ -111,3 +122,58 @@ def total_training_flops(
     total *= M
 
     return total
+
+
+def recompute_overhead_flops(
+    graph: Graph, model: ModelSpec, strategy: Strategy,
+) -> float:
+    """Extra FLOPs from recomputing forward activations during backward pass.
+
+    Selective recompute re-runs the forward for specific ops (typically attention)
+    during backward. Full recompute re-runs the entire forward pass.
+
+    Respects per-layer policies: only ops belonging to a layer whose kind
+    appears in ``RecomputePolicy.per_layer`` are counted.
+
+    Returns the additional FLOPs (not the total).
+    """
+    rc = strategy.recompute
+    if not rc.per_layer:
+        return 0.0
+
+    extra = 0.0
+    for op in graph.ops:
+        # Look up the layer kind for this op
+        if op.layer_id < 0 or op.layer_id >= len(model.layers):
+            continue
+        lk = model.layers[op.layer_id].value
+        cats = rc.per_layer.get(lk)
+        if not cats:
+            continue
+
+        op_cats = _op_recompute_categories(op)
+        if "full" in cats or (op_cats & cats):
+            cost = op_cost(op, model)
+            if cost.bound == "compute":
+                extra += cost.fwd_flops
+
+    M = strategy.num_microbatches()
+    return extra * M
+
+
+def _op_recompute_categories(op: Op) -> set[str]:
+    """Map an op to its recompute category set."""
+    if op.kind == "attn_core":
+        return {"attn"}
+    if op.kind == "matmul":
+        name = op.name.lower()
+        if "qkv" in name or "o_proj" in name:
+            return {"attn"}
+        if "up_proj" in name or "gate_proj" in name or "down_proj" in name:
+            return {"ffn_swiglu"}
+        return set()
+    if op.kind == "swiglu":
+        return {"ffn_swiglu"}
+    if op.kind == "ln":
+        return {"ln"}
+    return set()

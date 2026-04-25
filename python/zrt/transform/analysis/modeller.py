@@ -44,6 +44,7 @@ class TrainingReport:
 
     # Efficiency metrics
     mfu: float = 0.0  # Model FLOPs Utilization
+    hfu: float = 0.0  # Hardware FLOPs Utilization (includes recompute)
 
     # FLOPs breakdown
     training_flops: float = 0.0
@@ -69,6 +70,7 @@ class TrainingReport:
             "step_time_ms": self.step_time_ms,
             "per_stage_ms": self.per_stage_ms,
             "mfu": self.mfu,
+            "hfu": self.hfu,
             "training_flops": self.training_flops,
             "forward_flops": self.forward_flops,
             "backward_flops": self.backward_flops,
@@ -95,6 +97,7 @@ class TrainingReport:
             "",
             "Efficiency:",
             f"  MFU: {self.mfu:.1%}",
+            f"  HFU: {self.hfu:.1%}",
             "",
             "FLOPs:",
             f"  Training: {self.training_flops/1e12:.2f} TFLOPs",
@@ -158,6 +161,7 @@ def estimate_training(
         step_time_ms=pipeline_metrics.step_time_ms if pipeline_metrics else 0.0,
         per_stage_ms=pipeline_metrics.per_stage_ms if pipeline_metrics else 0.0,
         mfu=pipeline_metrics.mfu if pipeline_metrics else 0.0,
+        hfu=pipeline_metrics.hfu if pipeline_metrics else 0.0,
         training_flops=g.metadata.get("training_flops", 0.0),
         forward_flops=g.metadata.get("forward_flops", 0.0),
         backward_flops=g.metadata.get("backward_flops", 0.0),
@@ -263,6 +267,7 @@ def estimate_training_from_graphs(
     step_time_ms = pipeline_metrics.step_time_ms if pipeline_metrics else 0.0
     per_stage_ms = pipeline_metrics.per_stage_ms if pipeline_metrics else 0.0
     mfu = pipeline_metrics.mfu if pipeline_metrics else 0.0
+    hfu = pipeline_metrics.hfu if pipeline_metrics else 0.0
     warmup_steps = pipeline_metrics.warmup_steps if pipeline_metrics else 0
     cooldown_steps = pipeline_metrics.cooldown_steps if pipeline_metrics else 0
     steady_steps = pipeline_metrics.steady_steps if pipeline_metrics else 0
@@ -290,6 +295,7 @@ def estimate_training_from_graphs(
         step_time_ms=step_time_ms,
         per_stage_ms=per_stage_ms,
         mfu=mfu,
+        hfu=hfu,
         training_flops=training_flops,
         forward_flops=forward_flops,
         backward_flops=backward_flops,

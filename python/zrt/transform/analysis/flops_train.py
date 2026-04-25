@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import logging
+
 from python.zrt.ir.graph import OpGraph
 from python.zrt.ir.node import OpNode
 from python.zrt.transform.base import GraphPass
 from python.zrt.transform.context import TransformContext
+
+logger = logging.getLogger(__name__)
 
 
 class TrainFlopsPass(GraphPass):
@@ -24,7 +28,7 @@ class TrainFlopsPass(GraphPass):
         
         for node in g.nodes.values():
             # Calculate forward FLOPs and memory
-            fwd_flops, read_bytes, write_bytes = self._calculate_fwd_flops(node)
+            fwd_flops, read_bytes, write_bytes = self._calculate_fwd_flops(node, g)
             
             # Calculate gradient FLOPs (dx and dw)
             dx_flops, dw_flops = self._calculate_grad_flops(node, fwd_flops)
@@ -46,7 +50,7 @@ class TrainFlopsPass(GraphPass):
         
         return g
 
-    def _calculate_fwd_flops(self, node: OpNode) -> tuple[float, float, float]:
+    def _calculate_fwd_flops(self, node: OpNode, graph: OpGraph) -> tuple[float, float, float]:
         """Calculate forward FLOPs and memory for a node.
         
         Args:
@@ -86,15 +90,10 @@ class TrainFlopsPass(GraphPass):
             # Flash attention: FLOPs ≈ 2 * batch * seq_len^2 * heads * head_dim
             # Approximate based on input/output sizes
             if inputs and outputs:
-                batch = inputs[0].shape[0] if len(inputs[0].shape) > 0 else 1
-                seq_len = inputs[0].shape[1] if len(inputs[0].shape) > 1 else 1
-                # Estimate heads and head_dim from output shape
-                if len(outputs[0].shape) == 3:
-                    _, _, hidden_size = outputs[0].shape
-                    # Assume head_dim = 64 (common value)
-                    head_dim = 64
-                    heads = hidden_size // head_dim
-                    fwd_flops = 2 * batch * (seq_len ** 2) * heads * head_dim
+                batch, seq_len, heads, head_dim = self._attention_dims(node, graph)
+                if seq_len > 0 and heads > 0 and head_dim > 0:
+                    compression = self._attention_compression_ratio(node, graph)
+                    fwd_flops = 2 * batch * (seq_len ** 2) * heads * head_dim * compression
         
         elif "layer_norm" in op_type.lower() or "ln" in op_type.lower():
             # Layer norm: FLOPs ≈ 5 * N
@@ -129,6 +128,83 @@ class TrainFlopsPass(GraphPass):
             fwd_flops = node.attrs.get("step_flops", 0.0)
         
         return fwd_flops, read_bytes, write_bytes
+
+    def _attention_dims(self, node: OpNode, graph: OpGraph) -> tuple[int, int, int, int]:
+        attrs = node.attrs
+        metadata = graph.metadata
+        inputs = node.inputs
+        outputs = node.outputs
+
+        batch = self._int_or_none(attrs.get("batch", attrs.get("b")))
+        seq_len = self._int_or_none(attrs.get("seq_len", attrs.get("s")))
+        heads = self._int_or_none(attrs.get("heads", attrs.get("num_heads")))
+        head_dim = self._int_or_none(attrs.get("head_dim"))
+
+        if batch is None:
+            batch = self._int_or_none(metadata.get("batch", metadata.get("batch_size")))
+        if seq_len is None:
+            seq_len = self._int_or_none(metadata.get("seq_len"))
+        if heads is None:
+            heads = self._int_or_none(metadata.get("num_heads", metadata.get("heads")))
+        if head_dim is None:
+            head_dim = self._int_or_none(metadata.get("head_dim"))
+
+        if inputs:
+            q_shape = inputs[0].shape
+            if len(q_shape) >= 4:
+                batch = batch or int(q_shape[0])
+                heads = heads or int(q_shape[1])
+                seq_len = seq_len or int(q_shape[2])
+                head_dim = head_dim or int(q_shape[3])
+            elif len(q_shape) >= 3:
+                batch = batch or int(q_shape[0])
+                seq_len = seq_len or int(q_shape[1])
+
+        hidden_size = None
+        if outputs and outputs[0].shape:
+            hidden_size = int(outputs[0].shape[-1])
+        elif inputs and inputs[0].shape:
+            hidden_size = int(inputs[0].shape[-1])
+
+        if head_dim is None and heads and hidden_size:
+            head_dim = max(1, hidden_size // heads)
+        if head_dim is None:
+            head_dim = 64
+        if heads is None and hidden_size and head_dim > 0:
+            heads = max(1, hidden_size // head_dim)
+
+        return batch or 1, seq_len or 1, heads or 0, head_dim or 0
+
+    def _attention_compression_ratio(self, node: OpNode, graph: OpGraph) -> float:
+        value = node.annotations.get("attn_compression_ratio")
+        if value is None:
+            value = node.attrs.get("attn_compression_ratio")
+        if value is None:
+            value = graph.metadata.get("attn_compression_ratio", 1.0)
+        try:
+            ratio = float(value)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid attn_compression_ratio=%r on node %s; using dense attention ratio 1.0",
+                value, node.id,
+            )
+            return 1.0
+        if not (0.0 < ratio <= 1.0):
+            logger.warning(
+                "Invalid attn_compression_ratio=%r on node %s; using dense attention ratio 1.0",
+                value, node.id,
+            )
+            return 1.0
+        return ratio
+
+    @staticmethod
+    def _int_or_none(value: object) -> int | None:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     def _calculate_grad_flops(self, node: OpNode, fwd_flops: float) -> tuple[float, float]:
         """Calculate gradient FLOPs (dx and dw) for a node.

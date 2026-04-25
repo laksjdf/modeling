@@ -77,7 +77,7 @@ class TrainingConfig:
     recompute_policy: str = "none"  # "none", "full", "selective"
 
     # Pipeline schedule
-    pp_schedule: str = "1f1b"  # "1f1b", "interleaved", "dualpipe", "dualpipev"
+    pp_schedule: str = "1f1b"  # "1f1b", "interleaved", "dualpipe", "dualpipev", "zb"
     vpp_chunks: int = 1
 
     # Optional explicit layer→stage assignment for PP; length must equal
