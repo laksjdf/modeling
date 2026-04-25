@@ -1,7 +1,7 @@
 """Test 1F1B pipeline schedule — bubble ratio matches Megatron paper."""
 
 import pytest
-from zrt.training.compose.pipeline import pipeline_step_time
+from zrt.training.compose.pipeline import OneF1BComposer, pipeline_step_time
 from zrt.training.compose.stage import StageTime
 from zrt.training.ir.builders import build_graph
 from zrt.training.spec.dtype import Dtype
@@ -34,6 +34,30 @@ def test_single_stage_no_bubble():
     assert result.bubble_fraction == 0.0
     assert result.warmup == 0.0
     assert result.cooldown == 0.0
+
+
+def test_single_stage_dp_allreduce_overlaps_backward_when_enabled():
+    """PP=1 has no pipeline bubble, but DDP buckets can overlap backward."""
+    stage = [StageTime(fwd=1.0, bwd=2.0)]
+    strategy = Strategy(tp=1, pp=1, dp=4, micro_batch=1, global_batch=4)
+
+    result = OneF1BComposer().compose(stage, M=4, pp=1, dp_ar_time=3.0, strategy=strategy)
+
+    assert result.step_time == 12.0
+    assert result.dp_ar_exposed == 0.0
+
+
+def test_single_stage_dp_allreduce_exposed_when_overlap_disabled():
+    stage = [StageTime(fwd=1.0, bwd=2.0)]
+    strategy = Strategy(
+        tp=1, pp=1, dp=4, micro_batch=1, global_batch=4,
+        dp_overlap_in_bubble=False,
+    )
+
+    result = OneF1BComposer().compose(stage, M=4, pp=1, dp_ar_time=3.0, strategy=strategy)
+
+    assert result.step_time == 15.0
+    assert result.dp_ar_exposed == 3.0
 
 
 def test_pp2_bubble_ratio():

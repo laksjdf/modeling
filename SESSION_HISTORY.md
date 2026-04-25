@@ -798,3 +798,41 @@ Archived at: 2026-04-24
 - `git diff --check`：passed
 
 已知剩余风险：anchor suite 仍保留 GPT-3 strict MFU calibration gap；P2 follow-up 未处理 P3 anchor calibration 或 P4 HFU metric。
+
+---
+## 2026-04-25 P3 Anchor Integration
+
+### 本轮完成
+
+- 将 anchor integration test 从 placeholder 改为真实 `estimate()` 集成：每个 anchor YAML 都会加载为 `ModelSpec/SystemSpec/Strategy`，执行 `strategy.validate()` 与 `estimate()`，load/estimate 异常不再被吞掉。
+- 对 `strict_mfu_check=True` 的 anchor 启用严格 MFU gate；GPT-3 175B strict anchor 现在通过，estimated MFU 0.5075 vs target 0.5200，误差 2.40%（tolerance 10%）。
+- 修正 spec IR TP sharding：`attn_core` heads/KV metadata 与 attention tensor local shape 现在按 TP 缩放；LN/RoPE/SwiGLU/add 等 memory-bound activation bytes 也按 TP rank 计入，避免每个 TP rank 重复完整 activation traffic。
+- PP=1 schedule 现在允许 DP gradient reduce 在 backward window 中重叠；`dp_overlap_in_bubble=False` 仍保留 fully exposed 行为。
+- P3 计划中的 context-parallel Ulysses/Ring insertion coverage 已存在，本轮纳入 focused regression。
+
+### 验证
+
+- `python -m py_compile python/zrt/training/ir/shard.py python/zrt/training/compose/pipeline.py tests/training/test_1f1b.py tests/training/test_ir_dense.py`
+- `PYTHONPATH=python pytest tests/training/anchors/test_anchors.py -q -s`：13 passed
+- `PYTHONPATH=python pytest tests/training/test_1f1b.py tests/training/test_ir_dense.py tests/training/test_context_parallel.py tests/training/test_search.py -q`：24 passed
+- `PYTHONPATH=python pytest tests/training -q`：196 passed
+- `git diff --check`：passed
+
+已知剩余风险：DeepSeek-V3 与 LLaMA-3 anchors 仍为 calibration-mode，当前 MFU 偏差分别约 92.69% 与 41.77%；未启用 strict gate。P3 未处理 P4 HFU metric。
+
+---
+## 2026-04-25 P3 bytes_fwd integer follow-up
+
+### 本轮完成
+
+- 修复 TP sharding 后 `bytes_fwd` 由 int 变 float 的问题：`shard.py` 使用 integer floor division 保留 byte count 整数类型。
+- 更新 `test_build_graph_with_tp`，同时断言 `bytes_fwd` 的数值和 `int` 类型，避免回归。
+
+### 验证
+
+- `python -m py_compile python/zrt/training/ir/shard.py tests/training/test_ir_dense.py`
+- `PYTHONPATH=python pytest tests/training/test_ir_dense.py tests/training/anchors/test_anchors.py -q`：19 passed
+- `PYTHONPATH=python pytest tests/training -q`：196 passed
+- `git diff --check`：passed
+
+已知剩余风险：DeepSeek-V3 与 LLaMA-3 anchors 仍为 calibration-mode；P4 HFU metric 尚未实现。

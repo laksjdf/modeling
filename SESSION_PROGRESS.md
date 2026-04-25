@@ -1,6 +1,6 @@
 # Session Progress
 
-## 当前阶段：P2 Compressed Attention FLOPs follow-up — 已完成
+## 当前阶段：P3 Anchor Integration follow-up — 已完成
 
 ## 最新变更（2026-04-25）
 
@@ -23,20 +23,28 @@
 - P2 follow-up：graph-native attention 维度推导不再硬编码 `head_dim = 64`；优先读取 node attrs / graph metadata / 4D Q tensor shape，再回退到 hidden/head_dim 推导。
 - `_attn_cost()` 明确注释 backward dx 是从 compressed forward 推导，因此继承 CSA/HCA ratio。
 - graph-native 非法 `attn_compression_ratio` 不再中断整图 pass；现在写出包含 node id 的 warning，并回退到 dense ratio 1.0。
+- P3 anchor harness 不再是 placeholder：`tests/training/anchors/test_anchors.py` 现在真实加载每个 anchor、运行 `estimate()`，并对 `strict_mfu_check=True` 的 anchor 执行严格 MFU gate；load/estimate 异常不再被吞掉。
+- GPT-3 175B strict anchor 已校准通过：estimated MFU 0.5075 vs target 0.5200，误差 2.40%（tolerance 10%）。
+- spec IR TP sharding 现在覆盖 `attn_core` heads / KV metadata 和 LN/RoPE/SwiGLU/add 等 memory-bound activation bytes，避免每个 TP rank 计入完整 attention/activation work。
+- PP=1 路径支持 DP gradient reduce 在 backward window 中重叠；`dp_overlap_in_bubble=False` 仍保留 fully exposed DP allreduce/reduce-scatter 行为。
+- P3 计划中的 context parallel insertion coverage 已存在于 `tests/training/test_context_parallel.py`，本轮纳入验证。
+- P3 follow-up：TP sharding of `bytes_fwd` now preserves integer type via floor integer division; regression asserts `bytes_fwd` remains `int`.
 
 ## 本轮验证
 
 ```
-python -m py_compile python/zrt/training/spec/model.py python/zrt/training/io/config_loader.py python/zrt/training/models/flops.py python/zrt/transform/analysis/flops_train.py tests/training/test_flops.py tests/training/test_transform_integration.py
-PYTHONPATH=python pytest tests/training/test_flops.py tests/training/test_transform_integration.py -q
-PYTHONPATH=python pytest tests/training/test_flops.py tests/training/test_transform_integration.py tests/training/test_search.py tests/training/test_dualpipe.py tests/training/test_graph_schedule.py -q
-PYTHONPATH=python pytest tests/training -q --ignore=tests/training/anchors
+python -m py_compile python/zrt/training/ir/shard.py python/zrt/training/compose/pipeline.py tests/training/test_1f1b.py tests/training/test_ir_dense.py
+PYTHONPATH=python pytest tests/training/anchors/test_anchors.py -q -s
+PYTHONPATH=python pytest tests/training/test_1f1b.py tests/training/test_ir_dense.py tests/training/test_context_parallel.py tests/training/test_search.py -q
+python -m py_compile python/zrt/training/ir/shard.py tests/training/test_ir_dense.py
+PYTHONPATH=python pytest tests/training/test_ir_dense.py tests/training/anchors/test_anchors.py -q
+PYTHONPATH=python pytest tests/training -q
 git diff --check
 ```
 
-结果：focused compressed-attention tests 23 passed；FLOPs/transform/search/schedule regression 42 passed（上一轮）；non-anchor training suite 181 passed；`git diff --check` passed。
+结果：anchor suite 13 passed；1F1B/IR/context/search focused regression 24 passed；bytes_fwd focused regression 19 passed；full training suite 196 passed；`git diff --check` passed。
 
-已知剩余风险：`tests/training/anchors/test_anchors.py -q` 在上一轮仍为 12 passed / 1 failed，失败为 GPT-3 strict MFU calibration gap（estimated=0.2264，anchor=0.5200，deviation=56.5%）。P2 未处理 P3 anchor calibration 或 P4 HFU metric。
+已知剩余风险：DeepSeek-V3 与 LLaMA-3 anchors 仍为 calibration-mode，当前 MFU 偏差分别约 92.69% 与 41.77%；未启用 strict gate。P3 未处理 P4 HFU metric。
 
 参考计划：`.omc/plans/proud-wishing-puzzle.md`
 
@@ -47,17 +55,16 @@ git diff --check
 | P0 graph-native path | ✅ 完成 | modeller 恢复、stitch metadata、CLI 接线、step_time 直读 |
 | P1 ZeroBubble Composer | ✅ 完成 | `ZeroBubbleComposer` + graph-native `zb` dispatch |
 | P2 compressed attention | ✅ 完成 | `attn_compression_ratio` 接入 spec 与 graph-native attention FLOPs |
-| P3 anchor integration/calibration | ⏳ 待办 | GPT-3 strict MFU gap 仍存在 |
+| P3 anchor integration/calibration | ✅ 完成 | GPT-3 strict MFU gate 通过；其他 anchors 保持 calibration-mode |
 | P4 HFU metric | ⏳ 待办 | MFU/HFU 区分尚未实现 |
 
 ## 本轮修改文件
 
-- `python/zrt/training/spec/model.py`
-- `python/zrt/training/io/config_loader.py`
-- `python/zrt/training/models/flops.py`
-- `python/zrt/transform/analysis/flops_train.py`
-- `tests/training/test_flops.py`
-- `tests/training/test_transform_integration.py`
+- `python/zrt/training/ir/shard.py`
+- `python/zrt/training/compose/pipeline.py`
+- `tests/training/anchors/test_anchors.py`
+- `tests/training/test_1f1b.py`
+- `tests/training/test_ir_dense.py`
 - `SESSION_HISTORY.md`
 - `SESSION_PROGRESS.md`
 
@@ -70,3 +77,4 @@ git diff --check
 - Phase 4：spec 路径 Composer、Chrome Trace、图路径调度分派、EP 不均衡、搜索/Pareto、Anchor 验证。
 - P1 follow-up：ZeroBubble Composer 已接入 spec 与 graph-native training pipeline。
 - P2 follow-up：Compressed attention FLOPs ratio 已接入 spec 与 graph-native attention cost。
+- P3 follow-up：Anchor estimate integration 已启用 strict gate，GPT-3 175B strict anchor 通过。

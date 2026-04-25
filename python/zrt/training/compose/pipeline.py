@@ -66,8 +66,10 @@ class OneF1BComposer(PipelineComposer):
             # No pipeline: just fwd + bwd for single stage
             st = stage_times[0] if stage_times else StageTime()
             step = st.fwd + st.bwd
-            # DP overlap not applicable with PP=1
             dp_exposed = dp_ar_time
+            if strategy.dp_overlap_in_bubble and dp_ar_time > 0:
+                hidden = min(st.bwd * M, dp_ar_time)
+                dp_exposed = dp_ar_time - hidden
 
             ideal_step = M * (st.fwd + st.bwd)
             bubble_frac = 0.0
