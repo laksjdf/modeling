@@ -6,5 +6,9 @@ output
 .DS_Store
 .trae/
 .vscode/
+CLAUDE.md
+CLAUDE_TASK.MD
 .idea/
+SESSION_HISTORY.md
+SESSION_PROGRESS.md
 .omx/

@@ -490,15 +490,466 @@ class TransformedGraphExcelWriter:
             ws.column_dimensions[get_column_letter(col_idx)].width = width
 
     def _write_row(self, ws, row_idx: int, values: List[Any],
-                   fill: Optional[PatternFill] = None) -> None:
-        """Write data row with optional fill."""
+                   fill: Optional[PatternFill] = None,
+                   center_cols: Optional[set] = None) -> None:
+        """Write data row with optional fill and center-aligned columns."""
+        center_cols = center_cols or set()
         for col_idx, val in enumerate(values, 1):
             cell = ws.cell(row=row_idx, column=col_idx, value=val)
             cell.border = self._thin_border
             if fill:
                 cell.fill = fill
-            if col_idx > 10:  # Wrap text for longer content
+            if col_idx in center_cols:
+                cell.alignment = Alignment(horizontal="center")
+            elif col_idx > 10:
                 cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+    # ── Step 1: Raw capture sheets (ported from graph/excel_writer.py) ────────
+
+    def _write_model_config_sheet(self, wb: openpyxl.Workbook,
+                                  config_summary: Dict[str, Any]) -> None:
+        """Write model configuration (Step 1)."""
+        ws = wb.create_sheet("Model Config")
+        ws.append(["Parameter", "Value"])
+        ws["A1"].font = Font(bold=True, size=12)
+        ws["B1"].font = Font(bold=True, size=12)
+        for key, val in config_summary.items():
+            ws.append([key, str(val)])
+        ws.column_dimensions["A"].width = 30
+        ws.column_dimensions["B"].width = 40
+        for row in ws.iter_rows():
+            for cell in row:
+                if cell.value:
+                    cell.border = self._thin_border
+
+    def _write_raw_operators_sheet(self, wb: openpyxl.Workbook,
+                                   records: List[Dict[str, Any]],
+                                   label: str = "") -> None:
+        """Write raw aten operator sequence (Step 1)."""
+        from python.zrt.graph.classifier import get_fill
+        sheet_name = f"Raw Operators ({label})" if label else "Raw Operators"
+        ws = wb.create_sheet(sheet_name)
+        columns = [
+            ("Node ID", 8), ("Op Short", 12), ("Aten Op", 35),
+            ("Input Shapes", 50), ("Input Dtypes", 30),
+            ("Output Shapes", 50), ("Output Dtypes", 30),
+            ("Module Path", 55), ("Layer", 7), ("Component", 25),
+            ("Source File", 28), ("Line", 6), ("Code", 60), ("Func", 22),
+            ("Extra Args", 55),
+        ]
+        self._write_header(ws, columns)
+        for row_idx, rec in enumerate(records, 2):
+            values = [
+                rec["node_id"], rec.get("op_short", ""), rec["aten_op"],
+                rec["input_shapes"], rec["input_dtypes"],
+                rec["output_shapes"], rec["output_dtypes"],
+                rec["module_path"], rec["layer"], rec["component"],
+                rec.get("src_file", ""), rec.get("src_line", ""),
+                rec.get("src_code", ""), rec.get("src_func", ""),
+                rec.get("extra_args", ""),
+            ]
+            self._write_row(ws, row_idx, values, get_fill(rec["component"]),
+                            center_cols={1, 12})
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(columns))}{len(records) + 1}"
+        ws.freeze_panes = "A2"
+
+    def _write_fused_operators_sheet(self, wb: openpyxl.Workbook,
+                                     fused: List[Dict[str, Any]],
+                                     label: str = "") -> None:
+        """Write fused operators (Step 1)."""
+        from python.zrt.graph.classifier import get_fill
+        sheet_name = f"Fused Operators ({label})" if label else "Fused Operators"
+        ws = wb.create_sheet(sheet_name)
+        columns = [
+            ("Node ID", 8), ("Fused Operator", 38), ("Constituent Aten Ops", 70),
+            ("Sub-ops", 9), ("Layer", 7),
+            ("Fused Input Shapes", 55), ("Fused Input Dtypes", 30), ("Input Sources", 60),
+            ("Fused Output Shapes", 55), ("Fused Output Dtypes", 30), ("Output Sources", 60),
+        ]
+        self._write_header(ws, columns)
+        for row_idx, rec in enumerate(fused, 2):
+            values = [
+                rec["node_id"], rec["fused_op"], rec["aten_ops"], rec["num_sub_ops"], rec["layer"],
+                rec.get("fused_input_shapes", rec["input_shapes"]),
+                rec.get("fused_input_dtypes", rec["input_dtypes"]),
+                rec.get("fused_input_sources", ""),
+                rec.get("fused_output_shapes", rec["output_shapes"]),
+                rec.get("fused_output_dtypes", rec["output_dtypes"]),
+                rec.get("fused_output_sources", ""),
+            ]
+            self._write_row(ws, row_idx, values, get_fill(rec["fused_op"]),
+                            center_cols={1, 4})
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(columns))}{len(fused) + 1}"
+        ws.freeze_panes = "A2"
+
+    def _write_fusion_rules_sheet(self, wb: openpyxl.Workbook,
+                                  fused: List[Dict[str, Any]],
+                                  output_dir: Path,
+                                  label: str = "") -> None:
+        """Write fusion rules and export JSON (Step 1)."""
+        ws = wb.create_sheet("Fusion Rules")
+        columns = [
+            ("Module Class", 30), ("Fusion Level", 12), ("Aten Op Sequence", 80),
+            ("Sub-ops", 9), ("Occurrences", 12), ("Example Module Path", 55),
+            ("Fused Input Shapes", 55), ("Fused Input Dtypes", 30), ("Input Sources", 65),
+            ("Fused Output Shapes", 55), ("Fused Output Dtypes", 30), ("Output Sources", 65),
+        ]
+        self._write_header(ws, columns)
+
+        # Extract FusionSpec-like entries from fused records
+        arrow = " \u2192 "
+        specs_by_key: Dict[tuple, Dict[str, Any]] = {}
+        for g in fused:
+            if g.get("num_sub_ops", 0) <= 1:
+                continue
+            key = (g.get("module_class", ""), g.get("fusion_level", ""))
+            if key in specs_by_key:
+                specs_by_key[key]["occurrences"] += 1
+            else:
+                specs_by_key[key] = {
+                    "module_class": g.get("module_class", ""),
+                    "aten_op_sequence": g.get("aten_ops", "").split(arrow),
+                    "num_sub_ops": g.get("num_sub_ops", 0),
+                    "fusion_level": g.get("fusion_level", ""),
+                    "example_module_path": g.get("module_path", ""),
+                    "occurrences": 1,
+                    "fused_input_shapes": g.get("fused_input_shapes", ""),
+                    "fused_input_dtypes": g.get("fused_input_dtypes", ""),
+                    "fused_input_sources": g.get("fused_input_sources", ""),
+                    "fused_output_shapes": g.get("fused_output_shapes", ""),
+                    "fused_output_dtypes": g.get("fused_output_dtypes", ""),
+                    "fused_output_sources": g.get("fused_output_sources", ""),
+                }
+        specs = sorted(specs_by_key.values(), key=lambda s: -s["occurrences"])
+
+        for row_idx, spec in enumerate(specs, 2):
+            values = [
+                spec["module_class"], spec["fusion_level"],
+                arrow.join(spec["aten_op_sequence"]),
+                spec["num_sub_ops"], spec["occurrences"], spec["example_module_path"],
+                spec["fused_input_shapes"], spec["fused_input_dtypes"], spec["fused_input_sources"],
+                spec["fused_output_shapes"], spec["fused_output_dtypes"], spec["fused_output_sources"],
+            ]
+            self._write_row(ws, row_idx, values, None)
+        ws.freeze_panes = "A2"
+
+        # Export fusion rules JSON
+        if output_dir:
+            json_path = output_dir / "fusion_rules.json"
+            json_path.write_text(json.dumps(specs, indent=2, default=str))
+            logger.info("Exported fusion rules to %s", json_path)
+
+    def _write_by_layer_sheet(self, wb: openpyxl.Workbook,
+                              raw_records: List[Dict[str, Any]],
+                              fused_records: List[Dict[str, Any]],
+                              label: str = "") -> None:
+        """Write by-layer statistics (Step 1)."""
+        sheet_name = f"By Layer ({label})" if label else "By Layer"
+        ws = wb.create_sheet(sheet_name)
+        ws.append(["Layer", "Fused Op Count", "Raw Op Count", "Fused Operators"])
+        for col in ("A", "B", "C", "D"):
+            ws[f"{col}1"].font = self._header_font
+            ws[f"{col}1"].fill = self._header_fill
+        layer_raw: Dict[str, int] = defaultdict(int)
+        for r in raw_records:
+            layer_raw[r["layer"] or "non-layer"] += 1
+        layer_fused_info: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"count": 0, "ops": []})
+        for r in fused_records:
+            key = r["layer"] or "non-layer"
+            layer_fused_info[key]["count"] += 1
+            layer_fused_info[key]["ops"].append(r["fused_op"])
+        for layer in sorted(layer_fused_info.keys(), key=lambda x: (x == "non-layer", x)):
+            info = layer_fused_info[layer]
+            seen: set = set()
+            unique_ops = [op for op in info["ops"] if not (op in seen or seen.add(op))]
+            ws.append([layer, info["count"], layer_raw.get(layer, 0), ", ".join(unique_ops)])
+        ws.column_dimensions["A"].width = 10
+        ws.column_dimensions["B"].width = 15
+        ws.column_dimensions["C"].width = 14
+        ws.column_dimensions["D"].width = 100
+
+    def _write_summary_sheet(self, wb: openpyxl.Workbook,
+                             fused: List[Dict[str, Any]]) -> None:
+        """Write fused operator summary statistics (Step 1)."""
+        ws = wb.create_sheet("Summary")
+        ws.append(["Fused Operator", "Count", "Avg Sub-ops"])
+        for col in ("A", "B", "C"):
+            ws[f"{col}1"].font = Font(bold=True, size=12)
+        fused_counts: Dict[str, List[int]] = defaultdict(list)
+        for r in fused:
+            fused_counts[r["fused_op"]].append(r["num_sub_ops"])
+        for comp in sorted(fused_counts.keys()):
+            sub_ops = fused_counts[comp]
+            ws.append([comp, len(sub_ops), round(sum(sub_ops) / len(sub_ops), 1)])
+        ws.column_dimensions["A"].width = 40
+        ws.column_dimensions["B"].width = 10
+        ws.column_dimensions["C"].width = 12
+
+    # ── Step 3: Performance report sheets ─────────────────────────────────────
+
+    def _write_perf_summary_sheet(self, wb: openpyxl.Workbook,
+                                  summary) -> None:
+        """Write performance summary (Step 3). Supports E2ESummary and TrainingSummary."""
+        from python.zrt.report.summary import E2ESummary, TrainingSummary
+        is_training = isinstance(summary, TrainingSummary)
+        ws = wb.create_sheet("Training Summary" if is_training else "Performance Summary")
+
+        section_fill = PatternFill(start_color="E8F5E9", end_color="E8F5E9", fill_type="solid")
+        section_font = Font(bold=True, size=10, color="1B5E20")
+        header_font = Font(bold=True, size=11)
+
+        def _section(label: str) -> int:
+            row = ws.max_row + 1
+            cell = ws.cell(row=row, column=1, value=label)
+            cell.font = section_font
+            cell.fill = section_fill
+            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
+            return row
+
+        def _row(key: str, value: Any) -> int:
+            ws.append([key, value])
+            return ws.max_row
+
+        ws.column_dimensions["A"].width = 34
+        ws.column_dimensions["B"].width = 28
+        ws.cell(row=1, column=1, value="Metric").font = header_font
+        ws.cell(row=1, column=2, value="Value").font = header_font
+
+        if is_training:
+            _section("── Metadata ──")
+            _row("Model", summary.model)
+            _row("Hardware", summary.hardware)
+            _row("Parallel", summary.parallel_desc)
+            _row("Batch size", summary.batch_size)
+            _row("Seq len", summary.seq_len)
+            _section("── Step Timing ──")
+            fwd_pct = summary.forward_ms / summary.step_ms * 100 if summary.step_ms > 0 else 0
+            bwd_pct = summary.backward_ms / summary.step_ms * 100 if summary.step_ms > 0 else 0
+            _row("Step latency (ms)", round(summary.step_ms, 3))
+            _row("Forward (ms)", f"{round(summary.forward_ms, 3)}  ({fwd_pct:.1f}%)")
+            _row("Backward (ms)", f"{round(summary.backward_ms, 3)}  ({bwd_pct:.1f}%)")
+            _section("── Throughput ──")
+            _row("Samples / sec", round(summary.samples_per_sec, 2))
+            _row("Tokens / sec", round(summary.tokens_per_sec, 1))
+            _section("── HW Efficiency ──")
+            _row("MFU", f"{summary.mfu:.2%}")
+            _row("HBM BW util", f"{summary.hbm_bw_util:.2%}")
+            _row("Arith intensity (ops/byte)", round(summary.arithmetic_intensity, 2))
+            _row("Total FLOPs (T)", round(summary.total_flops / 1e12, 3))
+            _row("  Forward FLOPs (T)", round(summary.fwd_flops / 1e12, 3))
+            _row("  Backward FLOPs (T)", round(summary.bwd_flops / 1e12, 3))
+            _section("── Memory Access ──")
+            _row("Fwd Read (GB)", round(summary.fwd_read_bytes / 1e9, 3))
+            _row("Fwd Write (GB)", round(summary.fwd_write_bytes / 1e9, 3))
+            _row("Bwd Read (GB)", round(summary.bwd_read_bytes / 1e9, 3))
+            _row("Bwd Write (GB)", round(summary.bwd_write_bytes / 1e9, 3))
+            _section("── Compute / Comm ──")
+            _row("Fwd compute (ms)", round(summary.fwd_compute_ms, 3))
+            _row("Fwd comm (ms)", round(summary.fwd_comm_ms, 3))
+            _row("Fwd exposed comm (ms)", round(summary.fwd_exposed_comm_ms, 3))
+            _row("Fwd overlap ratio", f"{summary.fwd_overlap_ratio:.1%}")
+            _row("Bwd compute (ms)", round(summary.bwd_compute_ms, 3))
+            _row("Bwd comm (ms)", round(summary.bwd_comm_ms, 3))
+            _row("Bwd exposed comm (ms)", round(summary.bwd_exposed_comm_ms, 3))
+            _row("Bwd overlap ratio", f"{summary.bwd_overlap_ratio:.1%}")
+            if summary.recompute_op_count > 0:
+                _section("── Activation Checkpointing ──")
+                _row("Recompute op count", summary.recompute_op_count)
+                _row("Recompute overhead", f"{summary.recompute_ratio:.1%}")
+            if summary.memory_breakdown is not None:
+                mb = summary.memory_breakdown
+                _section("── Memory (per GPU) ──")
+                _row("Weights (GB)", round(mb.weights / 1e9, 3))
+                _row("Gradients (GB)", round(mb.grads / 1e9, 3))
+                _row("Opt states (GB)", round(mb.opt_state / 1e9, 3))
+                _row("Activations (GB)", round(mb.activations / 1e9, 3))
+                _row("Comm buffers (GB)", round(mb.comm_buffers / 1e9, 3))
+                _row("Total (GB)", round(mb.total / 1e9, 3))
+        else:
+            _section("── Metadata ──")
+            _row("Model", summary.model)
+            _row("Hardware", summary.hardware)
+            _row("Phase", summary.phase.upper())
+            _row("Parallel", summary.parallel_desc)
+            _row("Batch size", summary.batch_size)
+            _row("Seq len", summary.seq_len)
+            _section("── Latency ──")
+            _row("Total latency (ms)", round(summary.latency_ms, 3))
+            if summary.ttft_ms is not None:
+                _row("TTFT (ms)", round(summary.ttft_ms, 3))
+            if summary.tpot_ms is not None:
+                _row("TPOT (ms/token)", round(summary.tpot_ms, 3))
+            _row("Throughput (tok/s)", round(summary.tokens_per_sec, 1))
+            _section("── Compute / Comm ──")
+            _row("Compute (ms)", round(summary.compute_ms, 3))
+            _row("Comm (ms)", round(summary.comm_ms, 3))
+            _row("Exposed comm (ms)", round(summary.exposed_comm_ms, 3))
+            _row("Overlap ratio", f"{summary.overlap_ratio:.1%}")
+            _section("── HW Efficiency ──")
+            _row("MFU", f"{summary.mfu:.2%}")
+            _row("HBM BW util", f"{summary.hbm_bandwidth_util:.2%}")
+            _row("Arith intensity (ops/byte)", round(summary.arithmetic_intensity, 2))
+            _row("Total FLOPs (T)", round(summary.total_flops / 1e12, 4))
+            _row("Total bytes (GB)", round(summary.total_bytes / 1e9, 4))
+            _row("  Read (GB)", round(summary.read_bytes / 1e9, 4))
+            _row("  Write (GB)", round(summary.write_bytes / 1e9, 4))
+
+        if summary.by_component:
+            _section("── By Component (% of serial latency) ──")
+            for comp, pct in sorted(summary.by_component.items(), key=lambda x: -x[1]):
+                _row(comp, f"{pct:.1f}%")
+        if summary.by_layer:
+            _section("── By Layer (ms) ──")
+            n = len(summary.by_layer)
+            avg = sum(summary.by_layer) / n if n else 0
+            _row(f"Layers ({n}, avg {avg:.3f} ms)", "")
+            for i, lat in enumerate(summary.by_layer):
+                _row(f"  Layer {i}", round(lat, 4))
+        if summary.memory_budget is not None:
+            mb = summary.memory_budget
+            _section("── Memory Budget (per GPU) ──")
+            _row("Weights (GB)", round(mb.weights / 1e9, 3))
+            _row("KV cache (GB)", round(mb.kv_cache_mb * 1e-3, 3))
+            _row("Activations (GB)", round(mb.activation_peak_mb * 1e-3, 3))
+            _row("Total (GB)", round(mb.total_mb * 1e-3, 3))
+            _row("Feasible", "Yes" if mb.is_feasible else "No (OOM)")
+
+    def _write_bottlenecks_sheet(self, wb: openpyxl.Workbook, summary) -> None:
+        """Write top bottleneck operators (Step 3)."""
+        ws = wb.create_sheet("Top Bottlenecks")
+        ws.column_dimensions["A"].width = 8
+        ws.column_dimensions["B"].width = 50
+        ws.column_dimensions["C"].width = 16
+        ws.column_dimensions["D"].width = 14
+        ws.column_dimensions["E"].width = 12
+        self._write_header(ws, [
+            ("#", 8), ("Operator", 50), ("Latency (us)", 16),
+            ("% of Total", 14), ("Bound", 12),
+        ])
+        total_us = summary.latency_ms * 1000
+        for idx, (op_desc, lat_us) in enumerate(summary.top_bottleneck_ops, 1):
+            pct = (lat_us / total_us * 100) if total_us > 0 else 0
+            bound = ""
+            if "[" in op_desc:
+                parts = op_desc.split("[")
+                bound = parts[1].rstrip("]") if len(parts) > 1 else ""
+            self._write_row(ws, idx + 1, [idx, op_desc, round(lat_us, 2),
+                                           f"{pct:.1f}%", bound])
+        ws.freeze_panes = "A2"
+
+    # ── Unified full-report writers ───────────────────────────────────────────
+
+    def write_full_inference(
+        self,
+        config_summary: Dict[str, Any],
+        raw_records: List[Dict[str, Any]],
+        fused_records: List[Dict[str, Any]],
+        transformed_graph: OpGraph,
+        ctx: TransformContext,
+        summary,
+        output_path: Path,
+    ) -> None:
+        """Write complete inference report: Step 1 (capture) + Step 2 (transform) + Step 3 (perf).
+
+        Sheet order:
+          1. Model Config
+          2. Raw Operators
+          3. Fused Operators
+          4. Summary
+          5. By Layer
+          6. Fusion Rules
+          7. Transformed Operators
+          8. Communication Ops
+          9. Parallelism Summary
+          10. Stream Assignment
+          11. Performance Summary
+          12. Top Bottlenecks
+        """
+        wb = openpyxl.Workbook()
+
+        # Step 1: Raw capture
+        self._write_model_config_sheet(wb, config_summary)
+        self._write_raw_operators_sheet(wb, raw_records)
+        self._write_fused_operators_sheet(wb, fused_records)
+        self._write_summary_sheet(wb, fused_records)
+        self._write_by_layer_sheet(wb, raw_records, fused_records)
+        self._write_fusion_rules_sheet(wb, fused_records, output_path.parent)
+
+        # Step 2: Transformed graph
+        self._write_transformed_ops_sheet(wb, transformed_graph, ctx)
+        self._write_communication_sheet(wb, transformed_graph, ctx)
+        self._write_parallelism_summary_sheet(wb, transformed_graph, ctx)
+        self._write_stream_assignment_sheet(wb, transformed_graph, ctx)
+
+        # Step 3: Performance
+        self._write_perf_summary_sheet(wb, summary)
+        self._write_bottlenecks_sheet(wb, summary)
+
+        wb.save(output_path)
+        logger.info("Exported full inference report to %s", output_path)
+
+    def write_full_training(
+        self,
+        config_summary: Dict[str, Any],
+        fwd_raw: List[Dict[str, Any]],
+        fwd_fused: List[Dict[str, Any]],
+        bwd_raw: List[Dict[str, Any]],
+        bwd_fused: List[Dict[str, Any]],
+        fwd_graph: OpGraph,
+        bwd_graph: OpGraph,
+        ctx: TransformContext,
+        training_summary,
+        output_path: Path,
+    ) -> None:
+        """Write complete training report: Step 1 (fwd+bwd) + Step 2 (fwd+bwd) + Step 3 (perf).
+
+        Sheet order:
+          1. Model Config
+          2. Raw Operators (fwd)
+          3. Fused Operators (fwd)
+          4. Raw Operators (bwd)
+          5. Fused Operators (bwd)
+          6. Summary
+          7. By Layer
+          8. Fusion Rules
+          9. Transformed Operators (fwd)
+          10. Communication Ops (fwd)
+          11. Parallelism Summary
+          12. Stream Assignment
+          13. Backward Operators
+          14. Recompute Ops
+          15. Training Summary
+          16. Top Bottlenecks
+        """
+        wb = openpyxl.Workbook()
+
+        # Step 1: Raw capture (fwd + bwd)
+        self._write_model_config_sheet(wb, config_summary)
+        self._write_raw_operators_sheet(wb, fwd_raw, "fwd")
+        self._write_fused_operators_sheet(wb, fwd_fused, "fwd")
+        self._write_raw_operators_sheet(wb, bwd_raw, "bwd")
+        self._write_fused_operators_sheet(wb, bwd_fused, "bwd")
+        # Merge raw/fused for summary and by-layer
+        all_raw = fwd_raw + bwd_raw
+        all_fused = fwd_fused + bwd_fused
+        self._write_summary_sheet(wb, all_fused)
+        self._write_by_layer_sheet(wb, all_raw, all_fused)
+        self._write_fusion_rules_sheet(wb, all_fused, output_path.parent)
+
+        # Step 2: Transformed graph (fwd + bwd)
+        self._write_transformed_ops_sheet(wb, fwd_graph, ctx)
+        self._write_communication_sheet(wb, fwd_graph, ctx)
+        self._write_parallelism_summary_sheet(wb, fwd_graph, ctx)
+        self._write_stream_assignment_sheet(wb, fwd_graph, ctx)
+        self._write_backward_ops_sheet(wb, bwd_graph, ctx)
+        self._write_recompute_sheet(wb, bwd_graph)
+
+        # Step 3: Performance
+        self._write_perf_summary_sheet(wb, training_summary)
+        self._write_bottlenecks_sheet(wb, training_summary)
+
+        wb.save(output_path)
+        logger.info("Exported full training report to %s", output_path)
 
 
 def export_transformed_graph(graph: OpGraph, ctx: TransformContext,
@@ -894,6 +1345,125 @@ def export_training_graphs(
     json_fwd = output_dir / f"{base}_train_forward.json"
     _export_json(fwd_graph, ctx, json_fwd)
 
+    json_bwd = output_dir / f"{base}_train_backward.json"
+    _export_json(bwd_graph, ctx, json_bwd)
+
+    return {"excel": excel_path, "json_fwd": json_fwd, "json_bwd": json_bwd}
+
+
+# ── Unified full-report exports ───────────────────────────────────────────────
+
+def export_full_report(
+    config_summary: Dict[str, Any],
+    raw_records: List[Dict[str, Any]],
+    fused_records: List[Dict[str, Any]],
+    transformed_graph: OpGraph,
+    ctx: TransformContext,
+    summary,
+    output_dir: Path,
+) -> Dict[str, Path]:
+    """Export complete inference report: capture + transform + performance.
+
+    Single Excel file with all sheets:
+      Model Config → Raw Operators → Fused Operators → Summary → By Layer →
+      Fusion Rules → Transformed Operators → Communication Ops →
+      Parallelism Summary → Stream Assignment → Performance Summary →
+      Top Bottlenecks
+
+    Parameters
+    ----------
+    config_summary : dict
+        Model configuration from ``build_config_summary()``.
+    raw_records : list[dict]
+        Raw aten op records from ``run_trace_phases``.
+    fused_records : list[dict]
+        Fused op records from ``FusionEngine.fuse_keep_children()``.
+    transformed_graph : OpGraph
+        Transformed graph from ``TransformPipeline.run()``.
+    ctx : TransformContext
+        Transform context with parallel/stream config.
+    summary : E2ESummary
+        Performance summary from ``build_summary()``.
+    output_dir : Path
+        Output directory.
+
+    Returns
+    -------
+    dict[str, Path]
+        {"excel": ..., "json": ...}
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    base = summary.model.replace("/", "_").replace(":", "_")
+    phase = summary.phase
+
+    excel_path = output_dir / f"{base}_{phase}_full_report.xlsx"
+    writer = TransformedGraphExcelWriter()
+    writer.write_full_inference(
+        config_summary, raw_records, fused_records,
+        transformed_graph, ctx, summary, excel_path,
+    )
+
+    json_path = output_dir / f"{base}_{phase}_full_report.json"
+    _export_json(transformed_graph, ctx, json_path)
+
+    return {"excel": excel_path, "json": json_path}
+
+
+def export_full_training_report(
+    config_summary: Dict[str, Any],
+    fwd_raw: List[Dict[str, Any]],
+    fwd_fused: List[Dict[str, Any]],
+    bwd_raw: List[Dict[str, Any]],
+    bwd_fused: List[Dict[str, Any]],
+    fwd_graph: OpGraph,
+    bwd_graph: OpGraph,
+    ctx: TransformContext,
+    training_summary,
+    output_dir: Path,
+) -> Dict[str, Path]:
+    """Export complete training report: capture(fwd+bwd) + transform(fwd+bwd) + performance.
+
+    Single Excel file with all sheets:
+      Model Config → Raw Ops (fwd) → Fused Ops (fwd) → Raw Ops (bwd) →
+      Fused Ops (bwd) → Summary → By Layer → Fusion Rules →
+      Transformed Ops (fwd) → Communication Ops (fwd) →
+      Parallelism Summary → Stream Assignment → Backward Operators →
+      Recompute Ops → Training Summary → Top Bottlenecks
+
+    Parameters
+    ----------
+    config_summary : dict
+        Model configuration.
+    fwd_raw / fwd_fused : list[dict]
+        Forward raw and fused op records.
+    bwd_raw / bwd_fused : list[dict]
+        Backward raw and fused op records.
+    fwd_graph / bwd_graph : OpGraph
+        Transformed forward/backward graphs.
+    ctx : TransformContext
+        Transform context (with training config).
+    training_summary : TrainingSummary
+        Training performance summary.
+    output_dir : Path
+        Output directory.
+
+    Returns
+    -------
+    dict[str, Path]
+        {"excel": ..., "json_fwd": ..., "json_bwd": ...}
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    base = fwd_graph.name.replace("/", "_").replace(":", "_").replace("_train_forward", "")
+
+    excel_path = output_dir / f"{base}_full_training.xlsx"
+    writer = TransformedGraphExcelWriter()
+    writer.write_full_training(
+        config_summary, fwd_raw, fwd_fused, bwd_raw, bwd_fused,
+        fwd_graph, bwd_graph, ctx, training_summary, excel_path,
+    )
+
+    json_fwd = output_dir / f"{base}_train_forward.json"
+    _export_json(fwd_graph, ctx, json_fwd)
     json_bwd = output_dir / f"{base}_train_backward.json"
     _export_json(bwd_graph, ctx, json_bwd)
 

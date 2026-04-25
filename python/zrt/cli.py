@@ -232,7 +232,7 @@ def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
     )
     from python.zrt.executor import DAGScheduler
     from python.zrt.simulator import SimulatorHub
-    from python.zrt.report import build_summary
+    from python.zrt.report import build_summary, export_html_report, export_chrome_trace
     from python.zrt.graph.excel_writer import append_perf_summary
 
     ctx = TransformContext(
@@ -243,6 +243,9 @@ def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
     pipe = build_default_pipeline()
     hub = SimulatorHub.default()
     scheduler = DAGScheduler(hw_spec=hw)
+
+    slug = _make_model_slug(model_id)
+    report_dir = result.output_dir / "reports"
 
     for phase, (raw_graph, _) in result.graphs.items():
         g = pipe.run(raw_graph, ctx)
@@ -265,11 +268,30 @@ def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
         except UnicodeEncodeError:
             logger.info("Performance summary: %s", summary)
 
-        slug = _make_model_slug(model_id)
         xlsx_path = result.output_dir / f"{slug}_{phase}_ops.xlsx"
         if xlsx_path.exists():
             append_perf_summary(xlsx_path, summary)
             logger.info("Performance summary written to %s", xlsx_path)
+
+        # Auto-export HTML + Chrome Trace
+        try:
+            report_dir.mkdir(parents=True, exist_ok=True)
+            export_html_report(
+                summary, report_dir / f"{slug}_{phase}_report.html",
+                timeline_data=[
+                    {"start": op.start_us, "end": op.end_us,
+                     "stream": op.stream_id, "type": op.stream_type}
+                    for op in tl.scheduled_ops
+                ],
+            )
+            export_chrome_trace(
+                tl, report_dir / f"{slug}_{phase}_trace.json",
+                name=f"{model_id} | {phase}",
+                metadata={"model": model_id, "hardware": args.hw,
+                          "phase": phase, "parallel": f"TP{args.tp}"},
+            )
+        except Exception as exc:
+            logger.warning("Report export failed: %s", exc)
 
 
 def _run_training_modelling(args, model_id: str, hw, result) -> None:
@@ -313,6 +335,34 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
         print(f"\n{report.summary()}")
     except UnicodeEncodeError:
         logger.info("Training summary:\n%s", report.summary())
+
+        # Auto-export HTML + Chrome Trace
+        try:
+            report_dir = output_dir / "reports"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            export_html_report(
+                summary, report_dir / "training_report.html",
+                timeline_data=[
+                    {"start": op.start_us, "end": op.end_us,
+                     "stream": op.stream_id, "type": op.stream_type}
+                    for op in fwd_tl.scheduled_ops
+                ],
+            )
+            export_chrome_trace(
+                fwd_tl, report_dir / "train_forward_trace.json",
+                name=f"{model_id} | train_forward",
+                metadata={"model": model_id, "hardware": args.hw,
+                          "phase": "train_forward", "parallel": parallel_desc},
+            )
+            if raw_bwd is not None:
+                export_chrome_trace(
+                    bwd_tl, report_dir / "train_backward_trace.json",
+                    name=f"{model_id} | train_backward",
+                    metadata={"model": model_id, "hardware": args.hw,
+                              "phase": "train_backward", "parallel": parallel_desc},
+                )
+        except Exception as exc:
+            logger.warning("Report export failed: %s", exc)
 
 
 def _run_estimate(config_path: str, output_path: str | None) -> None:
