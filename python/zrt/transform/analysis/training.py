@@ -161,27 +161,20 @@ class TrainingMemoryPass(GraphPass):
         opt_bytes_per_param = 12 if optimizer in ("adam", "adamw") else 8
         opt_bytes = (total_params * opt_bytes_per_param) / opt_shard
 
-        # ── Activation memory (Korthikanti) ─────────────────────────────────
+        # ── Activation memory ─────────────────────────────────────────────────
         seq_len = g.metadata.get("seq_len", 2048)
         hidden = g.metadata.get("hidden", 4096)
         num_layers = g.metadata.get("num_layers", 32)
         batch_size = ctx.training.micro_batch if ctx.training else 1
 
-        # Korthikanti upper bound: 34 * hidden * seq_len * num_layers * batch_size
-        base = 34 * hidden * seq_len * num_layers * batch_size
-
-        # Parallel sharding: TP cuts hidden/attn; CP cuts seq (if cp > 1)
-        shard = tp * max(cp, 1)
-
-        # Recompute policy multiplier
-        rc = getattr(ctx.training, "recompute_policy", "selective") if ctx.training else "selective"
-        rc_mult = {"none": 1.0, "selective": 0.5, "full": 0.1}.get(rc, 1.0)
-
-        # PP inflight depth: 1F1B steady state, stage 0 holds pp microbatches
-        # Phase 2 will replace with (pp - stage_id); Phase 1 uses conservative pp
-        inflight = pp
-
-        activations_bytes = (base / shard) * rc_mult * inflight
+        if g.metadata.get("fwd_bwd_stitched"):
+            # Graph-native path: sum saved activations from fwd→bwd tensor liveness
+            activations_bytes = self._graph_native_activations(g, tp, cp)
+        else:
+            # Korthikanti formula fallback
+            activations_bytes = self._korthikanti_activations(
+                g, ctx, seq_len, hidden, num_layers, batch_size, tp, cp, pp,
+            )
 
         # Communication buffers: AG/RS buffers
         comm_bytes = (2 * hidden * seq_len * num_layers) / tp
@@ -197,6 +190,72 @@ class TrainingMemoryPass(GraphPass):
         g.metadata["memory_breakdown"] = breakdown
 
         return g
+
+    # ── Activation memory strategies ─────────────────────────────────────────
+
+    def _korthikanti_activations(self, g, ctx, seq_len, hidden, num_layers,
+                                  batch_size, tp, cp, pp):
+        """Korthikanti formula: 34 * h * s * L * bs with sharding and inflight."""
+        base = 34 * hidden * seq_len * num_layers * batch_size
+        shard = tp * max(cp, 1)
+
+        rc = getattr(ctx.training, "recompute_policy", "selective") if ctx.training else "selective"
+        rc_mult = {"none": 1.0, "selective": 0.5, "full": 0.1}.get(rc, 1.0)
+
+        # Stage-aware inflight (peak over local stages):
+        # approximate activation volume per stage and scale by each stage's
+        # inflight depth (pp - stage_id), then take the peak.
+        stage_ids = {n.annotations.get("stage_id") for n in g.nodes.values()
+                     if "stage_id" in n.annotations}
+        if stage_ids and pp > 1:
+            stage_ids_int = sorted(
+                sid for sid in stage_ids if isinstance(sid, int)
+            )
+            if stage_ids_int:
+                num_local_stages = len(stage_ids_int)
+                per_stage_base = (base / shard) * rc_mult / max(num_local_stages, 1)
+                peak_stage = max(max(pp - s, 1) for s in stage_ids_int)
+                return per_stage_base * peak_stage
+            max_inflight = pp
+        else:
+            max_inflight = pp
+
+        return (base / shard) * rc_mult * max_inflight
+
+    def _graph_native_activations(self, g, tp, cp):
+        """Graph-native: sum saved activations from fwd→bwd edge liveness.
+
+        Requires fwd_bwd_stitched=True in metadata. Accepts phase aliases:
+        "fwd"/"forward"/"train_forward" and
+        "bwd"/"backward"/"train_backward".
+        Nodes with annotations["recompute"] == True have their outputs excluded.
+        """
+        shard = tp * max(cp, 1)
+
+        # Classify nodes by phase annotation
+        fwd_nodes = set()
+        bwd_nodes = set()
+        for nid, node in g.nodes.items():
+            phase = node.annotations.get("phase", "")
+            if phase in {"bwd", "backward", "train_backward"}:
+                bwd_nodes.add(nid)
+            else:
+                fwd_nodes.add(nid)
+
+        # Sum bytes on edges from forward to backward nodes = saved activations
+        saved_bytes = 0
+        recomputed_nodes = {
+            nid for nid, n in g.nodes.items() if n.annotations.get("recompute")
+        }
+
+        for edge in g.edges:
+            if edge.src in fwd_nodes and edge.dst in bwd_nodes:
+                # Skip activations from recomputed nodes (they are freed)
+                if edge.src in recomputed_nodes:
+                    continue
+                saved_bytes += edge.tensor.mem_bytes if hasattr(edge.tensor, 'mem_bytes') else 0
+
+        return saved_bytes / shard
 
 
 # ── TrainingPipelinePass ────────────────────────────────────────────────────────
@@ -309,22 +368,27 @@ class TrainingPipelinePass(GraphPass):
             if layer_scale != 1.0:
                 per_stage_us *= layer_scale
 
-        pp_schedule = (ctx.training.pp_schedule if ctx.training else "1f1b")
-        V = max(1, ctx.training.vpp_chunks if ctx.training else 1)
+            # Schedule-type bubble for the non-phase-aware path.
+            # Phase-aware path (pp>1, stage_id present) already computed step_time_us
+            # and bubble_fraction via the heterogeneous/homogeneous formula above.
+            # TODO Phase 3: apply VPP/DualPipe adjustments to the per-stage path too.
+            pp_schedule = (ctx.training.pp_schedule if ctx.training else "1f1b")
+            V = max(1, ctx.training.vpp_chunks if ctx.training else 1)
 
-        if pp_schedule == "interleaved" and V > 1 and pp > 1:
-            bubble_us = (pp - 1) * per_stage_us / V
-        elif pp_schedule == "dualpipev" and pp > 1:
-            bubble_us = (pp - 1) * per_stage_us / (2.0 * max(1, V))
-        elif pp_schedule == "dualpipe" and pp > 1:
-            bubble_us = (pp - 1) * per_stage_us / 2.0
-        else:  # "1f1b" or pp == 1
-            bubble_us = (pp - 1) * per_stage_us
+            if pp_schedule == "interleaved" and V > 1 and pp > 1:
+                bubble_us = (pp - 1) * per_stage_us / V
+            elif pp_schedule == "dualpipev" and pp > 1:
+                bubble_us = (pp - 1) * per_stage_us / (2.0 * max(1, V))
+            elif pp_schedule == "dualpipe" and pp > 1:
+                bubble_us = (pp - 1) * per_stage_us / 2.0
+            else:  # "1f1b" or pp == 1
+                bubble_us = (pp - 1) * per_stage_us
 
-        step_time_us = num_microbatches * per_stage_us + bubble_us
+            step_time_us = num_microbatches * per_stage_us + bubble_us
+            bubble_fraction = bubble_us / step_time_us if step_time_us > 0 else 0.0
+
         step_time_ms = step_time_us / 1000.0
         per_stage_ms = per_stage_us / 1000.0
-        bubble_fraction = bubble_us / step_time_us if step_time_us > 0 else 0.0
 
         # DP-in-bubble: if DP AR fits inside the bubble window, it is free;
         # otherwise the exposed portion adds to step time.
@@ -335,14 +399,65 @@ class TrainingPipelinePass(GraphPass):
                 if n.annotations.get("dp_comm") and n.attrs.get("bucket_bytes", 0) > 0
             ]
             if dp_comm_nodes:
-                bucket_bytes = sum(n.attrs["bucket_bytes"] for n in dp_comm_nodes)
-                dp_bw_bytes_per_us = hw.interconnect.inter_node.bandwidth_gbps * 1e9 / 8 / 1e6
-                ring_factor = 2.0 * (dp - 1) / dp
-                t_dp_ar_us = ring_factor * bucket_bytes / dp_bw_bytes_per_us if dp_bw_bytes_per_us > 0 else 0.0
+                # Prefer latency annotations on comm nodes when available
+                latency_sum = sum(
+                    n.annotations.get("latency_us", 0.0) for n in dp_comm_nodes
+                )
+                if latency_sum > 0.0:
+                    t_dp_ar_us = latency_sum
+                else:
+                    # Fallback: alpha-beta bandwidth formula
+                    bucket_bytes = sum(n.attrs["bucket_bytes"] for n in dp_comm_nodes)
+                    dp_bw_bytes_per_us = hw.interconnect.inter_node.bandwidth_gbps * 1e9 / 8 / 1e6
+                    ring_factor = 2.0 * (dp - 1) / dp
+                    t_dp_ar_us = ring_factor * bucket_bytes / dp_bw_bytes_per_us if dp_bw_bytes_per_us > 0 else 0.0
                 bubble_us = (pp - 1) * per_stage_us
                 t_exposed_dp_us = max(0.0, t_dp_ar_us - bubble_us)
                 step_time_us += t_exposed_dp_us
                 step_time_ms = step_time_us / 1000.0
+
+        # Overlap-aware comm time: reduce step_time by hidden comm
+        overlap_nodes = [
+            n for n in g.nodes.values()
+            if n.category == "communication"
+            and n.annotations.get("overlap_type", "none") != "none"
+            and n.annotations.get("latency_us", 0) > 0
+        ]
+        if overlap_nodes:
+            total_comm_us = 0.0
+            total_exposed_us = 0.0
+            for cn in overlap_nodes:
+                comm_lat = cn.annotations["latency_us"]
+                otype = cn.annotations["overlap_type"]
+                # Resolve target compute node latency for overlap
+                target_lat = 0.0
+                target_key = cn.annotations.get("overlap_target", "")
+                if target_key:
+                    # For ring_cp: target_key is "fa_tile:<node_id>"
+                    target_id = target_key.split(":", 1)[1] if ":" in target_key else target_key
+                    target_node = g.nodes.get(target_id)
+                    if target_node:
+                        target_lat = target_node.annotations.get("latency_us", 0.0)
+                # CoC fallback: if no explicit overlap target, use predecessor
+                # compute latency as the overlap window reference.
+                if otype == "coc" and target_lat <= 0.0:
+                    pred_ids = g.predecessors(cn.id)
+                    pred_lats = [
+                        g.nodes[p].annotations.get("latency_us", 0.0)
+                        for p in pred_ids
+                        if g.nodes[p].category != "communication"
+                    ]
+                    if pred_lats:
+                        target_lat = max(pred_lats)
+                exposed = compute_exposed_comm_time(
+                    comm_lat, otype, target_lat,
+                    coc_tile_k=cn.attrs.get("coc_tile_k", 4),
+                )
+                total_comm_us += comm_lat
+                total_exposed_us += exposed
+            hidden_us = total_comm_us - total_exposed_us
+            step_time_us -= hidden_us
+            step_time_ms = step_time_us / 1000.0
 
         warmup_steps = max(0, pp - 1)
         cooldown_steps = max(0, pp - 1)
@@ -370,3 +485,37 @@ class TrainingPipelinePass(GraphPass):
 
         g.metadata["pipeline_metrics"] = metrics
         return g
+
+
+# ── Exposed comm-time helper ────────────────────────────────────────────────────
+
+def compute_exposed_comm_time(
+    comm_latency_us: float,
+    overlap_type: str,
+    target_latency_us: float = 0.0,
+    coc_tile_k: int = 4,
+) -> float:
+    """Compute exposed (non-hidden) communication time under overlap.
+
+    Args:
+        comm_latency_us: latency of the comm node in microseconds.
+        overlap_type: "coc", "mc2", "ring_cp", or "none".
+        target_latency_us: latency of the compute node being overlapped.
+        coc_tile_k: number of tiles for CoC overlap (default 4).
+
+    Returns:
+        Exposed comm time in microseconds (>= 0).
+    """
+    if overlap_type == "mc2":
+        # MC2: fully fused AG+matmul, zero exposed comm
+        return 0.0
+    elif overlap_type == "coc":
+        # CoC: comm overlaps with matmul*(k-1)/k window
+        overlap_window = target_latency_us * (coc_tile_k - 1) / coc_tile_k
+        return max(0.0, comm_latency_us - overlap_window)
+    elif overlap_type == "ring_cp":
+        # Ring-CP: P2P overlaps with FA tile
+        return max(0.0, comm_latency_us - target_latency_us)
+    else:
+        # No overlap: full comm time is exposed
+        return comm_latency_us

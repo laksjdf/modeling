@@ -102,9 +102,16 @@ class StreamAssignPass(GraphPass):
       - category == "communication" → comm streams (round-robin)
       - category == "compute" / "memory" → compute streams (round-robin)
 
+    Overlap detection (based on existing annotations/attrs):
+      - Ring-CP: overlap_target starts with "fa_tile:" → overlap_type="ring_cp"
+      - MC2: attrs["fused_ag_matmul"] → overlap_type="mc2"
+      - CoC: attrs["coc_tile_k"] → overlap_type="coc"
+      - Otherwise → overlap_type="none"
+
     Adds to every node:
-      node.annotations["stream_id"]   : int
-      node.annotations["stream_type"] : "compute" | "comm"
+      node.annotations["stream_id"]    : int
+      node.annotations["stream_type"]  : "compute" | "comm"
+      node.annotations["overlap_type"] : "coc" | "mc2" | "ring_cp" | "none"  (comm nodes only)
     """
 
     name = "stream_assign"
@@ -121,6 +128,10 @@ class StreamAssignPass(GraphPass):
                 sid  = sc.comm_stream_id(comm_idx)
                 stype = "comm"
                 comm_idx += 1
+
+                # Overlap type detection from existing annotations/attrs
+                overlap = self._detect_overlap_type(node)
+                node.annotations["overlap_type"] = overlap
             else:
                 sid  = sc.compute_stream_id(compute_idx)
                 stype = "compute"
@@ -130,3 +141,18 @@ class StreamAssignPass(GraphPass):
             node.annotations["stream_type"] = stype
 
         return g
+
+    @staticmethod
+    def _detect_overlap_type(node) -> str:
+        """Determine overlap type from node annotations and attrs."""
+        # Ring-CP: P2P nodes with fa_tile overlap_target
+        overlap_target = node.annotations.get("overlap_target", "")
+        if overlap_target.startswith("fa_tile:"):
+            return "ring_cp"
+        # MC2: fused all_gather + matmul
+        if node.attrs.get("fused_ag_matmul"):
+            return "mc2"
+        # CoC: communication-over-compute with tile factor
+        if node.attrs.get("coc_tile_k"):
+            return "coc"
+        return "none"

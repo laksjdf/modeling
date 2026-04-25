@@ -8,6 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Tech Stack**: Python 3.14+, PyTorch 2.0+, transformers 4.36+ (version-agnostic via compat shims), networkx, openpyxl, onnx
 
+**Hot Paths** (frequently accessed files): `python/zrt/transform/analysis/modeller.py`, `tests/training/test_captured_graph_modelling.py`, `python/zrt/transform/analysis/training.py`
+
 ## Commands
 
 ```bash
@@ -133,3 +135,17 @@ Local model configs (no weights) live in `hf_models/` (deepseek_v3, llama3_8b, e
 **Hardware Registry Pattern**: `hw_registry.load(name)` loads YAML configs into `HardwareSpec` objects. Hardware details never hardcode in transform logic.
 
 **Training Memory Estimation**: Training memory calculation uses per-component formulas (weights, gradients, optimizer states, activations) with ZeRO staging (0-3) and gradient checkpointing support.
+
+## Design Documentation
+
+Key design docs in `docs/`:
+- `training_modeller_zh.md` — Training performance modeling design
+- `phase0_improvement_plan.md` — Phase 0 improvements (forward/backward graph stitching)
+- `training_integration_design.md` — Training integration architecture
+
+## Coding Conventions
+
+- **Naming**: `snake_case` for files/functions/variables, `PascalCase` for classes
+- **Testing**: Use `pytest`, name tests `test_<behavior>.py`, test functions `test_<expected_behavior>()`
+- **Imports**: Group standard library, third-party, local imports; keep consistent with surrounding code
+- **Commits**: Short, imperative subjects (e.g., `修复import报错`, `bug fix phase1`), include rationale for non-trivial changes

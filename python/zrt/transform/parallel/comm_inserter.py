@@ -184,30 +184,41 @@ class CommInserterPass(GraphPass):
         if cp <= 1:
             return
 
+        # Message-size parameters from graph metadata and training config
+        seq_len = g.metadata.get("seq_len", 2048)
+        hidden = g.metadata.get("hidden", 4096)
+        dtype_bytes = 2  # BF16
+        micro_batch = ctx.training.micro_batch if ctx.training else 1
+
+        # Ulysses A2A: each rank gets seq_len/cp tokens, full hidden dim
+        ulysses_msg_bytes = micro_batch * (seq_len // cp) * hidden * dtype_bytes
+        # Ring P2P: each round sends a KV chunk of seq_len/cp tokens
+        ring_msg_bytes = micro_batch * (seq_len // cp) * hidden * dtype_bytes
+
         # Iterate over nodes with CP split annotations
         cp_nodes = [
             n for n in list(g.topo_sort())
             if n.annotations.get("cp_split")
         ]
-        
+
         for node in cp_nodes:
             cp_split = node.annotations.get("cp_split", {})
             cp_kind = cp_split.get("kind", "none")
-            
+
             if cp_kind == "ulysses":
-                # Ulysses: A2A scatter-seq/gather-heads BEFORE attn core; inverse A2A AFTER
+                # Ulysses: A2A scatter-seq/gather-heads BEFORE attn; inverse A2A AFTER
                 pre_comm_id = f"comm_a2a_cp_pre_{node.id}"
                 post_comm_id = f"comm_a2a_cp_post_{node.id}"
-                
+
                 if pre_comm_id not in g.nodes:
-                    # Pre-A2A: scatter-seq
                     pre_comm = OpNode(
                         id=pre_comm_id,
                         op_type="comm.all_to_all",
                         inputs=copy.deepcopy(node.inputs),
                         outputs=copy.deepcopy(node.inputs),
                         attrs={"group_size": cp, "collective": "all_to_all",
-                               "role": "cp_ulysses_pre"},
+                               "role": "cp_ulysses_pre",
+                               "message_size_bytes": ulysses_msg_bytes},
                         scope=node.scope,
                         layer=node.layer,
                         category="communication",
@@ -217,14 +228,14 @@ class CommInserterPass(GraphPass):
                     _prepend_comm(g, node.id, pre_comm)
 
                 if post_comm_id not in g.nodes:
-                    # Post-A2A: gather-heads
                     post_comm = OpNode(
                         id=post_comm_id,
                         op_type="comm.all_to_all",
                         inputs=copy.deepcopy(node.outputs),
                         outputs=copy.deepcopy(node.outputs),
                         attrs={"group_size": cp, "collective": "all_to_all",
-                               "role": "cp_ulysses_post"},
+                               "role": "cp_ulysses_post",
+                               "message_size_bytes": ulysses_msg_bytes},
                         scope=node.scope,
                         layer=node.layer,
                         category="communication",
@@ -233,27 +244,27 @@ class CommInserterPass(GraphPass):
                     _rewire(g, node.id, post_comm)
 
             elif cp_kind == "ring":
-                # Ring: N rounds of P2P, each annotated as its own comm node
+                # Ring: N rounds of P2P, each overlapped with an FA tile
                 p2p_rounds = cp_split.get("p2p_rounds", cp)
                 for i in range(p2p_rounds):
                     p2p_id = f"comm_p2p_cp_ring_{node.id}_round_{i}"
                     if p2p_id not in g.nodes:
-                        # Create P2P communication node
                         p2p_comm = OpNode(
                             id=p2p_id,
                             op_type="comm.send_recv",
                             inputs=copy.deepcopy(node.inputs),
                             outputs=copy.deepcopy(node.inputs),
                             attrs={"group_size": cp, "collective": "send_recv",
-                                   "role": "cp_ring", "round": i},
+                                   "role": "cp_ring", "round": i,
+                                   "message_size_bytes": ring_msg_bytes,
+                                   "scope": node.scope, "layer": node.layer},
                             scope=node.scope,
                             layer=node.layer,
                             category="communication",
                         )
                         p2p_comm.annotations["inserted_by"] = "cp_pass"
-                        p2p_comm.annotations["overlap_target"] = node.id
+                        p2p_comm.annotations["overlap_target"] = f"fa_tile:{node.id}"
                         g.nodes[p2p_comm.id] = p2p_comm
-                        # Insert P2P node before the attention operation
                         _prepend_comm(g, node.id, p2p_comm)
 
 
