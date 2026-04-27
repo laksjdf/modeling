@@ -1,0 +1,23 @@
+# DeepSeek-V3.2 model specification
+# Reference: hf_models/deepseek_v3_2/config.json
+# Key differences from V3: first_k_dense_replace=3, moe_intermediate_size=2048, Indexer MLA
+
+name: deepseek-v3.2
+hidden: 7168
+ffn: 18432
+num_heads: 128
+num_kv_heads: 128
+head_dim: 128
+vocab: 129280
+seq_len: 4096
+layers: "[dense]*3+[moe]*57+[mtp]*1"
+num_experts: 256
+moe_ffn: 2048
+top_k: 8
+capacity_factor: 1.0
+expert_imbalance: 0.10
+mtp_depth: 1
+param_dtype: bf16
+grad_dtype: fp32
+master_dtype: fp32
+act_dtype: bf16

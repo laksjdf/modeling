@@ -1,0 +1,9 @@
+captured_with:
+  batch_size: 1
+  num_layers_traced: 2
+  seq_len: 4096
+model_id: qwen2_7b
+phases:
+- prefill
+- train_forward
+zrt_sim_version: '1542868'

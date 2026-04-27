@@ -1,0 +1,24 @@
+# DeepSeek-V3 training estimate — 8-node H100 SXM
+# Variant: loads from built-in model library (pre-captured OpGraph)
+
+model: deepseek_v3
+
+system:
+  hw: nvidia_h100_sxm
+  nodes: 8
+  gpus_per_node: 8
+  host_mem_gb: 2048
+
+strategy:
+  tp: 8
+  cp: 1
+  pp: 2
+  ep: 8
+  dp: 4
+  micro_batch: 1
+  global_batch: 1024
+  pp_schedule: 1f1b
+  zero_stage: 1
+  optimizer: adam
+  tp_overlap: none
+  builtin_model_id: deepseek_v3

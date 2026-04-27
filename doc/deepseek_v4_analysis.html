@@ -531,7 +531,397 @@ after:
 </div>
 
 <!-- =============================== 5 汇总 =============================== -->
-<h2>5 · 融合收益汇总（相对 V3.2 + 基础融合）</h2>
+<!-- =============================== 5 Mega-MoE 深度推导 =============================== -->
+<h2>5 · Mega-MoE 深度推导：NVLink/TensorCore 掩盖与 HBM 带宽下降</h2>
+<p class="small muted">
+  本节把 <b>M3 Mega-MoE</b> 放到显微镜下，逐层拆 overlap 机制并用 H100 SXM 参数做定量推导。
+  所有硬件数字按 H100 SXM5 峰值取值：HBM3 带宽 <code>B_HBM = 3.35 TB/s</code>，
+  NVLink-4 单向 <code>B_NVL = 450 GB/s</code>，FP8 TensorCore <code>T_fp8 = 1979 TFLOP/s</code>，
+  FP4 可近似 <code>T_fp4 ≈ 2 × T_fp8</code>（共享 MMA 阵列，精度减半吞吐翻倍）
+  <span class="badge infer">推测</span>；SM 总数 132。
+</p>
+
+<h3>5.0 Mega-MoE 内部模型结构</h3>
+<p class="small">
+  先给出 mega-kernel 生命周期内的一张"结构地图"：由哪些子组件组成、各组件物理上跑在哪组 SM、
+  数据从 HBM/smem/L2/symmetric heap 哪一层出、哪一层进。后面 5.1–5.5 都是基于这张图展开的机制与推导。
+</p>
+
+<h4>5.0.1 顶层架构图（单次 kernel launch 内部）</h4>
+<div class="diagram">
+┌───────────────── Persistent Kernel (one launch, alive through the entire MoE layer) ──────────────────┐
+│                                                                                                       │
+│   Local HBM              Producer SMs (~16) [推测]        Symmetric Heap             Consumer SMs (~116)│
+│   ──────────             ──────────────────────          ─────────────────           ───────────────── │
+│                                                                                                       │
+│   x ─TMA─▶   [Gate MatMul] ─smem─▶ [sqrtsoftplus +bias_noaux] ─smem─▶ [TopK-6]                          │
+│                                                              │                                        │
+│                                                              ▼                                        │
+│                                                    [Dispatch builder]                                 │
+│                                                              │ TMA.SYS                                │
+│                                                              └──NVLink put──▶  recv_buf  ◀── other ranks│
+│                                                                                   │                   │
+│                                                                                   ▼ L2/smem           │
+│                                                                           [Grouped-GEMM₁ (FP8×FP4)]   │
+│                                                                                   │ smem/reg          │
+│                                                                                   ▼                   │
+│                                                                           [SwiGLU  (register only)]   │
+│                                                                                   │ smem/reg          │
+│                                                                                   ▼                   │
+│                                                                           [Grouped-GEMM₂ (FP8×FP4)]   │
+│                                                                                   │                   │
+│                                                                                   ▼                   │
+│                                                                           [Shared-expert GEMM]        │
+│                                                                                   │  epilogue add     │
+│                                                                                   ▼                   │
+│                                                    [Combine builder]  ◀─smem─── y_partial             │
+│                                                              │ TMA.SYS                                │
+│                                                              └──NVLink get──▶  combined_buf           │
+│                                                                                   │                   │
+│   y ◀─TMA────────────────────────────────────────────────────────────────────────┘                    │
+│                                                                                                       │
+│   同步:  fence.sys / mbarrier 在 chunk 边界；chunks 间构成 ring pipeline（见 5.3.3）                    │
+└───────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+    数据流:    HBM ─▶ [smem/reg] ─▶ NVLink ─▶ [L2/smem] ─▶ [smem/reg] ─▶ NVLink ─▶ [smem] ─▶ HBM
+    HBM 仅 2 次:  入口读 x；出口写 y   （对比 V3.2 的 5 段 kernel、10+ 次 HBM round-trip）
+</div>
+<p class="small muted">
+  三条垂直泳道（Producer SMs / Symmetric Heap / Consumer SMs）表示物理位置；横向箭头是数据流；
+  <code>─TMA─▶</code> 表示本地 HBM 方向，<code>NVLink put/get</code> 表示跨卡方向，<code>smem / reg</code>
+  表示片上中转，<b>所有中间 activation 都绕过本地 HBM</b>。
+</p>
+
+<h4>5.0.2 组件职责表</h4>
+<table>
+<tr><th>#</th><th>组件</th><th>所在 SM 组</th><th>输入</th><th>输出</th><th>精度</th><th>关键备注</th></tr>
+<tr><td>1</td><td>Gate MatMul</td><td>Producer</td><td><code>x [N,H]</code>, <code>W_gate [H,E]</code></td><td><code>logits [N,E]</code></td><td>FP8 × FP8</td><td>E=384 输出小，单 tile 驻 smem</td></tr>
+<tr><td>2</td><td>sqrtsoftplus + <code>bias_noaux</code></td><td>Producer</td><td><code>logits</code></td><td><code>scores</code></td><td>FP32 累加</td><td>融进 Gate 的 epilogue</td></tr>
+<tr><td>3</td><td>TopK-6 (bitonic / radix)</td><td>Producer</td><td><code>scores</code></td><td><code>(idx, weight)</code></td><td>INT32 / FP16</td><td>整个 TopK 在 smem 完成</td></tr>
+<tr><td>4</td><td>Dispatch builder</td><td>Producer</td><td><code>x, idx</code></td><td>symmetric heap slot</td><td>FP8</td><td>发起 <code>TMA.SYS put</code>，走 NVLink</td></tr>
+<tr><td>5</td><td>Symmetric recv buf</td><td>共享 (L2 / DRAM-pinned)</td><td>跨 rank NVLink write</td><td>被 Consumer 读取</td><td>FP8</td><td>对称地址，fence.sys 同步</td></tr>
+<tr><td>6</td><td>Grouped-GEMM₁ (up+gate)</td><td>Consumer</td><td><code>recv_buf</code>, <code>W_up</code>+<code>W_gate</code></td><td><code>hidden [·,2I]</code></td><td>FP8 × <b>FP4</b></td><td>WGMMA async，按 expert 分组</td></tr>
+<tr><td>7</td><td>SwiGLU</td><td>Consumer</td><td><code>hidden</code></td><td><code>gated [·,I]</code></td><td>FP8 中间用 FP32</td><td><b>纯寄存器</b>，不过 smem</td></tr>
+<tr><td>8</td><td>Grouped-GEMM₂ (down)</td><td>Consumer</td><td><code>gated</code>, <code>W_down</code></td><td><code>y_partial [·,H]</code></td><td>FP8 × <b>FP4</b></td><td>与 GEMM₁ 共享 tile schedule</td></tr>
+<tr><td>9</td><td>Shared-expert GEMM</td><td>Consumer</td><td><code>x</code>, <code>W_shared</code></td><td><code>+= y_shared</code></td><td>FP8 × FP4</td><td>累加到 GEMM₂ 的 epilogue，不写 HBM</td></tr>
+<tr><td>10</td><td>Combine builder / NVLink get</td><td>Producer</td><td><code>y_partial</code></td><td><code>combined_buf</code></td><td>FP8</td><td>跨 rank reduce，<code>TMA.SYS get</code></td></tr>
+<tr><td>11</td><td>Output TMA store</td><td>Consumer</td><td><code>combined_buf</code></td><td><code>y [N,H]</code> 本地 HBM</td><td>FP8</td><td><b>整个 mega-kernel 唯一一次 HBM 写</b></td></tr>
+</table>
+<p class="small muted">
+  <b>关键不变量</b>：行 4/10 发起跨卡访问、行 6/8 发射 WGMMA——二者在物理硬件（NVLink engine vs TensorCore）
+  上完全解耦，且固定由不同 SM 组发射，从指令级就消除了对同一 warp scheduler 的争抢。
+</p>
+
+<h4>5.0.3 持久化 kernel 的 per-chunk 状态机</h4>
+<div class="diagram">
+   每个 chunk 在 mega-kernel 内经历 6 个状态：
+
+   ┌──▶ S0  idle       (等待上游 chunk 腾出 smem ring 槽)
+   │     │
+   │     ▼
+   │    S1  dispatch   (Producer : TopK + NVLink put)
+   │     │
+   │     ▼
+   │    S2  gemm₁      (Consumer : WGMMA FP8×FP4, up+gate)
+   │     │
+   │     ▼
+   │    S3  swiglu     (Consumer : register-only activation)
+   │     │
+   │     ▼
+   │    S4  gemm₂      (Consumer : WGMMA FP8×FP4, down + shared epilogue)
+   │     │
+   │     ▼
+   │    S5  combine    (Producer : NVLink get + partial sum)
+   │     │
+   └─────┘             (释放 smem 槽，返回 S0)
+
+   稳态流水快照 (pipeline_depth = 3, 5 chunks 同时在飞):
+
+          time   chunk₀   chunk₁   chunk₂   chunk₃   chunk₄
+          ────   ──────   ──────   ──────   ──────   ──────
+          t0     S5       S4       S3       S2       S1
+          t1     ·done·   S5       S4       S3       S2    ← chunk₅ 进入 S1
+          t2     ·done·   ·done·   S5       S4       S3    ← chunk₆ 进入 S1
+          ...
+
+   稳态下同时有:
+     • 1 个 chunk 正在 S1 (NVLink put)
+     • 2~3 个 chunk 正在 S2/S3/S4 (TensorCore 满占)
+     • 1 个 chunk 正在 S5 (NVLink get)
+   → 三种硬件引擎同时满负荷，overlap 达成。
+</div>
+
+<h4>5.0.4 内存层次分工</h4>
+<table>
+<tr><th>存储层</th><th>容量 (H100)</th><th>存什么</th><th>生命周期</th><th>读/写方</th></tr>
+<tr><td>本地 HBM3</td><td>80 GB / 3.35 TB/s</td><td>入口 <code>x</code>、出口 <code>y</code>；专家权重 stream</td><td>仅在 mega-kernel 首末各一次</td><td>入口: Producer TMA 读；出口: Consumer TMA 写</td></tr>
+<tr><td>本地 L2</td><td>50 MB</td><td>chunk ring staging；权重 tile cache</td><td>chunk 存在期间</td><td>Consumer 读权重；Producer/Consumer 共享 staging</td></tr>
+<tr><td>Symmetric Heap (NVLink 可达)</td><td>由 NVSHMEM/对称分配器决定</td><td><code>recv_buf</code> (dispatch 目标) / <code>combined_buf</code> (combine 源)</td><td>整个 kernel 生命周期</td><td>跨 rank Producer 写 / 本 rank Consumer 读</td></tr>
+<tr><td>Per-SM smem</td><td>228 KB × 132 SM</td><td>GEMM tile (A, B, accumulator)；TopK 排序区</td><td>单 chunk 的单个 GEMM stage</td><td>Consumer 发 WGMMA；Producer 排 TopK</td></tr>
+<tr><td>Register file</td><td>256 KB × 132 SM</td><td>SwiGLU 中间值；GEMM 累加器</td><td>单条指令流</td><td>仅 Consumer</td></tr>
+</table>
+<p class="small muted">
+  <b>"HBM 只碰两次"的根因</b>在这张表：所有跨 stage 的 activation 要么在 smem/register（同 SM 内），
+  要么在 symmetric heap（跨卡，走 NVLink 而非 HBM），因此 activation 的带宽账单完全从 HBM 搬到了 NVLink + 片上存储。
+</p>
+
+<h3>5.1 硬件前置：三条物理独立的带宽通路</h3>
+<p class="small">overlap 的本质是"同时踩住尽量多的独立硬件引擎"。H100 内部至少有三条互不共用带宽的通路：</p>
+<table>
+<tr><th>通路</th><th>物理引擎</th><th>峰值带宽</th><th>发起端</th><th>占用 SM 资源</th></tr>
+<tr><td>HBM 读写</td><td>HBM3 controller (5 stacks)</td><td>3.35 TB/s</td><td>TMA / LSU</td><td>LSU / TMA 发射端口</td></tr>
+<tr><td>NVLink 跨卡</td><td>NVSwitch + NVLink-4 engines</td><td>450 GB/s (单向)</td><td>LDGSTS.SYS / TMA.SYS</td><td>LSU / TMA（但不经 HBM）</td></tr>
+<tr><td>TensorCore MMA</td><td>4th-gen TensorCore (WGMMA)</td><td>1979 TFLOP/s FP8</td><td>WGMMA 异步指令</td><td>TC 单元（独立于 LSU）</td></tr>
+</table>
+<p class="small">
+  关键观察：<b>TensorCore 与 NVLink 引擎物理独立</b>，唯一的共用是 SM 内的 warp scheduler。
+  只要指令流安排得当（同一 CTA 发射 WGMMA 后立刻发射 SYS 内存指令，或者不同 CTA 分工），
+  三条通路可以同时满负荷。
+</p>
+
+<h3>5.2 传统实现为何 <i>一定</i> 串行</h3>
+<div class="card">
+  <p class="small">V3.2 把 MoE 层拆成 5 个独立 kernel，每 kernel 的 SM 分配默认是"全占"：</p>
+<div class="diagram">
+Timeline (NVLink)   ▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░▓▓▓▓▓▓
+                     dispatch                                       combine
+Timeline (TC)       ░░░░░░░░▓▓▓▓▓▓▓▓░░▓▓░░▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░
+                              GEMM₁       SwiGLU      GEMM₂
+Timeline (HBM)      ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
+                     全程 HBM 读写 activation（每个 kernel 开头/结尾）
+</div>
+  <p class="small"><b>三条互斥原因</b>：</p>
+  <ol class="small">
+    <li><b>Kernel 粒度太粗</b>：每个 kernel 启动要等前一个 <code>cudaStreamSynchronize</code>（或至少 event record），tensor core 和 NVLink 引擎天然不同时段活跃。</li>
+    <li><b>数据流依赖</b>：GEMM₁ 必须等 dispatch 在 HBM 落盘完，否则读不到对的 token；combine 必须等 GEMM₂ 写 HBM 完。</li>
+    <li><b>Activation 必须过 HBM</b>：kernel 之间只能靠 HBM 通信，smem / L2 在 kernel 结束时被刷掉。</li>
+  </ol>
+</div>
+
+<h3>5.3 Mega-MoE 的 overlap：三层机制</h3>
+
+<h4>5.3.1 Layer-1 · Symmetric memory 消除 kernel 边界</h4>
+<p class="small">
+  Mega-MoE 要求调用前每个 rank 已经通过 <code>cudaMallocAsync + CU_MEM_HANDLE_TYPE_POSIX_FD</code>
+  或 NVSHMEM 建立<b>对称堆</b>：同一个团队内所有 rank 在相同相对偏移处暴露一块同样大小的 buffer。
+  这样一行 PTX
+</p>
+<pre>st.global.sys.v4.f32 [%rd_sym_offset + %tid * 16], {%f0, %f1, %f2, %f3};</pre>
+<p class="small">
+  就能把四个 FP32 直接写到<b>远端卡</b>的指定位置，NVSwitch 自动路由，不需要 host 代理、不需要 <code>cudaMemcpy*</code>。
+  同步只靠 <code>fence.sys</code> / signal-wait 原语，粒度从 kernel 级降到 <b>指令级</b>。
+</p>
+
+<h4>5.3.2 Layer-2 · Producer/Consumer SM 分区</h4>
+<div class="diagram">
+                  132 SMs on H100
+  ┌─────────────────────────────────────────────────────────┐
+  │  Producer SMs (≈ 16, ~12%)    │  Consumer SMs (≈ 116)   │
+  │  ─────────────────────────    │  ──────────────────     │
+  │  · 发起 LDGSTS.SYS             │  · 发射 WGMMA (TC)      │
+  │  · TMA.SYS put / get          │  · smem → reg → smem    │
+  │  · NVLink 引擎满占             │  · TensorCore 满占      │
+  │  · 不做 MMA                    │  · 不发起跨卡访问        │
+  │  occupancy: ~2 CTA/SM          │  occupancy: 1 CTA/SM   │
+  └─────────────────────────────────────────────────────────┘
+           │                                │
+           ▼                                ▼
+   NVLink fabric                    TensorCore 阵列
+   (共 900 GB/s 双向)               (~2 PFLOP/s FP8)
+</div>
+<p class="small">
+  分区的关键是<b>不让同一个 SM 既发 WGMMA 又发 SYS 访问</b>。WGMMA 是异步指令，
+  会占用 warp scheduler 的发射槽；如果同一 warp 接着发 LDGSTS.SYS，
+  二者会在 issue queue 里竞争。把通信固定在 16 个 SM 上（CTA launch 时通过
+  cooperative groups 或 persistent kernel 的 <code>blockIdx.x &lt; 16</code> 分支），就能让
+  两类工作在物理上对应到不同 issue slot。
+</p>
+
+<h4>5.3.3 Layer-3 · 片上 ring pipeline（chunk-level）</h4>
+<p class="small">
+  输入 token 被切成 <code>C</code> 个 micro-chunk，每个 chunk 大小 ≈ 64–256 tokens
+  <span class="badge infer">推测</span>。Producer 和 Consumer 以错开的节拍工作：
+</p>
+<div class="diagram">
+  时间 →
+
+  Producer  :  [D₀]  [D₁]  [D₂]  [D₃]  [D₄]        [C₀]  [C₁]  [C₂]  [C₃]  [C₄]
+  (NVLink)     dispatch chunks                     combine chunks
+                  \     \     \     \     \         /     /     /     /     /
+                   ▼     ▼     ▼     ▼     ▼       ▲     ▲     ▲     ▲     ▲
+  smem ring  :    s₀    s₁    s₂    s₃    s₄    →r₀←  →r₁←  →r₂←  →r₃←  →r₄←
+
+  Consumer  :          [G₀]  [G₁]  [G₂]  [G₃]  [G₄]
+  (TC)                GEMM1+SwiGLU+GEMM2 per chunk
+
+  稳态: 任一时刻同时有 {dispatch chunk i+2, gemm chunk i, combine chunk i-1}
+</div>
+<p class="small">
+  smem ring 的深度 = pipeline 级数 × 每级 staging buffer。给定 H100 每 SM 228 KB smem、
+  每 chunk 64 tokens × 7168 B (FP8) = 448 KB，<b>单 SM 装不下整块</b>，必须跨 CTA 协作或用 L2
+  做 staging。Mega-MoE 选择<b>对称 L2</b>作为 staging（多进程共享 L2 partition 能力在 H100 加入），
+  smem 只存 current chunk 的 GEMM tile。
+</p>
+
+<h3>5.4 overlap 效率定量推导</h3>
+<p class="small">以下以 <b>prefill, 单层 MoE, batch = 4096 tokens, EP=64, TP=1</b> 为例推导稳态 latency。</p>
+
+<h4>5.4.1 符号定义</h4>
+<pre>
+H        = 7168         # hidden_size
+I        = 3072         # moe_intermediate_size
+k        = 6            # num_experts_per_tok
+E        = 384          # n_routed_experts
+N        = 4096         # tokens per layer per step
+ep       = 64           # expert-parallel degree
+B_NVL    = 450e9        # B/s, NVLink-4 单向
+T_fp4    = 4e15         # FLOP/s, FP8×FP4 TensorCore 近似 (2× FP8)  [推测]
+B_HBM    = 3.35e12      # B/s, HBM3
+</pre>
+
+<h4>5.4.2 通信量 (dispatch + combine 之和)</h4>
+<pre>
+dispatch: 每 token 发 k 份拷贝到目标 expert 所在 rank (跨节点 NVLink)
+  bytes_dispatch = N × k × H × sizeof(FP8) = 4096 × 6 × 7168 × 1 B = 172 MB
+
+combine:  每 token 回收 k 份结果求和
+  bytes_combine  = 172 MB  (对称)
+
+bytes_comm_total ≈ 344 MB
+
+T_comm = bytes_comm_total / B_NVL = 344e6 / 450e9 ≈ 764 μs
+</pre>
+
+<h4>5.4.3 计算量 (GEMM₁ + GEMM₂ 之和)</h4>
+<pre>
+每 token 被路由到 k 个 expert:
+  GEMM₁ (gate + up): 2 × H × I  FMA/token        (× k 次)
+  GEMM₂ (down)     :     I × H  FMA/token        (× k 次)
+
+FLOPs / token = k × (2·H·I + I·H) × 2      # 2 = FMA → FLOP
+              = 6 × 3 × 7168 × 3072 × 2
+              = 792 GFLOP
+
+FLOPs_total = N × 792 GFLOP = 3.25 PFLOP
+
+T_gemm = FLOPs_total / T_fp4 = 3.25e15 / 4e15 = 812 μs
+</pre>
+
+<h4>5.4.4 稳态 latency</h4>
+<pre>
+Serial (V3.2 风格):   T_total = T_gemm + T_comm = 812 + 764 = 1576 μs
+Overlapped (Mega-MoE): T_total = max(T_gemm, T_comm) = 812 μs
+
+掩盖效率 = (T_comm + T_gemm - max) / (T_comm + T_gemm) = 764 / 1576 = 48.5 %
+加速比   = 1576 / 812 ≈ 1.94 ×
+</pre>
+<p class="small">
+  只要 <b>|T_gemm - T_comm| 较小</b>（本例 812 vs 764，差 6 %），掩盖效率逼近 50 %，即 1.94× 加速。
+  若 FP4 让 T_gemm 减半（降到 406 μs），则 <code>max = max(406, 764) = 764</code>，
+  <b>瓶颈反而变成 NVLink</b>——这正是 V4 需要 Mega-MoE 的动机：FP4 让 compute 变快，comm 不变，
+  只有把 comm 隐藏到 compute 里才能保持高利用率。
+</p>
+
+<h4>5.4.5 边界条件：chunk 数 C 必须足够大</h4>
+<pre>
+单 chunk 的 "rampup + drain" 开销 ≈ 2 × pipeline_depth × per-chunk-latency
+pipeline_depth = 3 (dispatch / compute / combine 三级)
+
+有效 overlap 只在稳态段发生。稳态占比 ≈ (C - 2·depth) / C
+C = 8   → 稳态占比 25 %  (掩盖效率打折到 12 %)
+C = 32  → 稳态占比 81 %  (掩盖效率 39 %)
+C = 128 → 稳态占比 95 %  (掩盖效率 46 %)
+
+结论: batch 需要至少 C × chunk_size ≈ 32 × 64 = 2048 tokens 才能吃满 Mega-MoE.
+对 decode (batch=1)，Mega-MoE 退化到 serial —— 这是为何 decode 另有专门路径.
+</pre>
+
+<h3>5.5 HBM 带宽下降的原理与推导</h3>
+<p class="small">
+  "HBM 带宽下降"其实有两层含义：(a) 传输字节数变少；(b) 对 HBM 带宽的<b>压力</b>变小，
+  让 HBM 带宽可以"让位"给 weight stream。下面分别推导。
+</p>
+
+<h4>5.5.1 逐算子 HBM activation 流量（未融合 vs 融合）</h4>
+<p class="small">Per-token 只算 activation（不含权重），FP8 = 1 B/元素：</p>
+<table>
+<tr><th>算子</th><th>V3.2 HBM IO (bytes)</th><th>V4 Mega-MoE HBM IO</th><th>说明</th></tr>
+<tr><td>Gate read x</td><td>H = 7168</td><td>H = 7168</td><td>入口一次，两者相同</td></tr>
+<tr><td>Gate write logits</td><td>E = 384</td><td>0</td><td>融合后 logits 在 smem</td></tr>
+<tr><td>TopK read/write</td><td>2E = 768</td><td>0</td><td>smem 内完成</td></tr>
+<tr><td>Dispatch input 打包</td><td>k·H = 43 KB (R+W)</td><td>0</td><td>直接 NVLink put，不经 HBM</td></tr>
+<tr><td>GEMM₁ 读 x</td><td>k·2H = 86 KB</td><td>0</td><td>x 从对称内存/smem 取</td></tr>
+<tr><td>GEMM₁ 写 hidden</td><td>k·2I = 37 KB</td><td>0</td><td>hidden 驻留 smem</td></tr>
+<tr><td>SwiGLU 读/写</td><td>k·(2I + I) = 55 KB</td><td>0</td><td>smem pass-through</td></tr>
+<tr><td>GEMM₂ 读 hidden</td><td>k·I = 18 KB</td><td>0</td><td>smem</td></tr>
+<tr><td>GEMM₂ 写 y</td><td>k·H = 43 KB</td><td>0</td><td>直接 NVLink put</td></tr>
+<tr><td>Combine 打包</td><td>k·H = 43 KB (R+W)</td><td>0</td><td>NVLink get</td></tr>
+<tr><td>Reduce read/write</td><td>(k+1)·H = 50 KB</td><td>0</td><td>在 combine 的 epilogue 累加</td></tr>
+<tr><td>Shared expert</td><td>3H = 21 KB</td><td>0</td><td>合并到 combine 累加器</td></tr>
+<tr><td>Final write y</td><td>H = 7168</td><td>H = 7168</td><td>出口一次</td></tr>
+<tr><td><b>合计</b></td><td><b>≈ 409 KB/token</b></td><td><b>≈ 14 KB/token</b></td><td><b>↓ 96.6 %</b></td></tr>
+</table>
+
+<h4>5.5.2 加上权重流量</h4>
+<pre>
+每层 MoE 权重（全部 expert，FP8 vs FP4）:
+  V3.2: E × (H·I · 3) × 1 B          # gate + up + down, FP8
+       = 384 × 7168 × 3072 × 3 × 1 B = 25.4 GB
+  V4:   E × (H·I · 3) × 0.5 B        # FP4
+       = 12.7 GB
+
+但 decode/prefill 里，每层只会用到 "所有被触发到的 expert"。
+大 batch (N ≥ ep × 2) 时，E 个 expert 几乎全命中，权重必须全读.
+小 batch (N = 1，decode) 时，只有 k = 6 个 expert 被命中。
+
+Prefill, N=4096: V3.2 权重流量 = 25.4 GB/层, V4 = 12.7 GB/层
+Decode, N=1   : V3.2 权重流量 ≈ 6 × 3·H·I × 1  B = 380 MB/层
+                V4 = 190 MB/层
+</pre>
+
+<h4>5.5.3 合并后的单层 HBM 预算与 "带宽下降"</h4>
+<pre>
+Prefill (N=4096, 单层):
+  V3.2 总 HBM = 409 KB × 4096  (act)  + 25.4 GB  (wt) = 1.7 GB + 25.4 GB ≈ 27.1 GB
+  V4   总 HBM =  14 KB × 4096  (act)  + 12.7 GB  (wt) = 57 MB  + 12.7 GB ≈ 12.8 GB
+  单层 HBM 时间 @ 3.35 TB/s: V3.2 = 8.1 ms, V4 = 3.8 ms  →  ↓ 53 %
+
+Decode (N=1, 单层):
+  V3.2 = 409 KB + 380 MB ≈ 380 MB
+  V4   =  14 KB + 190 MB ≈ 190 MB
+  单层时间: V3.2 = 113 μs, V4 = 57 μs                    →  ↓ 50 %
+</pre>
+<p class="small">
+  注意："<b>带宽下降</b>" 对应的是<b>单位有用计算所消耗的 HBM 字节</b>下降，而非 HBM 控制器峰值变化。
+  其直接表现是：HBM 从 "activation 抢带宽" 的状态，变成 "专心喂权重" 的状态，
+  这让 <code>arithmetic_intensity = FLOPs / HBM_bytes</code> 显著上升，
+  从 MoE 典型的 memory-bound 区间向 compute-bound 推进。
+</p>
+
+<h4>5.5.4 为何 activation 能"消失"（原理复盘）</h4>
+<ol class="small">
+  <li><b>无 kernel 边界</b> → smem/register 不会被强制刷到 HBM；中间张量可以整段驻留 smem。</li>
+  <li><b>对称内存直连 NVLink</b> → 跨卡传输不走 "HBM-write + CPU 通知 + HBM-read" 三段式，而是 SM 直接发起 NVLink 事务。</li>
+  <li><b>Grouped-GEMM + 分 chunk</b> → 每次 GEMM 只处理一个 chunk 的 tile，tile 大小正好 fit L2/smem，无需 spill。</li>
+  <li><b>Epilogue 累加合并 shared expert</b> → 共享专家的输出直接加到 combine 累加器，节省一次 <code>y_shared + y_moe</code> 的 HBM round-trip。</li>
+</ol>
+
+<h3>5.6 小结：Mega-MoE 收益的前提与边界</h3>
+<table>
+<tr><th>条件</th><th>对 overlap 收益的影响</th></tr>
+<tr><td>batch ≥ 2048 tokens</td><td>pipeline 稳态占比 ≥ 80%，掩盖效率接近理论上限</td></tr>
+<tr><td>EP 跨 NVLink 域（节点内）</td><td>NVLink 满速；跨节点 IB 退化严重 (BW 只剩 50 GB/s)，需要 M4 拓扑融合补救</td></tr>
+<tr><td>FP8×FP4 Tensorcore 路径可用</td><td>T_gemm 接近 T_comm，overlap 收益最大；FP16 会让 compute 太重，overlap 意义小</td></tr>
+<tr><td>Expert 数 E 与 ep 整除</td><td>token 在 expert 间分布均匀，grouped-gemm 无空洞</td></tr>
+<tr><td>Decode (N=1)</td><td>无法填满 pipeline，应走单独 decode kernel；Mega-MoE 不激活</td></tr>
+</table>
+<p class="small muted">
+  推导小结：在典型 prefill 场景下，Mega-MoE 相比 V3.2 未融合路径理论加速 ≈ <b>1.9–2.1×</b>（来自 overlap）×
+  <b>1.3–1.5×</b>（来自 activation HBM 消失 + FP4 权重）≈ <b>2.5–3×</b> 总加速；
+  decode 场景下 overlap 退化，但 FP4 + 合并 epilogue 仍贡献 <b>1.5–2×</b>。
+</p>
+
+<h2>6 · 融合收益汇总（相对 V3.2 + 基础融合）</h2>
 <table>
 <tr><th>规则</th><th>Compute</th><th>Memory (HBM IO)</th><th>Latency 量级</th><th>关键前置</th></tr>
 <tr><td>A1 QKV+LoRA</td><td>≈ 1.00×</td><td>0.50×</td><td>decode ↓ 20–30 %</td><td>—</td></tr>
@@ -548,7 +938,7 @@ after:
 <p class="small muted">注：百分比是相对单一算子序列的降幅，不同层叠加时存在相互遮蔽效应；所有 1M-ctx 单 token 27 % FLOPs / 10 % KV 的宏观口径来自 DeepSeek 官方模型卡。</p>
 
 <!-- =============================== 6 与本仓库对齐 =============================== -->
-<h2>6 · 与 xPU-Simulator 本仓库的对齐建议</h2>
+<h2>7 · 与 xPU-Simulator 本仓库的对齐建议</h2>
 <ul>
   <li><b>ConfigExtractor</b>：为 <code>model_type == "deepseek_v4"</code> 新增分支，读取 <code>compress_ratios</code> 决定每层是 CSA 还是 HCA；把 <code>num_kv_heads=1</code> 映射到压缩 latent，单独生成 <code>CSA_ATTN</code> / <code>HCA_ATTN</code> OpType。</li>
   <li><b>DispatchExtractor</b>：需要为 <code>sqrtsoftplus</code>、<code>o_groups</code> grouped-matmul、mHC 的 Sinkhorn 迭代（小矩阵 20 轮）新增融合规则，否则 ~6 000 aten op 会膨胀。</li>
