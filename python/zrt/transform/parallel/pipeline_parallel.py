@@ -110,9 +110,10 @@ class PipelineParallelPass(GraphPass):
         }
         layer_to_virtual_stage: Dict[int, int] = {}
         if is_vpp:
-            layers_per_chunk = max(1, len(sorted_layers) // (pp * vpp_chunks))
+            total_chunks = pp * vpp_chunks
+            layers_per_chunk = max(1, len(sorted_layers) // total_chunks)
             for idx, lid in enumerate(sorted_layers):
-                layer_to_virtual_stage[lid] = idx // layers_per_chunk
+                layer_to_virtual_stage[lid] = min(idx // layers_per_chunk, total_chunks - 1)
 
         # 4. Annotate stage_id and virtual_stage_id on every node
         for node in g.nodes.values():
@@ -158,9 +159,10 @@ class PipelineParallelPass(GraphPass):
                 stages[s_idx].node_ids.update(layer_nodes[layer_id])
                 stages[s_idx].total_compute_us += layer_load.get(layer_id, 0.0)
         elif is_vpp:
-            layers_per_chunk = max(1, n_layers // (pp * vpp_chunks))
+            total_chunks = pp * vpp_chunks
+            layers_per_chunk = max(1, n_layers // total_chunks)
             for idx, layer_id in enumerate(sorted_layers):
-                chunk_id = idx // layers_per_chunk
+                chunk_id = min(idx // layers_per_chunk, total_chunks - 1)
                 s_idx = chunk_id % pp
                 stages[s_idx].layer_ids.append(layer_id)
                 stages[s_idx].node_ids.update(layer_nodes[layer_id])
@@ -169,8 +171,8 @@ class PipelineParallelPass(GraphPass):
             if vpp_chunks > 1:
                 logger.info(
                     "PipelineParallelPass: VPP interleaved assignment "
-                    "(pp=%d, vpp_chunks=%d, layers_per_chunk=%d)",
-                    pp, vpp_chunks, layers_per_chunk,
+                    "(pp=%d, vpp_chunks=%d, layers_per_chunk=%d, total_chunks=%d)",
+                    pp, vpp_chunks, layers_per_chunk, total_chunks,
                 )
         else:
             stage_load = [0.0] * pp
