@@ -182,6 +182,7 @@ CLAUDE.md 描述了 `python/zrt/training/builtins/`，但仓库中只剩下空 `
                  │     │ memory_breakdown / compute_mfu / compute_hfu (recompute_overhead_flops)
                  │     └── StepResult
                  └── Report（含 step_time_ms / mfu / hfu / memory / per_stage / warnings）
+                    ⚠ 目标迁移为 TrainingReport，与 Stack B 统一接口契约（见 §6 设计定位）
 ```
 
 ---
@@ -436,6 +437,8 @@ CLAUDE.md 描述了 `python/zrt/training/builtins/`，但仓库中只剩下空 `
 ---
 
 ## 6. 训练子系统（`zrt.training`，独立）
+
+> **设计定位（Stack A）**：`zrt.training` 是规格驱动的快速估算路径，服务于搜索/扫描场景，无需真实图捕获。图捕获路径（Stack B，`transform/analysis/modeller.py`）为主路径，提供真实算子级精度。两路均共享 `PipelineComposer` 类（`training/compose/schedules.py`）。当前 Stack A 返回 `Report`，Stack B 返回 `TrainingReport`；目标将两者统一为 `TrainingReport`。详见 `docs/training_modeller_zh.md`。
 
 ### 6.1 Spec 层
 - `spec/model.py:ModelSpec`：geometry + `layers: list[LayerKind]` + MoE/MTP 字段 + `attn_compression_ratio`（构造期校验 ∈ (0,1]）+ 各 dtype。`total_params() / effective_params_for_flops()`（MoE 用 `top_k/num_experts` 缩放）。
