@@ -416,6 +416,10 @@ def pipeline_step_time(
     # HFU
     step.hfu = compute_hfu(model, strategy, system, step.step_time, graph)
 
+    # Add optimizer time to step_time (per §5.5.2 of muon_optimizer_design.md)
+    # This must happen after MFU/HFU calculation so MFU excludes optimizer overhead
+    step.step_time += opt_time + opt_comm
+
     return step
 
 

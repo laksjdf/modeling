@@ -79,7 +79,6 @@ class OptimizerPass(GraphPass):
             params //= tp
 
         opt = ctx.training.optimizer if ctx.training else "adam"
-        muon_ns_steps = ctx.training.muon_ns_steps if ctx.training else None
         muon_fraction = ctx.training.muon_param_fraction if ctx.training else None
         muon_rotation = getattr(ctx.training, "muon_rotation", True) if ctx.training else True
         dp = ctx.parallel.dp if ctx.parallel else 1
@@ -89,6 +88,7 @@ class OptimizerPass(GraphPass):
 
         # Estimate hidden dimension from graph metadata
         hidden = g.metadata.get("hidden", None)
+        model_type = g.metadata.get("model_type", None)
 
         # Muon-specific attributes
         params_muon = 0
@@ -100,7 +100,11 @@ class OptimizerPass(GraphPass):
             f_muon = muon_fraction if muon_fraction is not None else 0.85
             params_muon = int(params * f_muon)
             params_adam = params - params_muon
-            ns_steps_resolved = muon_ns_steps if muon_ns_steps is not None else 5
+            # Resolve NS steps using priority chain (per §5.1.1 of muon_optimizer_design.md)
+            if ctx.training:
+                ns_steps_resolved = ctx.training.effective_ns_steps(model_type)
+            else:
+                ns_steps_resolved = 5
             # Muon AG bytes: (DP-1)/DP × P_muon × 4B
             if dp > 1:
                 muon_ag_bytes = int((dp - 1) / dp * params_muon * 4)
@@ -117,7 +121,7 @@ class OptimizerPass(GraphPass):
                 "params_muon": params_muon,
                 "params_adam": params_adam,
                 "state_bytes": self._opt_state_bytes(opt, params, muon_fraction=muon_fraction),
-                "step_flops": self._opt_step_flops(opt, params, muon_ns_steps, muon_fraction, hidden),
+                "step_flops": self._opt_step_flops(opt, params, ns_steps_resolved, muon_fraction, hidden),
                 "ns_steps": ns_steps_resolved,
                 "ns_rotation": muon_rotation if opt == "muon" else False,
                 "muon_ag_bytes": muon_ag_bytes,

@@ -670,10 +670,16 @@ class TrainingPipelinePass(GraphPass):
         comm_time_us = 0.0
         if optimizer == "muon":
             ag_bytes = float(opt_node.attrs.get("muon_ag_bytes", 0))
+            ns_rotation = opt_node.attrs.get("ns_rotation", True)
             if ag_bytes > 0:
                 dp_bw = hw.interconnect.inter_node.bandwidth_gbps * 1e9 / 8
                 dp = ctx.parallel.dp if ctx.parallel else 1
-                ring_factor = 2.0 * (dp - 1) / dp
+                # Ring factor: AG always, RS only when rotation=True
+                # AG: (dp-1)/dp factor; RS: same factor when rotation=True
+                if ns_rotation:
+                    ring_factor = 2.0 * (dp - 1) / dp  # AG + RS
+                else:
+                    ring_factor = 1.0 * (dp - 1) / dp  # AG only (Moonshot optimization)
                 comm_time_us = (ring_factor * ag_bytes / dp_bw) * 1e6 if dp_bw > 0 else 0.0
 
         return compute_time_us + comm_time_us
