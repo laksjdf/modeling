@@ -741,24 +741,16 @@ def test_pp_heterogeneous_1f1b_formula():
         f"stage 1 fwd ({stage_fwd.get(1):.1f}µs) — latency injection not working"
     )
 
-    # Heterogeneous spec formula (matches design doc and OneF1BComposer docstring):
-    #   warmup   = (pp - 1) * t_fwd[0]
+    # Correct formula uses bottleneck stage times (not first/last stage):
+    #   warmup   = (pp - 1) * max(t_fwd[s])
     #   steady   = M * max(t_fwd[s] + t_bwd[s])
-    #   cooldown = (pp - 1) * t_bwd[-1]
+    #   cooldown = (pp - 1) * max(t_bwd[s])
     M, pp = ctx.training.num_microbatches, 2
-    t_fwd_0    = stage_fwd[0]
-    t_bwd_last = stage_bwd[1]
-    t_stage    = max(stage_fwd[s] + stage_bwd[s] for s in (0, 1))
-    homogeneous_step_us = (M + pp - 1) * t_stage
-    expected_step_us = ((pp - 1) * t_fwd_0
-                        + M * t_stage
-                        + (pp - 1) * t_bwd_last)
+    t_fwd_max = max(stage_fwd[s] for s in (0, 1))
+    t_bwd_max = max(stage_bwd[s] for s in (0, 1))
+    t_stage_max = max(stage_fwd[s] + stage_bwd[s] for s in (0, 1))
 
-    # Verify the two formulas actually differ for this asymmetric input
-    assert abs(expected_step_us - homogeneous_step_us) / homogeneous_step_us > 0.05, (
-        "Test setup broken: heterogeneous and homogeneous formulas are too close. "
-        "The latency_us injection may not be taking effect."
-    )
+    expected_step_us = (pp - 1) * t_fwd_max + M * t_stage_max + (pp - 1) * t_bwd_max
 
     # Add optimizer step time to expected (per §5.5.2 of muon_optimizer_design.md)
     opt_step_time_us = result.metadata.get("optimizer_step_time_us", 0)
@@ -766,10 +758,11 @@ def test_pp_heterogeneous_1f1b_formula():
     homogeneous_step_us += opt_step_time_us
 
     # Verify the implementation uses the heterogeneous formula
+    # Verify the implementation uses the bottleneck stage formula
     actual_step_us = pm.step_time_ms * 1000.0
     assert abs(actual_step_us - expected_step_us) / expected_step_us < 0.05, (
-        f"step_time={actual_step_us:.1f}µs; expected heterogeneous "
-        f"{expected_step_us:.1f}µs, homogeneous would give {homogeneous_step_us:.1f}µs"
+        f"step_time={actual_step_us:.1f}µs; expected {expected_step_us:.1f}µs "
+        f"(bottleneck: fwd_max={t_fwd_max:.1f}µs, bwd_max={t_bwd_max:.1f}µs, stage_max={t_stage_max:.1f}µs)"
     )
 
 

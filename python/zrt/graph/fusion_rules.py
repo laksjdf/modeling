@@ -90,6 +90,14 @@ PATTERN_SKIP: Set[str] = ALWAYS_TRANSPARENT | SHAPE_OPS | INIT_OPS
 # Covers all common transformer architectures without per-model customisation.
 
 SEMANTIC_LABELS: List[Tuple[str, str]] = [
+    # ── DeepSeek-V4 Hyper-Connections (must precede attn / mlp matchers) ───
+    # Class names come from python.zrt.graph.patches.patch_hc_for_capture():
+    # HCPreAttn / HCPostAttn / HCPreFfn / HCPostFfn / HCHead.
+    (r".*HCPreAttn.*",                                          "mhc_pre_attn"),
+    (r".*HCPostAttn.*",                                         "mhc_post_attn"),
+    (r".*HCPreFfn.*",                                           "mhc_pre_ffn"),
+    (r".*HCPostFfn.*",                                          "mhc_post_ffn"),
+    (r".*HCHead.*",                                             "mhc_head"),
     # ── Norm variants ────────────────────────────────────────────────────────
     (r".*RMSNorm.*|.*RmsNorm.*|.*NormHead.*",                  "rms_norm"),
     (r".*LayerNorm.*",                                          "layer_norm"),

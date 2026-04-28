@@ -842,12 +842,19 @@ def run_trace_phases(
             )
             effective_num_layers = min_required
 
+    # Detect if any requested phases are training phases — needed for DSV4
+    # to apply patch_for_training_capture (removes @inference_mode, upgrades
+    # kernel stubs to differentiable versions).
+    _TRAINING_PHASES_SET = {"train_forward", "train_backward"}
+    is_training_mode = any(p in _TRAINING_PHASES_SET for p in phases)
+
     logger.info(
-        "Loading model %s (%d layers, graph_mode=%s) …",
-        model_id, effective_num_layers, graph_mode,
+        "Loading model %s (%d layers, graph_mode=%s, training=%s) …",
+        model_id, effective_num_layers, graph_mode, is_training_mode,
     )
 
-    model, config, fake_mode = load_model(model_id, num_hidden_layers=effective_num_layers)
+    model, config, fake_mode = load_model(
+        model_id, num_hidden_layers=effective_num_layers, training=is_training_mode)
 
     slug = _make_model_slug(model_id)
     if output_dir is None:

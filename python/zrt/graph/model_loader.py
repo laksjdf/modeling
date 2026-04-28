@@ -45,6 +45,8 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from python.zrt.graph.patches import (
     apply_compat_patches,
     is_moe_module as _is_moe_module,
+    patch_for_training_capture,
+    patch_hc_for_capture,
     patch_indexer_for_fake,
     patch_moe_for_fake,
     patch_moe_for_meta,  # backward-compat alias
@@ -178,6 +180,7 @@ def _instantiate_model(config: Any, effective_id: str) -> nn.Module:
 def load_model(
     model_id: str,
     num_hidden_layers: int = 4,
+    training: bool = False,
 ) -> Tuple[nn.Module, Any, FakeTensorMode]:
     """Load any HF causal LM via FakeTensorMode for op-sequence tracing.
 
@@ -192,11 +195,19 @@ def load_model(
     num_hidden_layers:
         Number of transformer blocks to instantiate (2–4 is enough to see all
         distinct op patterns including dense + MoE layers).
+    training:
+        When True, apply ``patch_for_training_capture`` instead of the standard
+        inference patches.  This enables ``backward()`` through the model so the
+        training op graph (forward + backward matmuls, gradient accumulation ops,
+        etc.) can be captured.  Only meaningful for DeepSeek-V4; safe to pass for
+        other models (the patch silently no-ops when the ZRT kernel stubs are not
+        loaded).  The model is left in ``train()`` mode rather than ``eval()``.
 
     Returns
     -------
     (model, config, fake_mode)
-        model     — eval mode, MoE-patched, all params are FakeTensors.
+        model     — MoE-patched, all params are FakeTensors.
+                    eval mode when training=False; train mode when training=True.
         config    — ``config._full_num_hidden_layers`` stores the original depth.
         fake_mode — the active ``FakeTensorMode`` context; must remain entered
                     during forward pass so that new tensors (inputs, intermediates)
@@ -219,8 +230,8 @@ def load_model(
 
     # Step 4: instantiate model (with local-registry fallback on import errors)
     logger.info(
-        "Instantiating %s with FakeTensorMode (%d layers) …",
-        type(config).__name__, num_hidden_layers,
+        "Instantiating %s with FakeTensorMode (%d layers, training=%s) …",
+        type(config).__name__, num_hidden_layers, training,
     )
     try:
         model = _instantiate_model(config, effective_id)
@@ -228,8 +239,15 @@ def load_model(
         fake_mode.__exit__(None, None, None)
         raise
 
-    model.eval()
-    patch_moe_for_fake(model)
-    patch_indexer_for_fake(model)
+    if training:
+        # train() keeps requires_grad=True on parameters; patch_for_training_capture
+        # also calls patch_moe_for_fake / patch_indexer_for_fake / patch_hc_for_capture.
+        model.train()
+        patch_for_training_capture(model)
+    else:
+        model.eval()
+        patch_moe_for_fake(model)
+        patch_indexer_for_fake(model)
+        patch_hc_for_capture(model)
 
     return model, config, fake_mode

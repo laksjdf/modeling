@@ -1,194 +1,150 @@
+"""DeepSeek-V4 PretrainedConfig.
+
+Field names follow HF convention; ``to_inference_args()`` maps them onto the
+``ModelArgs`` dataclass used by ``inference/model.py``.  Defaults match the
+DeepSeek-V4-Pro shipping config (see ``config.json``).
+"""
+from __future__ import annotations
+
+from typing import Optional, Tuple
+
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
 
-DEEPSEEK_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
+
 class DeepseekV4Config(PretrainedConfig):
-    r"""
-    This is the configuration class to store the configuration of a [`DeepseekV4Model`]. It is used to instantiate an DeepSeek
-    model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
-    defaults will yield a similar configuration to that of the DeepSeek-V3.
+    """Configuration for ``DeepseekV4ForCausalLM``.
 
-    Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
-    documentation from [`PretrainedConfig`] for more information.
-
-
-    Args:
-        vocab_size (`int`, *optional*, defaults to 129280):
-            Vocabulary size of the Deep model. Defines the number of different tokens that can be represented by the
-            `inputs_ids` passed when calling [`DeepseekV4Model`]
-        hidden_size (`int`, *optional*, defaults to 4096):
-            Dimension of the hidden representations.
-        intermediate_size (`int`, *optional*, defaults to 11008):
-            Dimension of the MLP representations.
-        moe_intermediate_size (`int`, *optional*, defaults to 1407):
-            Dimension of the MoE representations.
-        num_hidden_layers (`int`, *optional*, defaults to 32):
-            Number of hidden layers in the Transformer decoder.
-        num_nextn_predict_layers (`int`, *optional*, defaults to 1):
-            Number of nextn predict layers in the DeepSeekV3 Model.
-        num_attention_heads (`int`, *optional*, defaults to 32):
-            Number of attention heads for each attention layer in the Transformer decoder.
-        n_shared_experts (`int`, *optional*, defaults to None):
-            Number of shared experts, None means dense model.
-        n_routed_experts (`int`, *optional*, defaults to None):
-            Number of routed experts, None means dense model.
-        routed_scaling_factor (`float`, *optional*, defaults to 1.0):
-            Scaling factor or routed experts.
-        topk_method (`str`, *optional*, defaults to `gready`):
-            Topk method used in routed gate.
-        n_group (`int`, *optional*, defaults to None):
-            Number of groups for routed experts.
-        topk_group (`int`, *optional*, defaults to None):
-            Number of selected groups for each token(for each token, ensuring the selected experts is only within `topk_group` groups).
-        num_experts_per_tok (`int`, *optional*, defaults to None):
-            Number of selected experts, None means dense model.
-        moe_layer_freq (`int`, *optional*, defaults to 1):
-            The frequency of the MoE layer: one expert layer for every `moe_layer_freq - 1` dense layers.
-        first_k_dense_replace (`int`, *optional*, defaults to 0):
-            Number of dense layers in shallow layers(embed->dense->dense->...->dense->moe->moe...->lm_head).
-                                                            \--k dense layers--/
-        norm_topk_prob (`bool`, *optional*, defaults to False):
-            Whether to normalize the weights of the routed experts.
-        scoring_func (`str`, *optional*, defaults to 'softmax'):
-            Method of computing expert weights.
-        aux_loss_alpha (`float`, *optional*, defaults to 0.001):
-            Auxiliary loss weight coefficient.
-        seq_aux = (`bool`, *optional*, defaults to True):
-            Whether to compute the auxiliary loss for each individual sample.
-        num_key_value_heads (`int`, *optional*):
-            This is the number of key_value heads that should be used to implement Grouped Query Attention. If
-            `num_key_value_heads=num_attention_heads`, the model will use Multi Head Attention (MHA), if
-            `num_key_value_heads=1 the model will use Multi Query Attention (MQA) otherwise GQA is used. When
-            converting a multi-head checkpoint to a GQA checkpoint, each group key and value head should be constructed
-            by meanpooling all the original heads within that group. For more details checkout [this
-            paper](https://arxiv.org/pdf/2305.13245.pdf). If it is not specified, will default to
-            `num_attention_heads`.
-        hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
-            The non-linear activation function (function or string) in the decoder.
-        max_position_embeddings (`int`, *optional*, defaults to 2048):
-            The maximum sequence length that this model might ever be used with.
-        initializer_range (`float`, *optional*, defaults to 0.02):
-            The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
-        rms_norm_eps (`float`, *optional*, defaults to 1e-06):
-            The epsilon used by the rms normalization layers.
-        use_cache (`bool`, *optional*, defaults to `True`):
-            Whether or not the model should return the last key/values attentions (not used by all models). Only
-            relevant if `config.is_decoder=True`.
-        pad_token_id (`int`, *optional*):
-            Padding token id.
-        bos_token_id (`int`, *optional*, defaults to 1):
-            Beginning of stream token id.
-        eos_token_id (`int`, *optional*, defaults to 2):
-            End of stream token id.
-        tie_word_embeddings (`bool`, *optional*, defaults to `False`):
-            Whether to tie weight embeddings
-        rope_theta (`float`, *optional*, defaults to 10000.0):
-            The base period of the RoPE embeddings.
-        rope_scaling (`Dict`, *optional*):
-            Dictionary containing the scaling configuration for the RoPE embeddings. Currently supports two scaling
-            strategies: linear and dynamic. Their scaling factor must be a float greater than 1. The expected format is
-            `{"type": strategy name, "factor": scaling factor}`. When using this flag, don't update
-            `max_position_embeddings` to the expected new maximum.
-        attention_bias (`bool`, defaults to `False`, *optional*, defaults to `False`):
-            Whether to use a bias in the query, key, value and output projection layers during self-attention.
-        attention_dropout (`float`, *optional*, defaults to 0.0):
-            The dropout ratio for the attention probabilities.
-
-    ```python
-    >>> from transformers import DeepseekV4Model, DeepseekV4Config
-
-    >>> # Initializing a Deepseek-V3 style configuration
-    >>> configuration = DeepseekV4Config()
-
-    >>> # Accessing the model configuration
-    >>> configuration = model.config
-    ```"""
+    The geometry fields mirror DeepSeek-V3 (vocab/hidden/attention/experts) and
+    the new V4-only fields cover Hyper-Connections (``hc_*``), KV compression
+    (``compress_*``), the sparse-attn indexer (``index_*``) and low-rank
+    output projection (``o_lora_rank`` / ``o_groups``).
+    """
 
     model_type = "deepseek_v4"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
         self,
-        vocab_size=129280,
-        hidden_size=7168,
-        intermediate_size=18432,
-        moe_intermediate_size = 2048,
-        num_hidden_layers=61,
-        num_nextn_predict_layers=1,
-        num_attention_heads=128,
-        num_key_value_heads=128,
-        n_shared_experts = 1,
-        n_routed_experts = 256,
-        ep_size = 1,
-        routed_scaling_factor = 2.5,
-        kv_lora_rank = 512,
-        q_lora_rank = 1536,
-        qk_rope_head_dim = 64,
-        v_head_dim = 128,
-        qk_nope_head_dim = 128,
-        topk_method = 'noaux_tc',
-        n_group = 8,
-        topk_group = 4,
-        num_experts_per_tok = 8,
-        moe_layer_freq = 1,
-        first_k_dense_replace = 3,
-        norm_topk_prob = True,
-        scoring_func = 'sigmoid',
-        hidden_act="silu",
-        max_position_embeddings=4096,
-        initializer_range=0.02,
-        rms_norm_eps=1e-6,
-        use_cache=True,
-        pad_token_id=None,
-        bos_token_id=0,
-        eos_token_id=1,
-        tie_word_embeddings=False,
-        rope_theta=10000.0,
-        rope_scaling=None,
-        attention_bias=False,
-        attention_dropout=0.0,
+        # Core geometry
+        vocab_size: int = 129280,
+        hidden_size: int = 7168,
+        num_hidden_layers: int = 61,
+        num_attention_heads: int = 128,
+        num_key_value_heads: int = 1,
+        num_nextn_predict_layers: int = 1,
+        num_hash_layers: int = 3,
+        # MoE
+        moe_intermediate_size: int = 3072,
+        n_shared_experts: int = 1,
+        n_routed_experts: int = 384,
+        num_experts_per_tok: int = 6,
+        routed_scaling_factor: float = 2.5,
+        scoring_func: str = "sqrtsoftplus",
+        norm_topk_prob: bool = True,
+        swiglu_limit: float = 10.0,
+        expert_dtype: Optional[str] = "fp4",
+        # MLA / attention
+        head_dim: int = 512,
+        qk_rope_head_dim: int = 64,
+        q_lora_rank: int = 1536,
+        o_lora_rank: int = 1024,
+        o_groups: int = 16,
+        sliding_window: int = 128,
+        # KV compression (per-layer; len == num_hidden_layers + n_mtp when given)
+        compress_ratios: Optional[Tuple[int, ...]] = None,
+        compress_rope_theta: float = 160000.0,
+        # Sparse-attn indexer
+        index_n_heads: int = 64,
+        index_head_dim: int = 128,
+        index_topk: int = 1024,
+        # Hyper-Connections
+        hc_mult: int = 4,
+        hc_sinkhorn_iters: int = 20,
+        hc_eps: float = 1e-6,
+        # RoPE / YaRN
+        max_position_embeddings: int = 1048576,
+        original_max_position_embeddings: int = 65536,
+        rope_theta: float = 10000.0,
+        rope_scaling: Optional[dict] = None,
+        # Misc HF-required
+        rms_norm_eps: float = 1e-6,
+        hidden_act: str = "silu",
+        initializer_range: float = 0.02,
+        attention_bias: bool = False,
+        attention_dropout: float = 0.0,
+        use_cache: bool = True,
+        torch_dtype: str = "bfloat16",
+        # Tokens
+        pad_token_id: Optional[int] = None,
+        bos_token_id: int = 0,
+        eos_token_id: int = 1,
+        tie_word_embeddings: bool = False,
         **kwargs,
     ):
+        # Core
         self.vocab_size = vocab_size
-        self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.moe_intermediate_size = moe_intermediate_size
         self.num_hidden_layers = num_hidden_layers
-        self.num_nextn_predict_layers = num_nextn_predict_layers
         self.num_attention_heads = num_attention_heads
+        self.num_key_value_heads = num_key_value_heads
+        self.num_nextn_predict_layers = num_nextn_predict_layers
+        self.num_hash_layers = num_hash_layers
+
+        # MoE
+        self.moe_intermediate_size = moe_intermediate_size
         self.n_shared_experts = n_shared_experts
         self.n_routed_experts = n_routed_experts
-        self.ep_size = ep_size
-        self.routed_scaling_factor = routed_scaling_factor
-        self.kv_lora_rank = kv_lora_rank
-        self.q_lora_rank = q_lora_rank
-        self.qk_rope_head_dim = qk_rope_head_dim
-        self.v_head_dim = v_head_dim
-        self.qk_nope_head_dim = qk_nope_head_dim
-        self.topk_method = topk_method
-        self.n_group = n_group
-        self.topk_group = topk_group
         self.num_experts_per_tok = num_experts_per_tok
-        self.moe_layer_freq = moe_layer_freq
-        self.first_k_dense_replace = first_k_dense_replace
-        self.norm_topk_prob = norm_topk_prob
+        self.routed_scaling_factor = routed_scaling_factor
         self.scoring_func = scoring_func
-        # for backward compatibility
-        if num_key_value_heads is None:
-            num_key_value_heads = num_attention_heads
+        self.norm_topk_prob = norm_topk_prob
+        self.swiglu_limit = swiglu_limit
+        self.expert_dtype = expert_dtype
 
-        self.num_key_value_heads = num_key_value_heads
-        self.hidden_act = hidden_act
-        self.initializer_range = initializer_range
-        self.rms_norm_eps = rms_norm_eps
-        self.use_cache = use_cache
+        # Attention
+        self.head_dim = head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.q_lora_rank = q_lora_rank
+        self.o_lora_rank = o_lora_rank
+        self.o_groups = o_groups
+        self.sliding_window = sliding_window
+
+        # Compression — default mirrors V4-Pro inference/config.json
+        # (length 62 = num_hidden_layers + num_nextn_predict_layers).
+        if compress_ratios is None:
+            compress_ratios = tuple(
+                ([128, 128, 4] + [128, 4] * 29 + [0])[: num_hidden_layers + num_nextn_predict_layers]
+            )
+        self.compress_ratios = tuple(compress_ratios)
+        self.compress_rope_theta = compress_rope_theta
+
+        # Indexer
+        self.index_n_heads = index_n_heads
+        self.index_head_dim = index_head_dim
+        self.index_topk = index_topk
+
+        # HC
+        self.hc_mult = hc_mult
+        self.hc_sinkhorn_iters = hc_sinkhorn_iters
+        self.hc_eps = hc_eps
+
+        # RoPE
+        self.max_position_embeddings = max_position_embeddings
+        self.original_max_position_embeddings = original_max_position_embeddings
         self.rope_theta = rope_theta
         self.rope_scaling = rope_scaling
+
+        # Misc
+        self.rms_norm_eps = rms_norm_eps
+        self.hidden_act = hidden_act
+        self.initializer_range = initializer_range
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
+        self.use_cache = use_cache
+        self.torch_dtype = torch_dtype
 
         super().__init__(
             pad_token_id=pad_token_id,
@@ -196,4 +152,72 @@ class DeepseekV4Config(PretrainedConfig):
             eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
+        )
+
+    def to_inference_args(self, max_batch_size: int = 4):
+        """Return a ``ModelArgs`` instance compatible with ``inference/model.py``.
+
+        Resolves YaRN scaling fields from ``rope_scaling`` when present.
+        """
+        from .modeling_deepseek import _import_inference_module
+        ModelArgs = _import_inference_module().ModelArgs
+
+        rs = self.rope_scaling or {}
+        rope_factor = float(rs.get("factor", 16.0))
+        beta_fast = int(rs.get("beta_fast", 32))
+        beta_slow = int(rs.get("beta_slow", 1))
+        original_seq_len = int(
+            rs.get("original_max_position_embeddings", self.original_max_position_embeddings)
+        )
+
+        # Quant dtype: read from quantization_config when present; falls back
+        # to the torch_dtype field for non-quantized configs.
+        qcfg = getattr(self, "quantization_config", None) or {}
+        if qcfg.get("quant_method") == "fp8":
+            dtype = "fp8"
+        else:
+            dtype = "bf16"
+        scale_fmt = qcfg.get("scale_fmt", "ue8m0")
+        scale_dtype = "fp8" if scale_fmt == "ue8m0" else "fp32"
+
+        return ModelArgs(
+            max_batch_size=max_batch_size,
+            max_seq_len=self.max_position_embeddings,
+            dtype=dtype,
+            scale_fmt=scale_fmt,
+            scale_dtype=scale_dtype,
+            expert_dtype=self.expert_dtype,
+            vocab_size=self.vocab_size,
+            dim=self.hidden_size,
+            moe_inter_dim=self.moe_intermediate_size,
+            n_layers=self.num_hidden_layers,
+            n_hash_layers=self.num_hash_layers,
+            n_mtp_layers=self.num_nextn_predict_layers,
+            n_heads=self.num_attention_heads,
+            n_routed_experts=self.n_routed_experts,
+            n_shared_experts=self.n_shared_experts,
+            n_activated_experts=self.num_experts_per_tok,
+            score_func=self.scoring_func,
+            route_scale=self.routed_scaling_factor,
+            swiglu_limit=self.swiglu_limit,
+            q_lora_rank=self.q_lora_rank,
+            head_dim=self.head_dim,
+            rope_head_dim=self.qk_rope_head_dim,
+            norm_eps=self.rms_norm_eps,
+            o_groups=self.o_groups,
+            o_lora_rank=self.o_lora_rank,
+            window_size=self.sliding_window,
+            compress_ratios=tuple(self.compress_ratios),
+            compress_rope_theta=self.compress_rope_theta,
+            original_seq_len=original_seq_len,
+            rope_theta=self.rope_theta,
+            rope_factor=rope_factor,
+            beta_fast=beta_fast,
+            beta_slow=beta_slow,
+            index_n_heads=self.index_n_heads,
+            index_head_dim=self.index_head_dim,
+            index_topk=self.index_topk,
+            hc_mult=self.hc_mult,
+            hc_sinkhorn_iters=self.hc_sinkhorn_iters,
+            hc_eps=self.hc_eps,
         )

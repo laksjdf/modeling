@@ -77,9 +77,10 @@ class OneF1BComposer(PipelineComposer):
     ) -> StepResult:
         """Standard 1F1B pipeline schedule.
 
-        warmup   = (pp - 1) * t_fwd[0]
+        Uses bottleneck stage times to avoid underestimating bubble:
+        warmup   = (pp - 1) * max(t_fwd[s])
         steady   = M * max(t_fwd[s] + t_bwd[s])
-        cooldown = (pp - 1) * t_bwd[-1]
+        cooldown = (pp - 1) * max(t_bwd[s])
         step     = warmup + steady + cooldown + dp_ar_exposed
         """
         if pp == 1:
@@ -107,13 +108,13 @@ class OneF1BComposer(PipelineComposer):
             )
 
         # With pipeline parallelism
-        t_fwd_0 = stage_times[0].fwd if stage_times else 0
-        t_bwd_last = stage_times[-1].bwd if stage_times else 0
+        t_fwd_max = max(st.fwd for st in stage_times) if stage_times else 0
+        t_bwd_max = max(st.bwd for st in stage_times) if stage_times else 0
         t_stage_max = max(st.fwd + st.bwd for st in stage_times) if stage_times else 0
 
-        warmup = (pp - 1) * t_fwd_0
+        warmup = (pp - 1) * t_fwd_max
         steady = M * t_stage_max
-        cooldown = (pp - 1) * t_bwd_last
+        cooldown = (pp - 1) * t_bwd_max
 
         # DP AR: hide in bubble if enabled
         bubble = warmup + cooldown

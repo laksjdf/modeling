@@ -41,6 +41,12 @@ class ModelSpec:
     # MTP
     mtp_depth: int = 0
 
+    # Hyper-Connections (DeepSeek-V4): hc_mult > 1 keeps `hc_mult` parallel
+    # residual streams, mixed via hc_pre / hc_post around attn and ffn.
+    # hc_mult=1 disables HC entirely (legacy single-residual path).
+    hc_mult: int = 1
+    hc_sinkhorn_iters: int = 20
+
     # dtypes
     param_dtype: Dtype = Dtype.BF16
     grad_dtype: Dtype = Dtype.FP32

@@ -19,8 +19,9 @@ class MemBreakdown:
     weights: float = 0.0       # bytes
     grads: float = 0.0         # bytes
     opt_state: float = 0.0     # bytes
-    activations: float = 0.0   # bytes
+    activations: float = 0.0   # bytes (includes hc_overhead_bytes)
     comm_buffers: float = 0.0  # bytes
+    hc_overhead_bytes: float = 0.0  # bytes from HC residual replication
 
     @property
     def total(self) -> float:
@@ -34,6 +35,7 @@ class MemBreakdown:
             "opt_state_gb": self.opt_state / GB,
             "activations_gb": self.activations / GB,
             "comm_buffers_gb": self.comm_buffers / GB,
+            "hc_overhead_gb": self.hc_overhead_bytes / GB,
             "total_gb": self.total / GB,
         }
 
@@ -74,7 +76,7 @@ def memory_breakdown(
     else:
         layer_ids = list(range(len(model.layers)))
 
-    activations = _activation_memory(model, strategy, layer_ids)
+    activations, hc_overhead = _activation_memory(model, strategy, layer_ids)
 
     # ── Communication buffers ────────────────────────────────────────────
     comm_buffers = _comm_buffer_memory(model, strategy)
@@ -95,6 +97,7 @@ def memory_breakdown(
         opt_state=opt_state,
         activations=activations,
         comm_buffers=comm_buffers,
+        hc_overhead_bytes=hc_overhead,
     )
 
 
@@ -199,15 +202,24 @@ def _optimizer_state_bytes(P: int, model: ModelSpec, strategy: Strategy) -> int:
 
 def _activation_memory(
     model: ModelSpec, strategy: Strategy, layer_ids: list[int],
-) -> int:
+) -> tuple[int, int]:
     """Activation memory per rank using Korthikanti-style estimation.
 
     Per layer: seq * hidden * dtype_bytes * coefficient(layer_kind)
     Coefficient accounts for number of activation tensors held simultaneously.
+
+    Returns
+    -------
+    (total_activations, hc_overhead_bytes)
+        ``hc_overhead_bytes`` is the slice of ``total_activations`` attributable
+        to HC residual replication (``(hc_mult - 1) × residual_count`` extra
+        copies).  Reporting it separately lets the breakdown distinguish the
+        cost of HC from the rest of the activation footprint.
     """
     s = model.seq_len
     h = model.hidden
     act_bytes = model.act_dtype.bytes
+    hc_mult = max(1, getattr(model, "hc_mult", 1))
 
     # Coefficient per layer kind (number of activation tensors that must be
     # materialized simultaneously for backward, roughly)
@@ -215,8 +227,11 @@ def _activation_memory(
     COEFF_DENSE = 10
     COEFF_MOE = 14  # additional dispatch/combine tensors
     COEFF_MTP = 12
+    # HC residual streams that must be retained across attn / ffn (one each).
+    COEFF_HC_RESIDUAL = 2
 
     total_act = 0
+    total_hc = 0
     for lid in layer_ids:
         if lid >= len(model.layers):
             continue
@@ -233,18 +248,27 @@ def _activation_memory(
         # Base: seq * hidden * dtype_bytes * coeff
         layer_act = s * h * act_bytes * coeff
 
+        # HC overhead: (hc-1) extra residual copies per layer, both around
+        # attn and ffn.  hc_mult=1 ⇒ 0 overhead.
+        hc_layer = (hc_mult - 1) * s * h * act_bytes * COEFF_HC_RESIDUAL
+        layer_act += hc_layer
+
         # TP with SP reduces activation by factor of tp for seq-sharded portion
         if strategy.tp > 1:
             layer_act //= strategy.tp
+            hc_layer //= strategy.tp
 
         # CP reduces further
         if strategy.cp > 1:
             layer_act //= strategy.cp
+            hc_layer //= strategy.cp
 
         total_act += layer_act
+        total_hc += hc_layer
 
     # Scale by microbatch
     total_act *= strategy.micro_batch
+    total_hc *= strategy.micro_batch
 
     # Scale by in-flight microbatches (PP bubble depth)
     if strategy.pp > 1:
@@ -252,8 +276,9 @@ def _activation_memory(
         # Average over training step: use (pp) // 2 as approximation
         in_flight = max(1, strategy.pp // 2)
         total_act *= in_flight
+        total_hc *= in_flight
 
-    return total_act
+    return total_act, total_hc
 
 
 def _comm_buffer_memory(model: ModelSpec, strategy: Strategy) -> int:

@@ -36,71 +36,100 @@ class ZeroFSDPPass(GraphPass):
             "optstate_shard": dp if z >= 1 else 1,
         }
         
-        # FSDP-3 also adds a per-layer AG during fwd/bwd — insert those collectives
+        # ZeRO-3 / FSDP: insert per-layer communication
+        # Forward:  all_gather before each layer (gather sharded weights)
+        # Backward: all_gather before each layer + reduce_scatter after
         if z >= 3:
             self._insert_fsdp_ag(g, ctx)
         
         return g
 
     def _insert_fsdp_ag(self, graph: OpGraph, ctx: TransformContext):
-        """Insert FSDP all-gather collectives for ZeRO-3.
-        
+        """Insert FSDP all-gather / reduce-scatter collectives for ZeRO-3.
+
+        Forward:  all_gather before first fwd node (gather sharded weights).
+        Backward: all_gather before first bwd node (re-gather weights) +
+                  reduce_scatter after last bwd node (scatter gradients).
+
         Args:
             graph: OpGraph to modify
             ctx: TransformContext with training config
         """
         dp = ctx.parallel.dp
-        
-        # For each layer, insert all-gather before the layer and reduce-scatter after
+
         layers = self._get_layers(graph)
-        
+
         for layer in layers:
-            # Find first and last nodes in the layer
-            first_node = None
-            last_node = None
-            
-            for node in graph.topo_sort():
-                if self._node_in_layer(node, layer):
-                    if first_node is None:
-                        first_node = node
-                    last_node = node
-            
-            if first_node and last_node:
-                # Insert all-gather before the first node
-                ag_id = f"comm_fsdp_ag_{first_node.id}"
-                ag_node = OpNode(
-                    id=ag_id,
+            fwd_nodes = [
+                n for n in graph.topo_sort()
+                if self._node_in_layer(n, layer)
+                and n.annotations.get("phase") == "fwd"
+            ]
+            bwd_nodes = [
+                n for n in graph.topo_sort()
+                if self._node_in_layer(n, layer)
+                and n.annotations.get("phase") == "bwd"
+            ]
+
+            if fwd_nodes:
+                first_fwd = fwd_nodes[0]
+                ag_fwd_id = f"comm_fsdp_ag_{first_fwd.id}"
+                ag_fwd = OpNode(
+                    id=ag_fwd_id,
                     op_type="comm.all_gather",
-                    inputs=first_node.inputs.copy(),
-                    outputs=first_node.inputs.copy(),
+                    inputs=first_fwd.inputs.copy(),
+                    outputs=first_fwd.inputs.copy(),
                     attrs={
                         "group_size": dp,
                         "collective": "all_gather",
-                        "role": "fsdp_ag"
+                        "role": "fsdp_ag",
                     },
-                    scope=first_node.scope,
-                    category="communication"
+                    scope=first_fwd.scope,
+                    category="communication",
                 )
-                ag_node.annotations["inserted_by"] = "zero_fsdp_pass"
-                self._prepend_comm(graph, first_node.id, ag_node)
-                
-                # Insert reduce-scatter after the last node
-                rs_id = f"comm_fsdp_rs_{last_node.id}"
-                rs_node = OpNode(
+                ag_fwd.annotations["inserted_by"] = "zero_fsdp_pass"
+                ag_fwd.annotations["phase"] = "fwd"
+                self._prepend_comm(graph, first_fwd.id, ag_fwd)
+
+            if bwd_nodes:
+                first_bwd = bwd_nodes[0]
+                last_bwd = bwd_nodes[-1]
+
+                ag_bwd_id = f"comm_fsdp_ag_{first_bwd.id}"
+                ag_bwd = OpNode(
+                    id=ag_bwd_id,
+                    op_type="comm.all_gather",
+                    inputs=first_bwd.inputs.copy(),
+                    outputs=first_bwd.inputs.copy(),
+                    attrs={
+                        "group_size": dp,
+                        "collective": "all_gather",
+                        "role": "fsdp_ag",
+                    },
+                    scope=first_bwd.scope,
+                    category="communication",
+                )
+                ag_bwd.annotations["inserted_by"] = "zero_fsdp_pass"
+                ag_bwd.annotations["phase"] = "bwd"
+                self._prepend_comm(graph, first_bwd.id, ag_bwd)
+
+                rs_id = f"comm_fsdp_rs_{last_bwd.id}"
+                rs = OpNode(
                     id=rs_id,
                     op_type="comm.reduce_scatter",
-                    inputs=last_node.outputs.copy(),
-                    outputs=last_node.outputs.copy(),
+                    inputs=last_bwd.outputs.copy(),
+                    outputs=last_bwd.outputs.copy(),
                     attrs={
                         "group_size": dp,
                         "collective": "reduce_scatter",
-                        "role": "fsdp_rs"
+                        "role": "fsdp_rs",
                     },
-                    scope=last_node.scope,
-                    category="communication"
+                    scope=last_bwd.scope,
+                    category="communication",
                 )
-                rs_node.annotations["inserted_by"] = "zero_fsdp_pass"
-                self._rewire(graph, last_node.id, rs_node)
+                rs.annotations["inserted_by"] = "zero_fsdp_pass"
+                rs.annotations["phase"] = "bwd"
+                self._rewire(graph, last_bwd.id, rs)
 
     def _get_layers(self, graph: OpGraph) -> list[str]:
         """Get layer scopes from the graph.

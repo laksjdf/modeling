@@ -109,6 +109,30 @@ def _attn_compression_ratio(node, graph) -> float:
 
 # ── RooflinePass ──────────────────────────────────────────────────────────────
 
+def _effective_compute_dtype(node: "OpNode") -> "DType":
+    """Return the compute dtype for throughput lookup.
+
+    For compute nodes, activation dtype (inputs[0]) drives tensor-core selection.
+    Falls back to output dtype for non-compute or no-input nodes.
+    Also respects quant_act annotation for hypothetical-quant analysis.
+    """
+    from python.zrt.ir.types import DType
+
+    if node.category != "compute" or not node.inputs:
+        return node.outputs[0].dtype if node.outputs else DType.BF16
+    # Annotation path: QuantizationPass wrote quant_act on this node
+    quant_act = node.annotations.get("quant_act")
+    if quant_act and quant_act not in ("bf16", "fp16", "fp32"):
+        # Normalize fp8 alias to fp8_e4m3 (default FP8 format for training)
+        normalized = "fp8_e4m3" if quant_act == "fp8" else quant_act
+        try:
+            return DType(normalized)
+        except ValueError:
+            pass
+    # Captured dtype path: use activation tensor (inputs[0]) dtype
+    return node.inputs[0].dtype
+
+
 class RooflinePass(GraphPass):
     """Annotate nodes with Roofline-model timing estimates and bound classification.
 
@@ -137,8 +161,8 @@ class RooflinePass(GraphPass):
                 flops, read_b, write_b = sim._fmr(node)
             total_b = read_b + write_b
 
-            # Use primary dtype for peak throughput lookup
-            dtype = node.outputs[0].dtype if node.outputs else DType.BF16
+            # Use activation input dtype for compute throughput (INT8/FP8 vs BF16)
+            dtype = _effective_compute_dtype(node)
             peak  = hw.peak_flops(dtype)   # ops/s
             bw    = hw.hbm_bandwidth()     # bytes/s
 

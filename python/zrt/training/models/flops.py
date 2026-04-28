@@ -30,6 +30,14 @@ def op_cost(op: Op, model: ModelSpec) -> OpCost:
         return _matmul_cost(op)
     if op.kind == "attn_core":
         return _attn_cost(op, model)
+    if op.kind == "mhc_pre":
+        return _mhc_pre_cost(op)
+    if op.kind == "mhc_post":
+        return _mhc_post_cost(op)
+    if op.kind == "mhc_head":
+        return _mhc_head_cost(op)
+    if op.kind == "hc_expand":
+        return _memory_bound_cost(op)
     if op.kind in ("ln", "softmax", "rope", "swiglu", "add"):
         return _memory_bound_cost(op)
     if op.kind in ("embed", "lm_head"):
@@ -86,6 +94,80 @@ def _attn_compression_ratio(value: float) -> float:
     if not (0.0 < ratio <= 1.0):
         raise ValueError(f"attn_compression_ratio must be in (0, 1], got {value}")
     return ratio
+
+
+def _mhc_pre_cost(op: Op) -> OpCost:
+    """Hyper-Connections pre-mix: mixes-Linear + sinkhorn iters + weighted sum.
+
+    Math:
+      mixes  = x[b,s,hc*h] @ hc_fn[hc*h, mix_hc]      → 2·b·s·(hc·h)·mix_hc  (compute-bound)
+      sink   = sinkhorn_iters · O(b·s·mix_hc·hc)     elementwise              (memory-ish)
+      sum    = pre[b,s,hc] · x[b,s,hc,h]              → 2·b·s·hc·h            (weighted sum)
+    """
+    b = op.meta.get("b", 1)
+    s = op.meta.get("s", 0)
+    h = op.meta.get("h", 0)
+    hc = op.meta.get("hc", 1)
+    mix = op.meta.get("mix_hc", (2 + hc) * hc)
+    it = op.meta.get("sinkhorn_iters", 20)
+
+    fwd_lin = 2.0 * b * s * (hc * h) * mix
+    fwd_sink = float(it * b * s * mix * hc) * 4.0
+    fwd_sum = float(b * s * hc * h) * 2.0
+    fwd = fwd_lin + fwd_sink + fwd_sum
+
+    return OpCost(
+        fwd_flops=fwd,
+        dx_flops=2.5 * fwd,
+        dw_flops=fwd_lin,  # only the mixes Linear has trainable params
+    )
+
+
+def _mhc_post_cost(op: Op) -> OpCost:
+    """Hyper-Connections post-mix: post·x + Σ comb·residual.
+
+    Math:
+      post · x:           b·s·hc·h            (broadcast multiply)
+      comb · residual:    b·s·hc·hc·h         (full hc×hc combination)
+      sum over hc:        b·s·hc·h
+    No trainable parameters in this op (post / comb come from mhc_pre).
+    """
+    b = op.meta.get("b", 1)
+    s = op.meta.get("s", 0)
+    h = op.meta.get("h", 0)
+    hc = op.meta.get("hc", 1)
+
+    fwd = float(b * s * hc * h) * 2.0 + float(b * s * hc * hc * h) * 2.0
+
+    return OpCost(
+        fwd_flops=fwd,
+        dx_flops=2.5 * fwd,
+        dw_flops=0.0,
+    )
+
+
+def _mhc_head_cost(op: Op) -> OpCost:
+    """Final HC mix-down before final_ln (no sinkhorn, no comb).
+
+    Math:
+      mixes  = x[b,s,hc*h] @ hc_head_fn[hc*h, hc]   → 2·b·s·hc·h·hc
+      sum    = pre[b,s,hc] · x[b,s,hc,h]            → 2·b·s·hc·h
+    """
+    b = op.meta.get("b", 1)
+    s = op.meta.get("s", 0)
+    h = op.meta.get("h", 0)
+    hc = op.meta.get("hc", 1)
+    mix = op.meta.get("mix_hc", hc)
+
+    fwd_lin = 2.0 * b * s * (hc * h) * mix
+    fwd_sum = float(b * s * hc * h) * 2.0
+    fwd = fwd_lin + fwd_sum
+
+    return OpCost(
+        fwd_flops=fwd,
+        dx_flops=2.5 * fwd,
+        dw_flops=fwd_lin,
+    )
 
 
 def _memory_bound_cost(op: Op) -> OpCost:
@@ -176,4 +258,6 @@ def _op_recompute_categories(op: Op) -> set[str]:
         return {"ffn_swiglu"}
     if op.kind == "ln":
         return {"ln"}
+    if op.kind in ("mhc_pre", "mhc_post", "mhc_head"):
+        return {"hc"}
     return set()

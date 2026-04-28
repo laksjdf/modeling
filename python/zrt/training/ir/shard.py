@@ -152,6 +152,15 @@ def _apply_tp_sharding(
             for t in op.inputs + op.outputs:
                 if t.shape_logical and t.shape_logical[-1] in (h_attn, h_kv):
                     t.shape_local = (t.shape_logical[0], max(1, t.shape_logical[-1] // shard.tp))
+        elif op.kind in ("mhc_pre", "mhc_post", "mhc_head", "hc_expand"):
+            # Hyper-Connections are token-local: TP does not shard hc or h.
+            # The mixes-Linear operates on (hc·h) features that semantically
+            # belong to *one* residual stream replicated across hc copies; the
+            # learned hc_*_fn matrix is small (hc·h × mix_hc) and replicated on
+            # every TP rank, so introducing TP here would only add comm without
+            # reducing compute.  CP (sequence-parallel) handling — when added —
+            # would scale the seq dim of meta["s"] independently.
+            pass
         elif op.kind in ("ln", "rope", "swiglu", "add"):
             if "bytes_fwd" in op.meta:
                 op.meta["bytes_fwd"] = int(op.meta["bytes_fwd"]) // shard.tp

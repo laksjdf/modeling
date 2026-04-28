@@ -54,6 +54,22 @@ def classify_component(module_path: str, func_name: str) -> str:
     fn_parts = func_name.split(".")
     op_short = fn_parts[1] if len(fn_parts) >= 2 else func_name
 
+    # ── DeepSeek-V4 Hyper-Connections (must precede attn/ffn/head) ──────────
+    # Module paths injected by patches.patch_hc_for_capture():
+    #   transformer.layers.<i>.hc_pre_attn   / hc_post_attn
+    #   transformer.layers.<i>.hc_pre_ffn    / hc_post_ffn
+    #   transformer.head.hc_head_module
+    if "hc_pre_attn" in s:
+        return "hc.pre_attn"
+    if "hc_post_attn" in s:
+        return "hc.post_attn"
+    if "hc_pre_ffn" in s:
+        return "hc.pre_ffn"
+    if "hc_post_ffn" in s:
+        return "hc.post_ffn"
+    if "hc_head_module" in s or s.endswith(".hc_head"):
+        return "hc.head"
+
     # ── Norm layers ──────────────────────────────────────────────────────────
     if "input_layernorm" in s:
         return "attn_norm"

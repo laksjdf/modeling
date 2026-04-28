@@ -4,10 +4,12 @@ For each node annotates ``node.annotations["stage_id"] = int`` (0-indexed).
 Inserts ``comm.send_recv`` nodes at stage boundaries to model activation
 transfer latency between adjacent pipeline stages.
 
-Layer partitioning uses greedy bin-packing by accumulated per-layer compute
-load (``compute_us`` → ``latency_us`` → ``flops`` → 1.0 fallback), which
-approximates load-balanced stage assignment without requiring a pre-pass.
-An explicit ``TrainingConfig.pp_layer_assignment`` list overrides this.
+Layer partitioning strategies:
+  - VPP (vpp_chunks > 1, pp_schedule="interleaved"): interleaved assignment
+    Each device holds vpp_chunks virtual stages, layers distributed round-robin.
+    Example: pp=2, vpp_chunks=2, 8 layers → Device0=[L0,L1,L4,L5], Device1=[L2,L3,L6,L7]
+  - Standard 1F1B (vpp_chunks=1): greedy bin-packing by compute load.
+  - Explicit: user-provided pp_layer_assignment overrides automatic assignment.
 """
 from __future__ import annotations
 
@@ -29,11 +31,12 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class LayerGroup:
-    """Layers assigned to a single pipeline stage."""
+    """Layers assigned to a single pipeline stage (physical device)."""
     stage_id: int
     layer_ids: List[int] = field(default_factory=list)
     node_ids: Set[str] = field(default_factory=set)
     total_compute_us: float = 0.0
+    virtual_stage_ids: List[int] = field(default_factory=list)
 
 
 class PipelineParallelPass(GraphPass):
@@ -44,7 +47,8 @@ class PipelineParallelPass(GraphPass):
 
     Annotations written
     -------------------
-    ``node.annotations["stage_id"]`` : int  — 0-indexed pipeline stage.
+    ``node.annotations["stage_id"]`` : int  — 0-indexed pipeline stage (physical device).
+    ``node.annotations["virtual_stage_id"]`` : int — virtual stage within device (VPP only).
     """
 
     name = "pipeline_parallel"
@@ -67,6 +71,10 @@ class PipelineParallelPass(GraphPass):
             getattr(ctx.training, "pp_layer_assignment", None)
             if ctx.training else None
         )
+
+        vpp_chunks = max(1, getattr(ctx.training, "vpp_chunks", 1) if ctx.training else 1)
+        pp_schedule = getattr(ctx.training, "pp_schedule", "1f1b") if ctx.training else "1f1b"
+        is_vpp = vpp_chunks > 1 and pp_schedule in ("interleaved", "i1f1b")
 
         # 1. Build layer_id → {node_ids} and per-layer compute load
         layer_nodes: Dict[int, Set[str]] = {}
@@ -92,25 +100,33 @@ class PipelineParallelPass(GraphPass):
 
         # 2. Partition layers → pp stages
         stages = self._partition(sorted_layers, layer_nodes, layer_load,
-                                 pp, pp_layer_assignment)
+                                 pp, pp_layer_assignment, vpp_chunks, is_vpp)
 
-        # 3. Build lookup: layer_id → stage_id
+        # 3. Build lookup: layer_id → stage_id, layer_id → virtual_stage_id (VPP)
         layer_to_stage: Dict[int, int] = {
             lid: s.stage_id
             for s in stages
             for lid in s.layer_ids
         }
+        layer_to_virtual_stage: Dict[int, int] = {}
+        if is_vpp:
+            total_chunks = pp * vpp_chunks
+            layers_per_chunk = max(1, len(sorted_layers) // total_chunks)
+            for idx, lid in enumerate(sorted_layers):
+                layer_to_virtual_stage[lid] = min(idx // layers_per_chunk, total_chunks - 1)
 
-        # 4. Annotate stage_id on every node
+        # 4. Annotate stage_id and virtual_stage_id on every node
         for node in g.nodes.values():
             try:
                 layer_idx = int(node.layer) if node.layer else -1
             except (ValueError, TypeError):
                 layer_idx = -1
             node.annotations["stage_id"] = layer_to_stage.get(layer_idx, 0)
+            if is_vpp and layer_idx >= 0:
+                node.annotations["virtual_stage_id"] = layer_to_virtual_stage.get(layer_idx, 0)
 
         # 5. Insert P2P send_recv at each stage boundary
-        self._insert_p2p_nodes(g, stages)
+        self._insert_p2p_nodes(g, stages, is_vpp)
 
         # 6. Warn if imbalanced
         self._check_balance(stages)
@@ -126,21 +142,39 @@ class PipelineParallelPass(GraphPass):
         layer_load: Dict[int, float],
         pp: int,
         explicit: Optional[List[int]],
+        vpp_chunks: int = 1,
+        is_vpp: bool = False,
     ) -> List[LayerGroup]:
         stages = [LayerGroup(stage_id=i) for i in range(pp)]
 
         if not sorted_layers:
             return stages
 
-        if explicit and len(explicit) == len(sorted_layers):
-            # User-specified assignment: explicit[i] is the stage for sorted_layers[i]
+        n_layers = len(sorted_layers)
+
+        if explicit and len(explicit) == n_layers:
             for idx, layer_id in enumerate(sorted_layers):
                 s_idx = max(0, min(explicit[idx], pp - 1))
                 stages[s_idx].layer_ids.append(layer_id)
                 stages[s_idx].node_ids.update(layer_nodes[layer_id])
                 stages[s_idx].total_compute_us += layer_load.get(layer_id, 0.0)
+        elif is_vpp:
+            total_chunks = pp * vpp_chunks
+            layers_per_chunk = max(1, n_layers // total_chunks)
+            for idx, layer_id in enumerate(sorted_layers):
+                chunk_id = min(idx // layers_per_chunk, total_chunks - 1)
+                s_idx = chunk_id % pp
+                stages[s_idx].layer_ids.append(layer_id)
+                stages[s_idx].node_ids.update(layer_nodes[layer_id])
+                load = layer_load.get(layer_id, 0.0)
+                stages[s_idx].total_compute_us += load
+            if vpp_chunks > 1:
+                logger.info(
+                    "PipelineParallelPass: VPP interleaved assignment "
+                    "(pp=%d, vpp_chunks=%d, layers_per_chunk=%d, total_chunks=%d)",
+                    pp, vpp_chunks, layers_per_chunk, total_chunks,
+                )
         else:
-            # Greedy bin-packing: always assign to the lightest stage
             stage_load = [0.0] * pp
             for layer_id in sorted_layers:
                 min_s = int(min(range(pp), key=lambda i: stage_load[i]))
@@ -155,28 +189,40 @@ class PipelineParallelPass(GraphPass):
     # ── P2P insertion ─────────────────────────────────────────────────────────
 
     def _insert_p2p_nodes(self, graph: "OpGraph",
-                          stages: List[LayerGroup]) -> None:
+                          stages: List[LayerGroup],
+                          is_vpp: bool = False) -> None:
         """Insert comm.send_recv at stage boundaries and rewire receiver edges.
 
         Detects edges that cross stage boundaries, inserts one comm node per
         crossing edge, and rewires receiver-side edges so the comm node is on
         the real dependency path.
+
+        For VPP, also checks virtual_stage_id boundaries to insert P2P between
+        virtual stages on different physical devices.
         """
         node_stage = {nid: node.annotations.get("stage_id", 0)
                       for nid, node in graph.nodes.items()}
+        node_virtual_stage = {nid: node.annotations.get("virtual_stage_id", -1)
+                              for nid, node in graph.nodes.items()}
 
-        # Collect crossing edges (source and dest in different stages)
         crossing_edges: List[Edge] = []
         for edge in list(graph.edges):
             ss = node_stage.get(edge.src, -1)
             ds = node_stage.get(edge.dst, -1)
             if ss >= 0 and ds >= 0 and ss != ds:
                 crossing_edges.append(edge)
+            elif is_vpp:
+                sv = node_virtual_stage.get(edge.src, -1)
+                dv = node_virtual_stage.get(edge.dst, -1)
+                if sv >= 0 and dv >= 0 and sv != dv and ss != ds:
+                    crossing_edges.append(edge)
 
         p2p_idx = 0
         for edge in crossing_edges:
             ss = node_stage[edge.src]
             ds = node_stage[edge.dst]
+            sv = node_virtual_stage.get(edge.src, -1)
+            dv = node_virtual_stage.get(edge.dst, -1)
             src_phase = graph.nodes[edge.src].annotations.get("phase", "")
             dst_phase = graph.nodes[edge.dst].annotations.get("phase", "")
             direction = "bwd" if "bwd" in (src_phase, dst_phase) else "fwd"
@@ -207,14 +253,16 @@ class PipelineParallelPass(GraphPass):
                     "src_stage": ss,
                     "dst_stage": ds,
                     "message_size_bytes": act_bytes,
+                    "src_virtual_stage": sv if is_vpp and sv >= 0 else None,
+                    "dst_virtual_stage": dv if is_vpp and dv >= 0 else None,
                 },
                 scope=f"pipeline.p2p.{direction}.stage{ss}_to_{ds}",
                 category="communication",
             )
-            # Attribute boundary comm to the receiving stage so per-stage
-            # subgraphs retain the comm predecessor for receiver-side nodes.
             p2p_node.annotations["stage_id"] = ds
             p2p_node.annotations["phase"] = direction
+            if is_vpp and dv >= 0:
+                p2p_node.annotations["virtual_stage_id"] = dv
 
             # Insert after source node
             graph.insert_after(edge.src, p2p_node, [Edge(

@@ -183,6 +183,260 @@ class TestPipelineParallelPass:
                 f"Node {node.id} ({node.op_type}) missing stage_id"
             )
 
+    def test_vpp_interleaved_layer_assignment(self):
+        """VPP (vpp_chunks=2, pp=2, 8 layers) produces interleaved assignment.
+        
+        Expected distribution:
+          Device 0: L0,L1,L4,L5 (virtual stages 0 and 2)
+          Device 1: L2,L3,L6,L7 (virtual stages 1 and 3)
+        
+        Expected P2P boundaries:
+          L1→L2: stage 0→1, virtual_stage 0→1
+          L3→L4: stage 1→0, virtual_stage 1→2
+          L5→L6: stage 0→1, virtual_stage 2→3
+        """
+        graph = _make_linear_graph(num_layers=8)
+        ctx = _make_ctx(pp=2)
+        ctx.training = TrainingConfig(
+            micro_batch=1,
+            global_batch=8,
+            pp_schedule="interleaved",
+            vpp_chunks=2,
+        )
+        result = PipelineParallelPass().run(graph, ctx)
+
+        stage0_layers = {
+            int(n.layer) for n in result.nodes.values()
+            if n.layer and n.op_type != "comm.send_recv"
+               and n.annotations.get("stage_id") == 0
+        }
+        stage1_layers = {
+            int(n.layer) for n in result.nodes.values()
+            if n.layer and n.op_type != "comm.send_recv"
+               and n.annotations.get("stage_id") == 1
+        }
+
+        assert stage0_layers == {0, 1, 4, 5}, f"Expected {0,1,4,5}, got {stage0_layers}"
+        assert stage1_layers == {2, 3, 6, 7}, f"Expected {2,3,6,7}, got {stage1_layers}"
+
+        # Verify P2P nodes
+        p2p_nodes = [n for n in result.nodes.values() if n.op_type == "comm.send_recv"]
+        assert len(p2p_nodes) == 3, f"Expected 3 P2P nodes for VPP, got {len(p2p_nodes)}"
+
+
+    def test_vpp_virtual_stage_id_annotation(self):
+        """VPP mode adds virtual_stage_id annotation to compute nodes."""
+        graph = _make_linear_graph(num_layers=8)
+        ctx = _make_ctx(pp=2)
+        ctx.training = TrainingConfig(
+            micro_batch=1,
+            global_batch=8,
+            pp_schedule="interleaved",
+            vpp_chunks=2,
+        )
+        result = PipelineParallelPass().run(graph, ctx)
+
+        compute_nodes = [n for n in result.nodes.values()
+                         if n.op_type != "comm.send_recv"]
+        
+        for node in compute_nodes:
+            assert "virtual_stage_id" in node.annotations, (
+                f"Node {node.id} missing virtual_stage_id in VPP mode"
+            )
+
+        virtual_ids = {n.annotations["virtual_stage_id"] for n in compute_nodes}
+        assert virtual_ids == {0, 1, 2, 3}, f"Expected 4 virtual stages, got {virtual_ids}"
+
+    def test_vpp_p2p_count_more_than_standard(self):
+        """VPP mode has more P2P nodes due to interleaved virtual stage boundaries.
+        
+        Standard pp=2 with explicit continuous assignment: 1 P2P (L3→L4 boundary)
+        VPP pp=2, vpp_chunks=2: 3 P2P nodes at L1→L2, L5→L6, L7→L8 boundaries
+        """
+        graph = _make_linear_graph(num_layers=8)
+        
+        ctx_std = _make_ctx(pp=2, pp_layer_assignment=[0, 0, 0, 0, 1, 1, 1, 1])
+        ctx_vpp = _make_ctx(pp=2)
+        ctx_vpp.training = TrainingConfig(
+            micro_batch=1,
+            global_batch=8,
+            pp_schedule="interleaved",
+            vpp_chunks=2,
+        )
+        
+        result_std = PipelineParallelPass().run(graph, ctx_std)
+        result_vpp = PipelineParallelPass().run(graph, ctx_vpp)
+        
+        p2p_std = [n for n in result_std.nodes.values() if n.op_type == "comm.send_recv"]
+        p2p_vpp = [n for n in result_vpp.nodes.values() if n.op_type == "comm.send_recv"]
+        
+        assert len(p2p_std) == 1, f"Standard pp=2 should have 1 P2P, got {len(p2p_std)}"
+        assert len(p2p_vpp) == 3, f"VPP should have == 3 P2P nodes, got {len(p2p_vpp)}"
+
+    def test_vpp_p2p_has_virtual_stage_attrs(self):
+        """P2P nodes in VPP mode have src_virtual_stage and dst_virtual_stage attrs."""
+        graph = _make_linear_graph(num_layers=8)
+        ctx = _make_ctx(pp=2)
+        ctx.training = TrainingConfig(
+            micro_batch=1,
+            global_batch=8,
+            pp_schedule="interleaved",
+            vpp_chunks=2,
+        )
+        result = PipelineParallelPass().run(graph, ctx)
+        
+        p2p_nodes = [n for n in result.nodes.values() if n.op_type == "comm.send_recv"]
+        
+        for p2p in p2p_nodes:
+            assert "src_virtual_stage" in p2p.attrs, f"P2P {p2p.id} missing src_virtual_stage"
+            assert "dst_virtual_stage" in p2p.attrs, f"P2P {p2p.id} missing dst_virtual_stage"
+            
+            src_vs = p2p.attrs["src_virtual_stage"]
+            dst_vs = p2p.attrs["dst_virtual_stage"]
+            if src_vs is not None and dst_vs is not None:
+                assert src_vs != dst_vs, f"Virtual stage crossing: {src_vs} != {dst_vs}"
+
+    def test_vpp_pp4_interleaved_assignment(self):
+        """VPP with pp=4, vpp_chunks=2, 16 layers.
+        
+        Expected: each device gets 2 virtual stages with 2 layers each.
+        layers_per_chunk = 16 / (4*2) = 2
+        chunk_id = idx // 2
+        stage = chunk_id % 4
+        
+        L0,L1 → chunk 0 → stage 0
+        L2,L3 → chunk 1 → stage 1
+        L4,L5 → chunk 2 → stage 2
+        L6,L7 → chunk 3 → stage 3
+        L8,L9 → chunk 4 → stage 0
+        ...
+        """
+        graph = _make_linear_graph(num_layers=16)
+        ctx = _make_ctx(pp=4)
+        ctx.training = TrainingConfig(
+            micro_batch=1,
+            global_batch=16,
+            pp_schedule="interleaved",
+            vpp_chunks=2,
+        )
+        result = PipelineParallelPass().run(graph, ctx)
+        
+        stage_layers = {}
+        for s in range(4):
+            stage_layers[s] = {
+                int(n.layer) for n in result.nodes.values()
+                if n.layer and n.op_type != "comm.send_recv"
+                   and n.annotations.get("stage_id") == s
+            }
+        
+        assert stage_layers[0] == {0, 1, 8, 9}, f"Stage 0: {stage_layers[0]}"
+        assert stage_layers[1] == {2, 3, 10, 11}, f"Stage 1: {stage_layers[1]}"
+        assert stage_layers[2] == {4, 5, 12, 13}, f"Stage 2: {stage_layers[2]}"
+        assert stage_layers[3] == {6, 7, 14, 15}, f"Stage 3: {stage_layers[3]}"
+
+    def test_vpp_vpp_chunks_1_falls_back_to_standard(self):
+        """vpp_chunks=1 with interleaved schedule falls back to standard behavior."""
+        graph = _make_linear_graph(num_layers=8)
+        
+        ctx_vpp1 = _make_ctx(pp=2)
+        ctx_vpp1.training = TrainingConfig(
+            micro_batch=1,
+            global_batch=8,
+            pp_schedule="interleaved",
+            vpp_chunks=1,
+        )
+        ctx_std = _make_ctx(pp=2)
+        
+        result_vpp1 = PipelineParallelPass().run(graph, ctx_vpp1)
+        result_std = PipelineParallelPass().run(graph, ctx_std)
+        
+        vpp1_stages = {n.annotations["stage_id"] for n in result_vpp1.nodes.values()
+                       if n.op_type != "comm.send_recv"}
+        std_stages = {n.annotations["stage_id"] for n in result_std.nodes.values()
+                      if n.op_type != "comm.send_recv"}
+        
+        assert vpp1_stages == std_stages, f"vpp_chunks=1 should fallback to standard"
+        
+        vpp1_virtual = [n.annotations.get("virtual_stage_id") for n in result_vpp1.nodes.values()]
+        assert all(v is None for v in vpp1_virtual), "vpp_chunks=1 should not add virtual_stage_id"
+
+    def test_vpp_uneven_layer_count_10_layers_pp2_vpp2(self):
+        """VPP with 10 layers, pp=2, vpp_chunks=2 — bounded chunk_id prevents overflow.
+        
+        Before fix: floor division (10 // 4 = 2) created chunk_id=4 for layers 8-9,
+        wrapping back to device 0, giving device 0 three chunks instead of two.
+        
+        After fix: chunk_id = min(idx // layers_per_chunk, total_chunks - 1),
+        ensuring no chunk_id exceeds total_chunks - 1.
+        
+        layers_per_chunk = 10 // 4 = 2
+        Remaining layers (8,9) are clamped to chunk 3 (last valid chunk).
+        
+        Distribution:
+          - layers 0-1: chunk 0 → stage 0
+          - layers 2-3: chunk 1 → stage 1
+          - layers 4-5: chunk 2 → stage 0
+          - layers 6-9: chunk 3 → stage 1 (clamped)
+        """
+        graph = _make_linear_graph(num_layers=10)
+        ctx = _make_ctx(pp=2)
+        ctx.training = TrainingConfig(
+            micro_batch=1,
+            global_batch=10,
+            pp_schedule="interleaved",
+            vpp_chunks=2,
+        )
+        result = PipelineParallelPass().run(graph, ctx)
+        
+        stage0_layers = {
+            int(n.layer) for n in result.nodes.values()
+            if n.layer and n.op_type != "comm.send_recv"
+               and n.annotations.get("stage_id") == 0
+        }
+        stage1_layers = {
+            int(n.layer) for n in result.nodes.values()
+            if n.layer and n.op_type != "comm.send_recv"
+               and n.annotations.get("stage_id") == 1
+        }
+        
+        assert stage0_layers == {0, 1, 4, 5}, f"Stage 0 got {stage0_layers}"
+        assert stage1_layers == {2, 3, 6, 7, 8, 9}, f"Stage 1 got {stage1_layers}"
+        
+        compute_nodes = [n for n in result.nodes.values() if n.op_type != "comm.send_recv"]
+        virtual_ids = {n.annotations["virtual_stage_id"] for n in compute_nodes}
+        assert virtual_ids == {0, 1, 2, 3}, f"Expected 4 virtual stages (0-3), got {virtual_ids}"
+        assert max(virtual_ids) == 3, f"Max virtual_stage_id should be 3, got {max(virtual_ids)}"
+
+    def test_vpp_uneven_layer_count_11_layers_pp2_vpp3(self):
+        """VPP with 11 layers, pp=2, vpp_chunks=3 — 6 total chunks, bounded chunk_id.
+        
+        total_chunks = 2 * 3 = 6
+        layers_per_chunk = 11 // 6 = 1
+        Remaining layers (6-10) are clamped to chunk 5 (last valid chunk).
+        
+        Distribution:
+          - layer 0: chunk 0 → stage 0
+          - layer 1: chunk 1 → stage 1
+          - layer 2: chunk 2 → stage 0
+          - layer 3: chunk 3 → stage 1
+          - layer 4: chunk 4 → stage 0
+          - layers 5-10: chunk 5 → stage 1 (clamped)
+        """
+        graph = _make_linear_graph(num_layers=11)
+        ctx = _make_ctx(pp=2)
+        ctx.training = TrainingConfig(
+            micro_batch=1,
+            global_batch=11,
+            pp_schedule="interleaved",
+            vpp_chunks=3,
+        )
+        result = PipelineParallelPass().run(graph, ctx)
+        
+        compute_nodes = [n for n in result.nodes.values() if n.op_type != "comm.send_recv"]
+        virtual_ids = {n.annotations["virtual_stage_id"] for n in compute_nodes}
+        assert virtual_ids == {0, 1, 2, 3, 4, 5}, f"Expected 6 virtual stages (0-5), got {virtual_ids}"
+        assert max(virtual_ids) == 5, f"Max virtual_stage_id should be 5, got {max(virtual_ids)}"
+
 
 # ── TrainingPipelinePass per-stage tests ──────────────────────────────────────
 
