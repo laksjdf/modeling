@@ -335,6 +335,7 @@ def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
 def _run_training_modelling(args, model_id: str, hw, result) -> None:
     """Run graph-native training modelling on captured training graphs."""
     from python.zrt.transform.analysis import estimate_training_from_graphs
+    from python.zrt.transform.exporter import export_training_graphs
 
     fwd_pair = result.graphs.get("train_forward")
     if not fwd_pair:
@@ -348,7 +349,7 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
     if raw_bwd is None:
         logger.warning("No train_backward graph captured; backward metrics will use forward-only fallback.")
 
-    report = estimate_training_from_graphs(
+    report, ctx, transformed = estimate_training_from_graphs(
         forward_graph=raw_fwd,
         backward_graph=raw_bwd,
         hw_spec=hw,
@@ -367,6 +368,7 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
         optimizer=args.optimizer,
         micro_batch=args.micro_batch,
         global_batch=args.global_batch,
+        return_transformed=True,
         quant=args.quant,
     )
 
@@ -375,12 +377,35 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
     except UnicodeEncodeError:
         logger.info("Training summary:\n%s", report.summary())
 
+    slug = _make_model_slug(model_id)
+    output_dir = result.output_dir
+
+    # Export training Excel
+    try:
+        if "unified" in transformed:
+            g = transformed["unified"]
+            fwd_for_export = g
+            bwd_for_export = g
+        else:
+            fwd_for_export = transformed.get("train_forward")
+            bwd_for_export = None
+
+        if fwd_for_export:
+            export_training_graphs(
+                fwd_graph=fwd_for_export,
+                bwd_graph=bwd_for_export,
+                ctx=ctx,
+                output_dir=output_dir,
+            )
+            logger.info("Training Excel exported to %s", output_dir / f"{slug}_training.xlsx")
+    except Exception as exc:
+        logger.warning("Training Excel export failed: %s", exc)
+
     # Export training report JSON
     try:
         import json as _json
-        report_dir = result.output_dir / "reports"
+        report_dir = output_dir / "reports"
         report_dir.mkdir(parents=True, exist_ok=True)
-        slug = _make_model_slug(model_id)
         json_path = report_dir / f"{slug}_training_report.json"
         json_path.write_text(_json.dumps(report.to_dict(), indent=2))
         logger.info("Training report written to %s", json_path)

@@ -40,13 +40,21 @@ def estimate_training_from_graphs(
     global_batch: int = 32,
     pp_schedule: str = "1f1b",
     vpp_chunks: int = 1,
+    return_transformed: bool = False,
     quant: str | None = None,
-) -> TrainingReport:
+) -> "TrainingReport | tuple[TrainingReport, TransformContext, dict[str, OpGraph]]":
     """Estimate training performance from pre-built OpGraph instances.
 
     Takes already-captured forward and backward computation graphs and
     runs the training analysis pipeline. Use this when the graphs have
     already been captured by ``run_trace_phases``.
+
+    Parameters
+    ----------
+    return_transformed : bool, default False
+        If True, return (TrainingReport, TransformContext, transformed_graphs)
+        where transformed_graphs contains the pipeline-processed graphs.
+        This enables downstream Excel export via ``export_training_graphs``.
     """
     from python.zrt.transform.context import ParallelConfig, QuantConfig, TrainingConfig, TransformContext
     from python.zrt.transform.pipeline import build_default_pipeline
@@ -141,7 +149,7 @@ def estimate_training_from_graphs(
         config_parts.append(f"micro{training.micro_batch}")
     config_summary = "-".join(config_parts) if config_parts else "default"
 
-    return TrainingReport(
+    report = TrainingReport(
         config_summary=config_summary,
         step_time_ms=step_time_ms,
         per_stage_ms=per_stage_ms,
@@ -158,3 +166,7 @@ def estimate_training_from_graphs(
         bubble_fraction=bubble_fraction,
         total_params=total_params,
     )
+
+    if return_transformed:
+        return report, ctx, results
+    return report
