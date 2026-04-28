@@ -10,11 +10,14 @@ from dataclasses import dataclass, field
 
 from zrt.training.compose.stage import StageTime, stage_time
 from zrt.training.ir.training_graph import Graph
-from zrt.training.models.comm import total_comm_time
+from zrt.training.models.comm import total_comm_time, optimizer_comm_time
 from zrt.training.models.flops import recompute_overhead_flops
 from zrt.training.models.memory import MemBreakdown, memory_breakdown
+from zrt.training.models.optimizer import muon_optimizer_step_flops, adam_step_flops
+from zrt.training.io.perf_tables import achieved_flops_efficiency
+from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import ModelSpec
-from zrt.training.spec.strategy import PPSched, Strategy
+from zrt.training.spec.strategy import PPSched, Strategy, resolve_muon_ns_steps
 from zrt.training.spec.system import SystemSpec
 
 
@@ -44,6 +47,8 @@ class StepResult:
     schedule_name: str = "1f1b"    # Pipeline schedule identifier
     warmup_steps: int = 0          # Number of warmup microbatches
     cooldown_steps: int = 0        # Number of cooldown microbatches
+    optimizer_time: float = 0.0    # Optimizer step time (seconds)
+    optimizer_comm: float = 0.0    # Optimizer communication time (seconds)
 
 
 class PipelineComposer(ABC):
@@ -397,14 +402,24 @@ def pipeline_step_time(
 
     step.per_stage = stage_times
 
+    # Optimizer time and communication
+    opt_time = _compute_optimizer_time(model, system, strategy)
+    opt_comm = _compute_optimizer_comm_time(model, system, strategy)
+    step.optimizer_time = opt_time
+    step.optimizer_comm = opt_comm
+
     # Memory breakdown
     step.memory = memory_breakdown(graph, model, system, strategy)
 
-    # MFU
+    # MFU (before adding optimizer time, per design doc §5.5.2)
     step.mfu = compute_mfu(model, strategy, system, step.step_time)
 
     # HFU
     step.hfu = compute_hfu(model, strategy, system, step.step_time, graph)
+
+    # Add optimizer time to step_time (per §5.5.2 of muon_optimizer_design.md)
+    # This must happen after MFU/HFU calculation so MFU excludes optimizer overhead
+    step.step_time += opt_time + opt_comm
 
     return step
 
@@ -433,6 +448,50 @@ def _assign_stages(model: ModelSpec, strategy: Strategy) -> list[list[int]]:
     for i in range(n_layers):
         stages[i % pp].append(i)
     return stages
+
+
+def _compute_optimizer_time(model: ModelSpec, system: SystemSpec, strategy: Strategy) -> float:
+    """Compute optimizer step time in seconds.
+
+    Uses roofline model with achieved efficiency from perf_tables.
+    """
+    P = model.total_params()
+    if strategy.tp > 1:
+        P //= strategy.tp
+    if strategy.pp > 1:
+        n_layers = len(model.layers)
+        embed = model.vocab * model.hidden * 2
+        non_embed = P - embed
+        non_embed = int(non_embed * (n_layers / strategy.pp) / n_layers)
+        P = non_embed + embed // strategy.pp
+    if strategy.zero_stage >= 3:
+        P //= strategy.dp
+
+    gpu = system.gpu
+    peak_flops = gpu.flops_bf16 * 1e12
+    if peak_flops <= 0:
+        return 0.0
+
+    if strategy.optimizer.value == "muon":
+        K = resolve_muon_ns_steps(strategy.muon_config, model)
+        f_muon = (
+            strategy.muon_config.muon_param_fraction
+            if strategy.muon_config and strategy.muon_config.muon_param_fraction is not None
+            else 0.85
+        )
+        flops = muon_optimizer_step_flops(P, K, model.hidden, f_muon)
+        eff = achieved_flops_efficiency(gpu.name, Dtype.BF16, flops)
+        return flops / (peak_flops * eff) if eff > 0 else 0.0
+    else:
+        flops = adam_step_flops(P)
+        eff = achieved_flops_efficiency(gpu.name, Dtype.BF16, flops)
+        return flops / (peak_flops * eff) if eff > 0 else 0.0
+
+
+def _compute_optimizer_comm_time(model: ModelSpec, system: SystemSpec, strategy: Strategy) -> float:
+    """Compute optimizer communication time (Muon ZeRO-1 AllGather + ReduceScatter)."""
+    comm_times = optimizer_comm_time(model, system, strategy)
+    return comm_times.get("muon_ag", 0.0) + comm_times.get("muon_rs", 0.0)
 
 
 def util_from_flops(flops: float, peak_flops_total: float, step_time_s: float) -> float:

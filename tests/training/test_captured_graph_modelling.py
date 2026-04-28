@@ -752,6 +752,12 @@ def test_pp_heterogeneous_1f1b_formula():
 
     expected_step_us = (pp - 1) * t_fwd_max + M * t_stage_max + (pp - 1) * t_bwd_max
 
+    # Add optimizer step time to expected (per §5.5.2 of muon_optimizer_design.md)
+    opt_step_time_us = result.metadata.get("optimizer_step_time_us", 0)
+    expected_step_us += opt_step_time_us
+    homogeneous_step_us += opt_step_time_us
+
+    # Verify the implementation uses the heterogeneous formula
     # Verify the implementation uses the bottleneck stage formula
     actual_step_us = pm.step_time_ms * 1000.0
     assert abs(actual_step_us - expected_step_us) / expected_step_us < 0.05, (

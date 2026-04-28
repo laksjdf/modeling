@@ -95,7 +95,79 @@ def total_comm_time(
         tier = tier_for_group("DP", group_size, system)
         result[dp_c.name] = collective_time(dp_c, group_size, tier)
 
+    # Muon optimizer ZeRO-1 AllGather/ReduceScatter
+    if strategy.optimizer.value == "muon" and strategy.dp > 1 and strategy.zero_stage >= 1:
+        muon_comm = optimizer_comm_time(model, system, strategy)
+        result["muon_ag"] = muon_comm.get("muon_ag", 0.0)
+        result["muon_rs"] = muon_comm.get("muon_rs", 0.0)
+
     return result
+
+
+def optimizer_comm_time(
+    model: ModelSpec, system: SystemSpec, strategy: Strategy,
+) -> dict[str, float]:
+    """Return Muon optimizer communication time in seconds.
+
+    Muon with ZeRO-1 requires:
+      - AllGather before optimizer step to gather full Muon parameters
+      - ReduceScatter after optimizer step to distribute updated gradients
+
+    Communication volume per step:
+      - AG: (DP-1)/DP × P_muon × 4B
+      - RS: (DP-1)/DP × P_muon × 4B (same volume)
+
+    Args:
+        model: ModelSpec with hidden dimension and param count
+        system: SystemSpec with network tiers
+        strategy: Strategy with optimizer config and muon_config
+
+    Returns:
+        Dict with "muon_ag" and "muon_rs" time in seconds
+    """
+    if strategy.optimizer.value != "muon" or strategy.dp <= 1 or strategy.zero_stage < 1:
+        return {"muon_ag": 0.0, "muon_rs": 0.0}
+
+    muon_config = strategy.muon_config
+    f_muon = (
+        muon_config.muon_param_fraction
+        if muon_config and muon_config.muon_param_fraction is not None
+        else 0.85
+    )
+
+    P = _params_on_rank_for_dp(model, strategy)
+    P_muon = int(P * f_muon)
+    param_bytes = 4  # FP32 master copy
+
+    # Total bytes to gather = P_muon × 4B
+    # Ring algorithm factor applied in collective_time(), not pre-scaled here
+    comm_bytes = int(P_muon * param_bytes)
+
+    group_size = strategy.dp
+    tier = tier_for_group("DP", group_size, system)
+
+    ag_c = Collective(
+        name="muon_ag", kind="AG", group="DP", bytes_=comm_bytes,
+        inserted_after="backward_end",
+    )
+    ag_time = collective_time(ag_c, group_size, tier)
+
+    # ReduceScatter only if rotation=True (Moonshot optimization)
+    # When rotation=False, each rank independently computes and slices, no RS needed
+    rotation = muon_config.rotation if muon_config else True
+    if rotation:
+        rs_c = Collective(
+            name="muon_rs", kind="RS", group="DP", bytes_=comm_bytes,
+            inserted_after="optimizer_step",
+        )
+        rs_time = collective_time(rs_c, group_size, tier)
+    else:
+        rs_time = 0.0
+
+    return {
+        "muon_ag": ag_time,
+        "muon_rs": rs_time,
+    }
 
 
 def _group_size_for(group: str, strategy: Strategy) -> int:

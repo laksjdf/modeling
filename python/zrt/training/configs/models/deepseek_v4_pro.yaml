@@ -1,0 +1,27 @@
+# DeepSeek-V4-Pro model specification (Muon optimizer reference)
+# Reference: DSV4 technical report §3.5.1, §2.4
+
+name: deepseek-v4-pro
+model_type: deepseek_v4
+muon_ns_steps: 10        # DSV4 official report §2.4 uses 10 NS iterations
+hidden: 7168
+ffn: 18432
+num_heads: 128
+num_kv_heads: 128
+head_dim: 128
+vocab: 129280
+seq_len: 4096
+layers: "[dense]*3+[moe]*57+[mtp]*1"
+num_experts: 256
+moe_ffn: 2048
+top_k: 8
+n_group: 8
+top_k_group: 4
+n_shared_experts: 1
+capacity_factor: 1.0
+expert_imbalance: 0.10
+mtp_depth: 1
+param_dtype: bf16
+grad_dtype: fp32
+master_dtype: fp32
+act_dtype: bf16

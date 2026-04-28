@@ -9,7 +9,7 @@ import yaml
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import LayerKind, ModelSpec
 from zrt.training.spec.strategy import (
-    CPKind, OffloadPolicy, OptKind, PPSched, RecomputePolicy, Strategy,
+    CPKind, MuonConfig, OffloadPolicy, OptKind, PPSched, RecomputePolicy, Strategy,
     TPOverlap,
 )
 from zrt.training.spec.system import GPU, NetTier, SystemSpec
@@ -111,6 +111,8 @@ def _parse_model(d: dict) -> ModelSpec:
         grad_dtype=_parse_dtype(d.get("grad_dtype", "fp32")),
         master_dtype=_parse_dtype(d.get("master_dtype", "fp32")),
         act_dtype=_parse_dtype(d.get("act_dtype", "bf16")),
+        model_type=d.get("model_type", "default"),
+        muon_ns_steps=d.get("muon_ns_steps"),
     )
 
 
@@ -168,6 +170,16 @@ def _parse_strategy(d: dict) -> Strategy:
             pct=ol.get("pct", 1.0),
         )
 
+    muon_config = None
+    if "muon_config" in d:
+        mc = d["muon_config"]
+        muon_config = MuonConfig(
+            ns_steps=mc.get("ns_steps", 5),
+            rotation=mc.get("rotation", True),
+            adam_param_types=set(mc.get("adam_param_types", ["embed", "lm_head", "router", "bias"])),
+            muon_param_fraction=mc.get("muon_param_fraction", 0.85),
+        )
+
     return Strategy(
         tp=d.get("tp", 1),
         cp=d.get("cp", 1),
@@ -188,6 +200,7 @@ def _parse_strategy(d: dict) -> Strategy:
         dualbatch=d.get("dualbatch", False),
         dp_overlap_in_bubble=d.get("dp_overlap_in_bubble", True),
         optimizer=OptKind(d.get("optimizer", "adam")),
+        muon_config=muon_config,
     )
 
 

@@ -34,6 +34,8 @@ def test_train_hw_cli_delegates_to_graph_native_modeller(monkeypatch, capsys):
         cp=5,
         zero_stage=2,
         optimizer="adamw",
+        muon_rotation=True,
+        muon_ns_steps=None,
         micro_batch=1,
         global_batch=16,
         total_params=123e9,

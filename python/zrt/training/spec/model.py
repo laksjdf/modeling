@@ -53,6 +53,10 @@ class ModelSpec:
     master_dtype: Dtype = Dtype.FP32
     act_dtype: Dtype = Dtype.BF16
 
+    # Muon optimizer specific fields (optional, from model YAML)
+    muon_ns_steps: int | None = None
+    model_type: str = "default"
+
     def __post_init__(self) -> None:
         self.attn_compression_ratio = float(self.attn_compression_ratio)
         if not (0.0 < self.attn_compression_ratio <= 1.0):

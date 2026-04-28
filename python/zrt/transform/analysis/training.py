@@ -628,7 +628,61 @@ class TrainingPipelinePass(GraphPass):
         )
 
         g.metadata["pipeline_metrics"] = metrics
+
+        # Add optimizer step time (per §5.5.2 of design doc)
+        opt_step_time_us = self._compute_optimizer_step_time(g, hw, ctx)
+        if opt_step_time_us > 0:
+            g.metadata["optimizer_step_time_us"] = opt_step_time_us
+            step_time_us += opt_step_time_us
+            metrics.step_time_ms = step_time_us / 1000.0
+
         return g
+
+    @staticmethod
+    def _compute_optimizer_step_time(
+        g: "OpGraph", hw: "HardwareSpec", ctx: "TransformContext",
+    ) -> float:
+        """Compute optimizer step time in microseconds.
+
+        Includes:
+        1. Optimizer compute FLOPs (Adam: memory-bound; Muon: compute-bound)
+        2. Muon AllGather/ReduceScatter communication (Muon + ZeRO + DP>1)
+        """
+        opt_node = g.nodes.get("optimizer_step")
+        if opt_node is None:
+            return 0.0
+
+        optimizer = opt_node.attrs.get("optimizer", "adam")
+        step_flops = float(opt_node.attrs.get("step_flops", 0))
+
+        from python.zrt.ir.types import DType
+        if optimizer == "muon":
+            # Muon NS is compute-bound (large GEMMs)
+            peak_flops = hw.peak_flops(DType.BF16)
+            compute_time_us = (step_flops / peak_flops) * 1e6 if peak_flops > 0 else 0.0
+        else:
+            # Adam is memory-bound (element-wise ops)
+            opt_state_bytes = float(opt_node.attrs.get("state_bytes", 0))
+            hbm_bw = hw.memory.hbm_bandwidth_gbps * 1e9 / 8
+            compute_time_us = (opt_state_bytes / hbm_bw) * 1e6 if hbm_bw > 0 else 0.0
+
+        # Muon additional communication (AllGather momentum)
+        comm_time_us = 0.0
+        if optimizer == "muon":
+            ag_bytes = float(opt_node.attrs.get("muon_ag_bytes", 0))
+            ns_rotation = opt_node.attrs.get("ns_rotation", True)
+            if ag_bytes > 0:
+                dp_bw = hw.interconnect.inter_node.bandwidth_gbps * 1e9 / 8
+                dp = ctx.parallel.dp if ctx.parallel else 1
+                # Ring factor: AG always, RS only when rotation=True
+                # AG: (dp-1)/dp factor; RS: same factor when rotation=True
+                if ns_rotation:
+                    ring_factor = 2.0 * (dp - 1) / dp  # AG + RS
+                else:
+                    ring_factor = 1.0 * (dp - 1) / dp  # AG only (Moonshot optimization)
+                comm_time_us = (ring_factor * ag_bytes / dp_bw) * 1e6 if dp_bw > 0 else 0.0
+
+        return compute_time_us + comm_time_us
 
     @staticmethod
     def _estimate_stage_dw_us(

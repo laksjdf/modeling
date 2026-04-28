@@ -1,0 +1,27 @@
+# DeepSeek-V4-Pro + Muon + ZeRO-1 reference baseline
+# Per §8.3 of muon_optimizer_design.md
+
+name: deepseek_v4_pro_muon_h100
+description: "DeepSeek-V4-Pro Muon optimizer baseline, H100 SXM, TP8 DP8 PP1 ZeRO-1"
+model: deepseek_v4_pro
+system:
+  hw: nvidia_h100_sxm
+  nodes: 8
+  gpus_per_node: 8
+  host_mem_gb: 512
+config:
+  tp: 8
+  pp: 1
+  ep: 1
+  dp: 8
+  zero_stage: 1
+  micro_batch: 1
+  global_batch: 1024
+  optimizer: muon
+  muon_config:
+    ns_steps: 10
+    rotation: true
+    muon_param_fraction: 0.85
+targets:
+  mfu: 0.40
+  tolerance: 0.20

@@ -68,6 +68,9 @@ class TrainingConfig:
     # Optimizer settings
     optimizer: str = "adam"  # "adam", "adamw", "muon"
     zero_stage: int = 1  # 0=none, 1=opt_state, 2=grads+opt, 3=weights+grads+opt
+    muon_ns_steps: int | None = None  # Newton-Schulz iterations for Muon
+    muon_param_fraction: float | None = None  # Fraction of params using Muon
+    muon_rotation: bool = True  # Moonshot rotation optimization for Muon
 
     # Batch size
     micro_batch: int = 1
@@ -89,6 +92,21 @@ class TrainingConfig:
 
     # Overlap DP allreduce with PP bubble window
     dp_overlap_in_bubble: bool = True
+
+    def effective_ns_steps(self, model_type: str | None = None) -> int:
+        """Return effective NS steps, handling None fallback logic.
+
+        Priority:
+          1. self.muon_ns_steps (explicit config)
+          2. _MUON_NS_STEPS_DEFAULTS[model_type] (model type lookup)
+          3. Default 5
+        """
+        if self.muon_ns_steps is not None:
+            return self.muon_ns_steps
+        from zrt.training.spec.strategy import _MUON_NS_STEPS_DEFAULTS
+        if model_type is not None:
+            return _MUON_NS_STEPS_DEFAULTS.get(model_type, 5)
+        return 5
 
     @property
     def num_microbatches(self) -> int:

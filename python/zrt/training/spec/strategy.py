@@ -46,6 +46,40 @@ class OptKind(Enum):
     MUON = "muon"
 
 
+_MUON_NS_STEPS_DEFAULTS: dict[str, int] = {
+    "deepseek_v4": 10,
+    "deepseek_v3": 5,
+    "default": 5,
+}
+
+
+@dataclass
+class MuonConfig:
+    ns_steps: int = 5
+    ns_variant: str = "zolo_pd"
+    rotation: bool = True
+    adam_param_types: set[str] = field(
+        default_factory=lambda: {"embed", "lm_head", "router", "bias"}
+    )
+    muon_param_fraction: float = 0.85
+
+
+def resolve_muon_ns_steps(
+    muon_config: MuonConfig | None,
+    model: "ModelSpec",
+) -> int:
+    if muon_config is None:
+        muon_config = MuonConfig()
+    if muon_config.ns_steps != MuonConfig.__dataclass_fields__["ns_steps"].default:
+        return muon_config.ns_steps
+    if hasattr(model, "muon_ns_steps") and model.muon_ns_steps is not None:
+        return model.muon_ns_steps
+    model_type = getattr(model, "model_type", None)
+    if model_type in _MUON_NS_STEPS_DEFAULTS:
+        return _MUON_NS_STEPS_DEFAULTS[model_type]
+    return _MUON_NS_STEPS_DEFAULTS["default"]
+
+
 @dataclass
 class RecomputePolicy:
     # per-LayerKind value -> set of op categories to recompute
@@ -95,6 +129,7 @@ class Strategy:
 
     # optimizer
     optimizer: OptKind = OptKind.ADAM
+    muon_config: MuonConfig | None = None
 
     def num_microbatches(self) -> int:
         """Number of microbatches per training step."""

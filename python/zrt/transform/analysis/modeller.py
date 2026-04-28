@@ -36,6 +36,9 @@ def estimate_training_from_graphs(
     tp: int = 1, pp: int = 1, ep: int = 1, dp: int = 1, cp: int = 1,
     zero_stage: int = 1,
     optimizer: str = "adam",
+    muon_rotation: bool = True,
+    muon_ns_steps: int | None = None,
+    model_type: str | None = None,
     micro_batch: int = 1,
     global_batch: int = 32,
     pp_schedule: str = "1f1b",
@@ -68,6 +71,8 @@ def estimate_training_from_graphs(
     }
     if total_params is not None:
         metadata["total_params"] = int(total_params)
+    if model_type is not None:
+        metadata["model_type"] = model_type
 
     for key, val in metadata.items():
         if key not in forward_graph.metadata:
@@ -84,6 +89,8 @@ def estimate_training_from_graphs(
         training=TrainingConfig(
             optimizer=optimizer,
             zero_stage=zero_stage,
+            muon_rotation=muon_rotation,
+            muon_ns_steps=muon_ns_steps,
             micro_batch=micro_batch,
             global_batch=global_batch,
             pp_schedule=pp_schedule,

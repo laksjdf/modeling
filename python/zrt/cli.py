@@ -151,6 +151,14 @@ def main() -> None:
         help="Optimizer for training estimation (default: adam).",
     )
     parser.add_argument(
+        "--muon-rotation", action="store_true", default=True,
+        help="Enable Moonshot rotation optimization for Muon (default: True).",
+    )
+    parser.add_argument(
+        "--muon-ns-steps", type=int, default=None,
+        help="Newton-Schulz iteration steps for Muon (default: 5, DSV4: 10).",
+    )
+    parser.add_argument(
         "--micro-batch", type=int, default=1,
         help="Micro-batch size per GPU (training, default: 1).",
     )
@@ -366,6 +374,8 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
         cp=getattr(args, "cp", 1),
         zero_stage=args.zero_stage,
         optimizer=args.optimizer,
+        muon_rotation=args.muon_rotation,
+        muon_ns_steps=args.muon_ns_steps,
         micro_batch=args.micro_batch,
         global_batch=args.global_batch,
         return_transformed=True,

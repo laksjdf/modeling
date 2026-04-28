@@ -355,6 +355,16 @@ class TrainingSummary:
     # ── chrome trace (optional) ───────────────────────────────────────────────
     chrome_trace: dict | None = None
 
+    # ── optimizer (optional, per §6.3 of muon_optimizer_design.md) ────────────
+    optimizer_type: str = "adam"              # "adam" or "muon"
+    muon_param_fraction: float = 0.0          # 0.0 for Adam, 0.85 for Muon default
+    opt_state_gb: float = 0.0                 # optimizer state memory in GB
+    opt_state_savings_gb: float = 0.0         # savings vs pure Adam
+    optimizer_step_ms: float = 0.0            # optimizer step time in ms
+    muon_ag_rs_ms: float = 0.0                # Muon AG+RS communication time
+    muon_ns_tflops: float = 0.0               # NS iteration FLOPs in TFLOPs
+    optimizer_time_fraction: float = 0.0     # optimizer_step_ms / total_step_ms
+
     # ── string representation ─────────────────────────────────────────────────
 
     def __str__(self) -> str:

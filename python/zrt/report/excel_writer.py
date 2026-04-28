@@ -43,6 +43,32 @@ class ExcelWriter:
 
         wb.save(output_path)
 
+    def _write_optimizer_sheet(self, wb, summary: "TrainingSummary") -> None:
+        """Write Optimizer sheet (per §6.3 of muon_optimizer_design.md)."""
+        ws = wb.create_sheet("Optimizer")
+        header_font = Font(bold=True, size=11)
+
+        ws.cell(row=1, column=1, value="Metric").font = header_font
+        ws.cell(row=1, column=2, value="Value").font = header_font
+
+        rows = [
+            ("optimizer_type", summary.optimizer_type),
+            ("muon_param_fraction", f"{summary.muon_param_fraction:.2%}"),
+            ("opt_state_gb", round(summary.opt_state_gb, 3)),
+            ("opt_state_savings_gb", round(summary.opt_state_savings_gb, 3)),
+            ("optimizer_step_ms", round(summary.optimizer_step_ms, 3)),
+            ("muon_ag_rs_ms", round(summary.muon_ag_rs_ms, 3)),
+            ("muon_ns_tflops", round(summary.muon_ns_tflops, 3)),
+            ("optimizer_time_fraction", f"{summary.optimizer_time_fraction:.2%}"),
+        ]
+
+        for row_idx, (metric, value) in enumerate(rows, 2):
+            ws.cell(row=row_idx, column=1, value=metric)
+            ws.cell(row=row_idx, column=2, value=value)
+
+        ws.column_dimensions["A"].width = 25
+        ws.column_dimensions["B"].width = 20
+
     def _write_config_sheet(self, wb, config_summary):
         ws = wb.active
         ws.title = "Model Config"
@@ -299,3 +325,21 @@ def append_perf_summary(xlsx_path: Path, summary: "E2ESummary") -> None:
 
     wb.save(xlsx_path)
     logger.info("Appended '%s' sheet to %s", sheet_name, xlsx_path)
+
+
+def append_optimizer_sheet(xlsx_path: Path, summary: "TrainingSummary") -> None:
+    """Open *xlsx_path* and append Optimizer sheet for *summary*.
+
+    Per §6.3 of muon_optimizer_design.md, includes optimizer_type,
+    muon_param_fraction, opt_state_gb, optimizer_step_ms, etc.
+    """
+    wb = openpyxl.load_workbook(xlsx_path)
+
+    if "Optimizer" in wb.sheetnames:
+        del wb["Optimizer"]
+
+    writer = ExcelWriter.__new__(ExcelWriter)
+    writer._write_optimizer_sheet(wb, summary)
+
+    wb.save(xlsx_path)
+    logger.info("Appended 'Optimizer' sheet to %s", xlsx_path)
