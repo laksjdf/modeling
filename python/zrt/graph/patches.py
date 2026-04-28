@@ -121,20 +121,15 @@ def _make_fake_moe_forward(mod: nn.Module):
         gate = getattr(mod, "gate", None)
         if gate is not None and callable(gate):
             try:
-                gate_out = gate(orig)
+                # Always pass flat [bs*seq, h] — Gate.linear() expects 2-D input.
+                gate_out = gate(flat)
                 if isinstance(gate_out, (tuple, list)):
-                    gate_weight = gate_out[1]
+                    # gate returns (weights, indices) — use weights (index 0)
+                    gate_weight = gate_out[0]
                 else:
                     gate_weight = torch.softmax(gate_out.float(), dim=-1)[:, :1]
-            except Exception:
-                try:
-                    gate_out = gate(flat)
-                    if isinstance(gate_out, (tuple, list)):
-                        gate_weight = gate_out[1]
-                    else:
-                        gate_weight = torch.softmax(gate_out.float(), dim=-1)[:, :1]
-                except Exception as exc:
-                    logger.debug("Gate forward failed (%s).", exc)
+            except Exception as exc:
+                logger.debug("Gate forward failed (%s).", exc)
 
         first_expert = next((e for e in mod.experts if e is not None), None)
         if first_expert is None:
@@ -409,11 +404,17 @@ def _diff_gemm(
     Signature matches the kernel stub: ``fp8_gemm(x, sx, w, sw, scale_dtype)``.
     The scale tensors ``sx`` / ``sw`` are ignored — they exist only to satisfy
     the caller's argument list.
+
+    ``w`` is expected in ``[out_features, in_features]`` layout (matching
+    ``nn.Linear.weight`` and ``F.linear`` convention), so the forward is
+    ``x @ w.T``.
     """
-    # x: [*, in_features]  w: [out_features, in_features]  →  [*, out_features]
+    # x: [*, in_features]  w: [out_features, in_features]
+    # F.linear(x, w) = x @ w.T = [*, out_features]
     # Flatten x to 2-D for mm, then restore batch dims.
     orig_shape = x.shape
     x_2d = x.reshape(-1, x.shape[-1])
+    # w is [out, in] → transpose to [in, out] for mm
     out_2d = torch.mm(x_2d, w.t())
     return out_2d.reshape(*orig_shape[:-1], w.shape[0]).to(torch.bfloat16)
 
