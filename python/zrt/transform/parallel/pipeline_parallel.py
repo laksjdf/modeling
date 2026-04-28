@@ -5,10 +5,14 @@ Inserts ``comm.send_recv`` nodes at stage boundaries to model activation
 transfer latency between adjacent pipeline stages.
 
 Layer partitioning strategies:
-  - VPP (vpp_chunks > 1, pp_schedule="interleaved"): interleaved assignment
+  - VPP/Interleaved (vpp_chunks > 1, pp_schedule="interleaved"): interleaved assignment
     Each device holds vpp_chunks virtual stages, layers distributed round-robin.
     Example: pp=2, vpp_chunks=2, 8 layers → Device0=[L0,L1,L4,L5], Device1=[L2,L3,L6,L7]
+  - DualPipeV (vpp_chunks > 1, pp_schedule="dualpipev"): interleaved assignment (same as VPP)
+    Combines VPP layer distribution with DualPipe F/B parallel scheduling.
   - Standard 1F1B (vpp_chunks=1): greedy bin-packing by compute load.
+  - DualPipe (pp_schedule="dualpipe"): greedy bin-packing (same as 1F1B)
+    Layer assignment identical to 1F1B; F/B parallel scheduling reduces bubble.
   - Explicit: user-provided pp_layer_assignment overrides automatic assignment.
 """
 from __future__ import annotations
@@ -74,7 +78,7 @@ class PipelineParallelPass(GraphPass):
 
         vpp_chunks = max(1, getattr(ctx.training, "vpp_chunks", 1) if ctx.training else 1)
         pp_schedule = getattr(ctx.training, "pp_schedule", "1f1b") if ctx.training else "1f1b"
-        is_vpp = vpp_chunks > 1 and pp_schedule in ("interleaved", "i1f1b")
+        is_vpp = vpp_chunks > 1 and pp_schedule in ("interleaved", "i1f1b", "dualpipev")
 
         # 1. Build layer_id → {node_ids} and per-layer compute load
         layer_nodes: Dict[int, Set[str]] = {}
