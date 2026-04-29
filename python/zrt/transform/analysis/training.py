@@ -148,12 +148,13 @@ class TrainingMemoryPass(GraphPass):
       - 2: Gradients + optimizer state sharded across DP
       - 3: Weights + gradients + optimizer state sharded across DP
 
-    Activation memory uses the Korthikanti formula (34 * h * s * L * bs)
-    with recompute-policy multiplier, CP sharding, and PP inflight depth.
+    Activation memory uses graph-native tensor liveness on stitched graphs
+    or the Korthikanti formula (34 * h * s * L * bs) as fallback, with
+    recompute-policy multiplier, CP sharding, and PP inflight depth.
 
-    When ``g.metadata["zero"]`` is present (written by ZeroFSDPPass),
-    weight/grad/opt-state sharding factors are read from it; otherwise
-    self-derived from ZeRO stage + DP/TP.
+    Sharding factors are read from ``g.metadata["zero"]`` (written by
+    ZeroFSDPPass which always runs first).  Every bucket is also divided
+    by TP because TP splits weight matrices across ranks.
 
     Adds to graph.metadata:
       "memory_breakdown": TrainingMemoryBreakdown
@@ -172,22 +173,22 @@ class TrainingMemoryPass(GraphPass):
         tp = ctx.parallel.tp if ctx.parallel else 1
         cp = getattr(ctx.parallel, "cp", 1) if ctx.parallel else 1
         pp = ctx.parallel.pp if ctx.parallel else 1
-        zero_stage = ctx.training.zero_stage if ctx.training else 0
 
         # ── Weight / grad / opt-state sharding ──────────────────────────────
+        # All three buckets shrink by tp (TP splits weight matrices).
+        # DP sharding is read from metadata (set by ZeroFSDPPass) or derived
+        # from zero_stage for standalone calls.
         zero_meta = g.metadata.get("zero")
-        if zero_meta:
+        if zero_meta is not None:
             weight_shard = zero_meta["weight_shard"] * tp
             grad_shard = zero_meta["grad_shard"] * tp
-            opt_shard = zero_meta["optstate_shard"]
+            opt_shard = zero_meta["optstate_shard"] * tp
         else:
-            weight_shard = tp
-            if zero_stage >= 3:
-                weight_shard *= dp
-            grad_shard = weight_shard
-            if zero_stage >= 2 and zero_stage < 3:
-                grad_shard = dp
-            opt_shard = dp if zero_stage >= 1 else 1
+            zero_stage = ctx.training.zero_stage if ctx.training else 0
+            dp_factor = dp if zero_stage >= 1 else 1
+            weight_shard = tp * (dp if zero_stage >= 3 else 1)
+            grad_shard = tp * (dp if zero_stage >= 2 else 1)
+            opt_shard = tp * dp_factor
 
         weights_bytes = (total_params * param_dtype) / weight_shard
         grads_bytes = (total_params * param_dtype) / grad_shard
