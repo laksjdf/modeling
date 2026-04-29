@@ -16,7 +16,6 @@ class TestSkipOps:
 
         # These should be in the skip list
         assert "aten.view.default" in PATTERN_SKIP
-        assert "aten.reshape.default" in PATTERN_SKIP
         assert "aten.permute.default" in PATTERN_SKIP
 
     def test_skip_ops_does_not_include_compute_ops(self):

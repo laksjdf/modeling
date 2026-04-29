@@ -43,7 +43,6 @@ import torch
 from python.zrt.graph.dispatch import RecordingDispatch, TensorTracker
 from python.zrt.report.excel_writer import ExcelWriter
 from python.zrt.graph.graph_builder import build_op_graph, build_fused_op_graph
-from python.zrt.report.onnx_exporter import export_all
 from python.zrt.graph.model_loader import load_model
 from python.zrt.graph.tracker import ModuleTracker, NullModuleTracker
 from python.zrt.ir.adapter import (
@@ -723,6 +722,7 @@ def _save_phase_outputs(
     raw_nx = build_op_graph(records)
     fused_nx = build_fused_op_graph(fused_with_children, records)
 
+    from python.zrt.report.onnx_exporter import export_all
     graph_paths = export_all(
         raw_graph=raw_nx,
         fused_graph=fused_nx,

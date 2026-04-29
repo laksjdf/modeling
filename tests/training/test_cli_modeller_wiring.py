@@ -15,7 +15,8 @@ def test_train_hw_cli_delegates_to_graph_native_modeller(monkeypatch, capsys):
 
     def fake_estimate_training_from_graphs(**kwargs):
         calls.append(kwargs)
-        return _Report()
+        # cli.py unpacks (report, ctx, transformed); return matching 3-tuple
+        return _Report(), None, {}
 
     monkeypatch.setattr(
         "python.zrt.transform.analysis.estimate_training_from_graphs",
@@ -41,6 +42,7 @@ def test_train_hw_cli_delegates_to_graph_native_modeller(monkeypatch, capsys):
         total_params=123e9,
         hidden=4096,
         num_layers_full=32,
+        quant=None,
     )
     fwd_graph = object()
     bwd_graph = object()
@@ -48,7 +50,8 @@ def test_train_hw_cli_delegates_to_graph_native_modeller(monkeypatch, capsys):
         graphs={
             "train_forward": (fwd_graph, None),
             "train_backward": (bwd_graph, None),
-        }
+        },
+        output_dir=None,
     )
     hw = object()
 
