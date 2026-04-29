@@ -2,16 +2,11 @@
 
 Usage::
 
-    python -m python.zrt <model_id> [options]
-    python -m python.zrt.graph.main <model_id> [options]  # backward compat
-    python -m python.zrt --estimate-config <yaml>         # spec-based estimation
-
-Examples::
-
-    python -m python.zrt Qwen/Qwen2.5-7B-Instruct --layers 4
-    python -m python.zrt deepseek-ai/DeepSeek-V3-0324 --layers 4 --hw nvidia_h100_sxm --tp 8
-    python -m python.zrt hf_models/llama3_8b --train --layers 2
+    python -m python.zrt --model-id Qwen/Qwen2.5-7B-Instruct --layers 4
+    python -m python.zrt --model-id deepseek-ai/DeepSeek-V3-0324 --layers 4 --hw nvidia_h100_sxm --tp 8
+    python -m python.zrt --model-id hf_models/llama3_8b --train --layers 2
     python -m python.zrt --estimate-config python/zrt/training/configs/llama3_70b_3d.yaml
+    python -m python.zrt --search-config python/zrt/training/configs/llama3_70b_3d.yaml
 """
 from __future__ import annotations
 
@@ -48,13 +43,16 @@ def _run_trace_phases(**kwargs):
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Trace LLM operator sequences and write Excel + computation graph.")
-    parser.add_argument(
+
+    # ── Mode flags (mutually exclusive) ──────────────────────────────────────
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
         "--estimate-config",
         metavar="YAML",
         help="Run spec-based training estimation from a YAML config (no graph capture). "
              "Example: --estimate-config python/zrt/training/configs/llama3_70b_3d.yaml",
     )
-    parser.add_argument(
+    mode_group.add_argument(
         "--search-config",
         metavar="YAML",
         help="Grid-search parallel strategies for a training config. "
@@ -65,35 +63,60 @@ def main() -> None:
         metavar="FILE",
         help="Write estimation/search result as JSON to FILE (used with --estimate-config or --search-config).",
     )
+
+    # ── Model ─────────────────────────────────────────────────────────────────
     parser.add_argument(
-        "model_id", nargs="?",
-        help="HF Hub model ID or local directory (e.g. deepseek-ai/DeepSeek-V3-0324)")
+        "--model-id",
+        metavar="MODEL",
+        default=None,
+        help="HF Hub model ID or local directory (e.g. deepseek-ai/DeepSeek-V3-0324). "
+             "Required for graph capture modes.",
+    )
     parser.add_argument(
-        "--model", choices=_get_model_dirs().keys(),
-        help="Shorthand for local DeepSeek model: v3 or v3.2 (backward compat)")
+        "--model",
+        choices=_get_model_dirs().keys(),
+        default=None,
+        help="Shorthand for local DeepSeek model: v3 or v3.2 (maps to hf_models/).",
+    )
+
+    # ── Input & layers ────────────────────────────────────────────────────────
     parser.add_argument("--layers", type=int, default=4,
                         help="Number of transformer layers to trace (default: 4)")
     parser.add_argument("--batch-size", type=int, default=1,
                         help="Dummy input batch size (default: 1)")
     parser.add_argument("--seq-len", type=int, default=128,
                         help="Prefill sequence length (default: 128)")
-    parser.add_argument("--output-dir", "-o",
-                        help="Output directory (default: output/graph/<model_slug>)")
+
+    _layer_group = parser.add_mutually_exclusive_group()
+    _layer_group.add_argument(
+        "--target-layers",
+        metavar="IDX",
+        help="Comma-separated layer indices to trace, e.g. '0,3'.",
+    )
+    _layer_group.add_argument(
+        "--auto-layers",
+        action="store_true",
+        default=False,
+        help="Automatically select the first dense and first sparse (MoE) layer.",
+    )
+
+    # ── Phases ────────────────────────────────────────────────────────────────
     parser.add_argument(
-        "--phases", nargs="+", default=["prefill", "decode"],
+        "--phases", nargs="+", default=None,
         choices=["prefill", "decode", "forward",
                  "train_forward", "train_backward", "train"],
         metavar="PHASE",
         help="Phases to trace (default: prefill decode). "
              "Inference: prefill, decode. Training: train_forward, train_backward. "
-             "'forward'/'train' are aliases for 'prefill'/'train_forward'.")
-    parser.add_argument(
-        "--phase", default=None,
-        help="(legacy) Trace a single phase. Overrides --phases when set.")
+             "'forward'/'train' are aliases for 'prefill'/'train_forward'.",
+    )
     parser.add_argument(
         "--train", action="store_true", default=False,
         help="Trace training phases (train_forward + train_backward). "
-             "Equivalent to --phases train_forward train_backward.")
+             "Equivalent to --phases train_forward train_backward.",
+    )
+
+    # ── Capture mode ──────────────────────────────────────────────────────────
     parser.add_argument(
         "--platform",
         default="generic",
@@ -107,40 +130,53 @@ def main() -> None:
         help="Use torch.compile graph capture instead of TorchDispatchMode eager tracing.",
     )
     parser.add_argument(
-        "--hw",
-        metavar="HW",
-        default=None,
-        help="Hardware spec name for performance report (e.g. nvidia_h100_sxm). "
-             f"Available: {', '.join(__import__('python.zrt.hardware.registry', fromlist=['list_available']).list_available())}",
-    )
-    parser.add_argument(
-        "--tp", type=int, default=1,
-        help="Tensor-parallel degree used when --hw is set (default: 1).",
-    )
-    parser.add_argument(
         "--gradient-checkpointing",
         action="store_true",
         default=False,
         help="Enable activation checkpointing during training phases.",
     )
 
-    # --- Training modelling flags (used with --train --hw) ---
+    # ── Output ────────────────────────────────────────────────────────────────
+    parser.add_argument("--output-dir", "-o",
+                        help="Output directory (default: output/<model_slug>)")
+
+    # ── Parallel strategy (applies to both inference transforms and training modelling) ──
+    parser.add_argument(
+        "--tp", type=int, default=1,
+        help="Tensor-parallel degree (default: 1).",
+    )
     parser.add_argument(
         "--pp", type=int, default=1,
-        help="Pipeline-parallel degree (training, default: 1).",
+        help="Pipeline-parallel degree (default: 1).",
     )
     parser.add_argument(
         "--ep", type=int, default=1,
-        help="Expert-parallel degree (training, default: 1).",
-    )
-    parser.add_argument(
-        "--cp", type=int, default=1,
-        help="Context-parallel degree (training, default: 1).",
+        help="Expert-parallel degree (default: 1).",
     )
     parser.add_argument(
         "--dp", type=int, default=1,
-        help="Data-parallel degree (training, default: 1).",
+        help="Data-parallel degree (default: 1).",
     )
+    parser.add_argument(
+        "--cp", type=int, default=1,
+        help="Context-parallel degree (default: 1).",
+    )
+    parser.add_argument(
+        "--quant", default=None,
+        metavar="DTYPE",
+        help="Weight quantization dtype for analysis: int4, int8, fp8 (default: no quantization)",
+    )
+
+    # ── Hardware (triggers perf report / modelling) ───────────────────────────
+    parser.add_argument(
+        "--hw",
+        metavar="HW",
+        default=None,
+        help="Hardware spec name for performance report (e.g. nvidia_h100_sxm). "
+             f"Available: {', '.join(__import__('python.zrt.hardware.registry', fromlist=['list_available']).list_available())}",
+    )
+
+    # ── Training modelling extras (used with --train --hw or --estimate-config) ──
     parser.add_argument(
         "--zero-stage", type=int, default=1,
         help="ZeRO optimization stage 0-3 (training, default: 1).",
@@ -171,11 +207,6 @@ def main() -> None:
         help="Full model param count, e.g. 671e9 (for scaling traced layers).",
     )
     parser.add_argument(
-        "--quant", default=None,
-        metavar="DTYPE",
-        help="Weight quantization dtype for analysis: int4, int8, fp8 (default: no quantization)",
-    )
-    parser.add_argument(
         "--hidden", type=int, default=7168,
         help="Hidden dimension for memory estimation (default: 7168).",
     )
@@ -184,25 +215,12 @@ def main() -> None:
         help="Total layers in full model (defaults to --layers if not set).",
     )
 
-    _layer_group = parser.add_mutually_exclusive_group()
-    _layer_group.add_argument(
-        "--target-layers",
-        metavar="IDX",
-        help="Comma-separated layer indices to trace, e.g. '0,3'.",
-    )
-    _layer_group.add_argument(
-        "--auto-layers",
-        action="store_true",
-        default=False,
-        help="Automatically select the first dense and first sparse (MoE) layer.",
-    )
     args = parser.parse_args()
 
-    # Three independent training estimation paths:
-    # 1. Graph-native (--train --hw): Capture aten ops, apply transforms, schedule
-    # 2. Spec-based (--estimate-config): Single-point estimation using analytical ModelSpec
-    # 3. Grid search (--search-config): Multi-point search over parallel strategies
-    #    Spec-based is DEPRECATED for production; prefer graph-native path.
+    # ── Three independent modes ───────────────────────────────────────────────
+    # 1. Spec-based estimation (--estimate-config)
+    # 2. Grid search (--search-config)
+    # 3. Graph capture + modelling (--model-id or --model)
     if args.estimate_config:
         _run_estimate(args.estimate_config, args.output)
         return
@@ -211,7 +229,7 @@ def main() -> None:
         _run_search(args.search_config, args.output)
         return
 
-    # Resolve model_id
+    # ── Resolve model_id ──────────────────────────────────────────────────────
     if args.model_id:
         model_id = args.model_id
     elif args.model:
@@ -219,17 +237,17 @@ def main() -> None:
         model_id = str(
             Path(__file__).parent.parent.parent / "hf_models" / model_dir_name)
     else:
-        parser.error("Provide a model_id argument or --model v3/v3.2")
+        parser.error("Provide --model-id or --model v3/v3.2")
 
     output_dir = Path(args.output_dir) if args.output_dir else None
 
-    # Phase resolution: --train > --phase (legacy) > --phases
+    # ── Phase resolution: --train > --phases > default ────────────────────────
     if args.train:
         phases = ["train_forward", "train_backward"]
-    elif args.phase is not None:
-        phases = [args.phase]
-    else:
+    elif args.phases is not None:
         phases = args.phases
+    else:
+        phases = ["prefill", "decode"]
 
     target_layers: Optional[List[int]] = None
     if args.target_layers:
@@ -282,7 +300,9 @@ def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
     quant = QuantConfig(weight=args.quant, activation=args.quant) if args.quant else None
     ctx = TransformContext(
         hw_spec=hw,
-        parallel=ParallelConfig(tp=args.tp),
+        parallel=ParallelConfig(
+            tp=args.tp, pp=args.pp, ep=args.ep, dp=args.dp, cp=args.cp,
+        ),
         stream_config=StreamConfig(num_compute_streams=1, num_comm_streams=1),
         quant=quant,
     )
@@ -297,6 +317,9 @@ def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
         g = pipe.run(raw_graph, ctx)
         tl = scheduler.schedule(g)
         sim_results = hub.simulate_graph(g, hw)
+
+        parallel_desc = ctx.parallel.describe()
+
         summary = build_summary(
             model=model_id,
             hardware=args.hw,
@@ -307,7 +330,7 @@ def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
             sim_results=sim_results,
             timeline=tl,
             hw_spec=hw,
-            parallel_desc=f"TP{args.tp}",
+            parallel_desc=parallel_desc,
         )
         try:
             print(f"\n{summary}")
@@ -334,7 +357,7 @@ def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
                 tl, report_dir / f"{slug}_{phase}_trace.json",
                 name=f"{model_id} | {phase}",
                 metadata={"model": model_id, "hardware": args.hw,
-                          "phase": phase, "parallel": f"TP{args.tp}"},
+                          "phase": phase, "parallel": parallel_desc},
             )
         except Exception as exc:
             logger.warning("Report export failed: %s", exc)
@@ -371,7 +394,7 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
         pp=args.pp,
         ep=args.ep,
         dp=args.dp,
-        cp=getattr(args, "cp", 1),
+        cp=args.cp,
         zero_stage=args.zero_stage,
         optimizer=args.optimizer,
         muon_rotation=args.muon_rotation,

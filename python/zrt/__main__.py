@@ -1,4 +1,4 @@
-"""Allow running as: python -m python.zrt <model_id> [options]"""
+"""Allow running as: python -m python.zrt --model-id <MODEL> [options]"""
 import sys
 import os
 # Ensure `python/` is on sys.path so that `from zrt.*` imports work

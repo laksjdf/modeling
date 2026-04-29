@@ -30,6 +30,11 @@ Public API::
         seq_len=128,
         phase="prefill",
     )
+
+CLI usage::
+
+    python -m python.zrt --model-id deepseek-ai/DeepSeek-V3-0324 --layers 4
+    python -m python.zrt --model-id hf_models/deepseek_v3 --train --layers 2
 """
 from __future__ import annotations
 
@@ -858,7 +863,7 @@ def run_trace_phases(
 
     slug = _make_model_slug(model_id)
     if output_dir is None:
-        output_dir = Path("output") / "graph" / slug
+        output_dir = Path("output") / slug
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
