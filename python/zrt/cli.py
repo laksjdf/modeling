@@ -313,11 +313,13 @@ def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
 
         # Single call: schedule + simulate + all exports
         try:
+            report_dir = result.output_dir / "reports"
+            report_dir.mkdir(parents=True, exist_ok=True)
             rc, flat = export_reports(
                 model=model_id, hardware=args.hw, phase=phase,
                 batch_size=args.batch_size, seq_len=args.seq_len,
                 graph=g, hw_spec=hw, ctx=ctx,
-                output_dir=result.output_dir, slug=slug,
+                output_dir=report_dir, slug=slug,
                 flat_summary=True,
             )
         except Exception as exc:
@@ -439,7 +441,7 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
                 model=model_id, hardware=args.hw, phase="train",
                 batch_size=args.batch_size, seq_len=args.seq_len,
                 graph=train_graph, hw_spec=hw, ctx=ctx,
-                output_dir=output_dir, slug=slug,
+                output_dir=report_dir, slug=slug,
                 flat_summary=False,
                 profile=cli_profile,
             )

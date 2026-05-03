@@ -36,7 +36,6 @@ tr:hover td { background: #f5f5f5; }
 .heat-cell { padding: 8px 4px; text-align: center; border-radius: 4px; font-size: 11px; color: #fff; font-weight: 600; }
 .meta { font-size: 13px; color: #78909c; margin-bottom: 16px; }
 .meta span { margin-right: 16px; }
-</style>
 """
 
 # ── JS ────────────────────────────────────────────────────────────────────────
@@ -321,6 +320,75 @@ def export_html_report(
 # ─────────────────────────────────────────────────────────────────────────────
 
 _HIER_CSS = """
+/* ── Timeline layout ── */
+.timeline { position: relative; padding-left: 28px; }
+.timeline::before { content: ''; position: absolute; left: 9px; top: 12px; bottom: 12px;
+    width: 2px; background: #dbe4ee; }
+.timeline-item { position: relative; margin-bottom: 18px; }
+.timeline-dot { position: absolute; left: -17px; top: 22px; width: 12px; height: 12px;
+    border-radius: 50%; background: #38bdf8; border: 2px solid white;
+    box-shadow: 0 0 0 2px #bae6fd; }
+
+/* ── Details / Summary tree ── */
+details summary {
+    list-style: none; cursor: pointer; display: flex;
+    align-items: center; justify-content: space-between; gap: 12px; font-weight: 700;
+}
+details summary::-webkit-details-marker { display: none; }
+details summary::before {
+    content: '+'; width: 22px; height: 22px; line-height: 20px;
+    text-align: center; border-radius: 50%; border: 1px solid #cbd5e1;
+    color: #334155; flex: 0 0 22px; background: #fff; font-weight: 700;
+}
+details[open] summary::before { content: '−'; }
+
+.summary-right { margin-left: auto; color: #475569; font-weight: 600; font-size: 13px; }
+.sum-left { display: flex; align-items: center; gap: 8px; }
+
+/* ── Block card ── */
+.block {
+    padding: 10px 12px;
+    background: linear-gradient(180deg, #ffffff 0%, #fcfdff 100%);
+    border: 1px solid #dbe4ee; border-radius: 18px;
+    box-shadow: 0 4px 20px rgba(15,23,42,.05);
+}
+.op-family {
+    padding: 10px 12px; margin-top: 10px;
+    border: 1px solid #dbe4ee; border-radius: 18px;
+    background: #fff; box-shadow: 0 4px 20px rgba(15,23,42,.05);
+}
+
+.block-meta { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 8px 34px; }
+.chip { display: inline-flex; padding: 5px 10px; border-radius: 999px;
+    border: 1px solid #dbe4ee; background: #f8fbff; color: #334155; font-size: 12px; }
+
+/* ── Sub-structure lanes ── */
+.subgraph-wrap { margin: 12px 0 10px 34px; padding: 14px;
+    border: 1px dashed #cbd5e1; border-radius: 16px; background: #fbfdff; }
+.subgraph-lane + .subgraph-lane { margin-top: 16px; }
+.lane-title { font-size: 13px; font-weight: 800; color: #0f172a; margin-bottom: 8px; }
+.subgraph-flow { display: flex; gap: 10px; overflow-x: auto; align-items: stretch; padding-bottom: 4px; }
+.sg-arrow { display: flex; align-items: center; justify-content: center;
+    min-width: 22px; color: #94a3b8; font-size: 20px; }
+
+/* ── Comp-box cards ── */
+.comp-box { min-width: 160px; border-radius: 14px; border: 1px solid #dbe4ee;
+    background: #fff; padding: 10px; box-shadow: 0 2px 10px rgba(15,23,42,.03); }
+.comp-box.norm    { background: #f8fafc; }
+.comp-box.proj    { background: #eff6ff; }
+.comp-box.index   { background: #f5f3ff; }
+.comp-box.attn    { background: #ecfeff; }
+.comp-box.memory  { background: #ecfdf5; }
+.comp-box.comm    { background: #fef2f2; }
+.comp-box.router  { background: #fff7ed; }
+.comp-box.act     { background: #faf5ff; }
+.comp-box.shared  { background: #fdf2f8; }
+.comp-box.resid   { background: #f8fafc; }
+.cb-title { font-weight: 800; font-size: 13px; color: #334155; }
+.cb-ms { font-size: 20px; font-weight: 800; margin-top: 8px; color: #0f172a; }
+.cb-meta { color: #64748b; margin-top: 6px; font-size: 11px; line-height: 1.4; }
+
+/* ── Bound bar ── */
 .bound-row { position: relative; height: 28px; background: #eff4f8; border-radius: 999px;
     overflow: hidden; margin: 4px 0; border: 1px solid #e2e8f0; }
 .bound-row .bound-fill { height: 100%; border-radius: 999px; }
@@ -330,80 +398,30 @@ _HIER_CSS = """
 .bound-label { position: absolute; left: 12px; top: 50%; transform: translateY(-50%);
     font-size: 12px; font-weight: 600; color: #334155; white-space: nowrap; }
 
-/* ── Timeline-dot layout ── */
-.timeline-dots { position: relative; padding-left: 28px; }
-.timeline-dots::before { content: ''; position: absolute; left: 7px; top: 12px; bottom: 12px;
-    width: 2px; background: #cbd5e1; }
-.timeline-dot { position: absolute; left: 1px; width: 14px; height: 14px; border-radius: 50%;
-    background: #3b82f6; border: 2px solid #fff; box-shadow: 0 0 0 2px #3b82f6; z-index: 1; }
-.timeline-item { position: relative; margin-bottom: 4px; }
-.timeline-item:last-child { margin-bottom: 0; }
-
-/* ── Block ── */
-.block-section { margin-bottom: 8px; }
-.block-title { background: #1e293b; color: #fff; padding: 10px 16px; border-radius: 8px 8px 0 0;
-    font-weight: 700; font-size: 15px; display: flex; justify-content: space-between; align-items: center; }
-.block-title .pct { font-weight: 500; opacity: 0.85; font-size: 14px; }
-.block-meta { display: flex; gap: 8px; padding: 8px 16px; background: #f8fafc;
-    border: 1px solid #e2e8f0; border-top: none; flex-wrap: wrap; }
-.chip { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 11px;
-    font-weight: 600; background: #e2e8f0; color: #475569; }
-
-/* ── Sub-structure lanes ── */
-.subgraph-wrap { display: flex; flex-direction: column; gap: 8px; padding: 10px 0;
-    background: #fafafa; border: 1px solid #e2e8f0; border-top: none; }
-.subgraph-lane { padding: 0 12px; }
-.lane-title { font-size: 12px; font-weight: 700; color: #64748b; text-transform: uppercase;
-    letter-spacing: 0.5px; margin-bottom: 6px; padding-left: 4px; }
-.subgraph-flow { display: flex; align-items: center; flex-wrap: wrap; gap: 0; }
-
-/* ── Comp-box cards ── */
-.comp-box { display: inline-flex; flex-direction: column; border-radius: 8px; overflow: hidden;
-    min-width: 110px; text-align: center; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
-.cb-title { padding: 6px 10px 2px; font-size: 12px; font-weight: 700; color: #fff; }
-.cb-ms { padding: 1px 10px; font-size: 15px; font-weight: 800; color: #fff; }
-.cb-meta { padding: 2px 10px 6px; font-size: 10px; color: rgba(255,255,255,0.85); }
-.sg-arrow { font-size: 18px; color: #94a3b8; margin: 0 4px; font-weight: 700; user-select: none; }
-
-/* comp-box color palette */
-.comp-norm    { background: linear-gradient(135deg, #22c55e, #4ade80); }
-.comp-attn    { background: linear-gradient(135deg, #3b82f6, #60a5fa); }
-.comp-proj    { background: linear-gradient(135deg, #f59e0b, #fbbf24); }
-.comp-router  { background: linear-gradient(135deg, #a855f7, #c084fc); }
-.comp-comm    { background: linear-gradient(135deg, #ef4444, #f87171); }
-.comp-shared  { background: linear-gradient(135deg, #06b6d4, #22d3ee); }
-.comp-resid   { background: linear-gradient(135deg, #64748b, #94a3b8); }
-.comp-misc    { background: linear-gradient(135deg, #6366f1, #818cf8); }
-.comp-index   { background: linear-gradient(135deg, #14b8a6, #2dd4bf); }
-.comp-act     { background: linear-gradient(135deg, #8b5cf6, #a78bfa); }
-.comp-memory  { background: linear-gradient(135deg, #0ea5e9, #38bdf8); }
-
-/* ── Op-family rows ── */
-.op-family-row { display: flex; align-items: center; padding: 5px 14px; border-bottom: 1px solid #f1f5f9;
-    font-size: 13px; cursor: pointer; }
-.op-family-row:last-child { border-bottom: none; }
-.op-family-row:hover { background: #f1f5f9; }
-.op-family-row .name { flex: 1; min-width: 200px; font-weight: 500; }
-.op-family-row .stat { width: 85px; text-align: right; color: #64748b; font-size: 12px; }
-.op-family-row .stat.bold { font-weight: 600; color: #334155; }
+/* ── Bound tag ── */
 .bound-tag { display: inline-block; padding: 1px 8px; border-radius: 999px;
     font-size: 10px; font-weight: 700; text-transform: uppercase; margin-left: 8px; }
 .bound-tag.compute { background: #fed7aa; color: #9a3412; }
 .bound-tag.memory  { background: #bbf7d0; color: #166534; }
 .bound-tag.communication { background: #e9d5ff; color: #6b21a8; }
-.op-friendly { font-size: 12px; color: #94a3b8; font-weight: 400; margin-left: 6px; }
 
-/* ── Op-family detail (12-column table) ── */
-.op-family-detail { display: none; padding: 8px 14px 12px 28px; background: #f8fafc;
-    border-top: 1px dashed #e2e8f0; }
-.op-family-detail.open { display: block; }
-.sub-detail-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 4px; }
-.sub-detail-table th { background: #334155; color: #fff; padding: 5px 8px; font-size: 11px;
-    font-weight: 600; white-space: nowrap; }
-.sub-detail-table td { padding: 4px 8px; border-bottom: 1px solid #e2e8f0; white-space: nowrap; }
-.sub-detail-table tr:hover td { background: #f1f5f9; }
+/* ── Compact table (for op-family detail) ── */
+.compact { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px;
+    background: white; border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden; }
+.compact th, .compact td { border-bottom: 1px solid #e5e7eb; padding: 6px 8px;
+    text-align: right; vertical-align: top; }
+.compact th:nth-child(1), .compact td:nth-child(1),
+.compact th:nth-child(2), .compact td:nth-child(2),
+.compact th:nth-child(3), .compact td:nth-child(3),
+.compact th:nth-child(4), .compact td:nth-child(4) { text-align: left; }
+.compact th { position: sticky; top: 0; background: #f8fafc; z-index: 1;
+    color: #334155; font-size: 11px; font-weight: 700; }
+.compact code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    white-space: pre-wrap; word-break: break-word; font-size: 11px; }
 
-.subtitle { color: #666; font-size: 13px; padding: 8px 16px; background: #f5f5f5; }
+.bound-compute { color: #9a3412; font-weight: 700; }
+.bound-memory { color: #047857; font-weight: 700; }
+.bound-communication { color: #3730a3; font-weight: 700; }
 
 .warning-box { background: #FFF8E1; border-left: 4px solid #FFA000; padding: 12px 16px;
     margin: 12px 0; border-radius: 4px; font-size: 13px; }
@@ -412,12 +430,6 @@ _HIER_CSS = """
 
 _HIER_JS = """
 <script>
-function toggleFamily(row) {
-    var detail = row.nextElementSibling;
-    if (detail && detail.classList.contains('op-family-detail')) {
-        detail.classList.toggle('open');
-    }
-}
 function switchViz(panelId, btn) {
     document.querySelectorAll('.viz-panel').forEach(p => p.style.display = 'none');
     document.querySelectorAll('.viz-tab').forEach(b => {b.style.background='#f8fafc';b.style.color='#64748b';b.style.borderColor='#e2e8f0'});
@@ -449,9 +461,9 @@ def _comp_box_css_class(component_type: str) -> str:
         return "shared"
     if "add" in ct or "residual" in ct:
         return "resid"
-    if "rope" in ct or "rotary" in ct:
-        return "misc"
-    if "index" in ct or "dsa" in ct or "csa" in ct:
+    if "rope" in ct or "rotary" in ct or "misc" in ct:
+        return "index"
+    if "dsa" in ct or "csa" in ct or "index" in ct:
         return "index"
     if "silu" in ct or "gelu" in ct or "act" in ct:
         return "act"
@@ -510,7 +522,7 @@ def _render_comp_box_card(ss) -> str:
         hbm_str = "0 B"
 
     return (
-        f'<div class="comp-box comp-{css}">'
+        f'<div class="comp-box {css}">'
         f'<div class="cb-title">{display}</div>'
         f'<div class="cb-ms">{ss.total_ms:.3f} ms</div>'
         f'<div class="cb-meta">FLOPs {flops_str} · HBM {hbm_str}</div>'
@@ -529,28 +541,26 @@ def _fmt_bytes(n: int) -> str:
     return f"{n} B"
 
 
-def _render_op_family_row(fam, block_id: str, si: int, fi: int) -> str:
-    """Render a single op-family row + expandable 12-column detail table."""
-    bound_tag = f'<span class="bound-tag {fam.bound}">{fam.bound}</span>' if fam.bound else ""
+def _render_op_family_details(fam) -> str:
+    """Render a single op-family as a <details>/<summary> expandable block."""
+    bound_cls = f"bound-{fam.bound}" if fam.bound else ""
     display = fam.display_name or fam.op_type.split(".")[-1]
 
-    row = (
-        f'<div class="op-family-row" onclick="toggleFamily(this)">'
-        f'<span class="name">{display}<span class="op-friendly">{fam.shape_desc}</span>{bound_tag}</span>'
-        f'<span class="stat bold">{fam.total_ms:.3f} ms</span>'
-        f'<span class="stat">{fam.pct_of_substructure:.1f}%</span>'
-        f'<span class="stat">×{fam.count}</span>'
-        f'</div>'
+    summary_right = (
+        f'<span class="summary-right">'
+        f'{fam.total_ms:.3f} ms · {fam.pct_of_substructure:.1f}% · '
+        f'<span class="{bound_cls}">{fam.bound}</span>'
+        f'</span>'
     )
 
-    # 12-column detail table
+    # Build the 12-column detail table row
     children_rows = ""
     for ch in fam.children:
         hbm = ch.read_bytes + ch.write_bytes
         children_rows += (
             f"<tr>"
             f"<td>{fam.count}</td>"
-            f"<td><code>{fam.op_type.split('.')[-1]}</code></td>"
+            f"<td>{fam.op_type}</td>"
             f"<td><code>{ch.shape_desc}</code></td>"
             f"<td><code>{fam.formula}</code></td>"
             f"<td>{fam.tflops:.4f}</td>"
@@ -560,23 +570,22 @@ def _render_op_family_row(fam, block_id: str, si: int, fi: int) -> str:
             f"<td>{fam.memory_ms:.4f}</td>"
             f"<td>{fam.comm_ms:.4f}</td>"
             f"<td><b>{fam.total_ms:.4f}</b></td>"
-            f"<td><span class='bound-tag {fam.bound}'>{fam.bound}</span></td>"
+            f"<td class='{bound_cls}'>{fam.bound}</td>"
             f"</tr>"
         )
         break  # one row per OpFamily (aggregated), not per child
 
-    detail = (
-        f'<div class="op-family-detail">'
-        f'<table class="sub-detail-table"><thead><tr>'
-        f'<th>Count</th><th>Type</th><th>Shape</th><th>Formula</th>'
-        f'<th>TFLOPs</th><th>HBM Bytes</th><th>Comm Bytes</th>'
-        f'<th>Compute ms</th><th>Memory ms</th><th>Comm ms</th>'
-        f'<th>Total ms</th><th>Bound</th>'
-        f'</tr></thead><tbody>{children_rows}</tbody></table>'
-        f'</div>'
+    return (
+        f"<details class='op-family'>"
+        f"<summary><span>{display}</span>{summary_right}</summary>"
+        f"<table class='compact'><thead><tr>"
+        f"<th>Count</th><th>Type</th><th>Shape</th><th>Formula</th>"
+        f"<th>TFLOPs</th><th>HBM Bytes</th><th>Comm Bytes</th>"
+        f"<th>Compute ms</th><th>Memory ms</th><th>Comm ms</th>"
+        f"<th>Total ms</th><th>Bound</th>"
+        f"</tr></thead><tbody>{children_rows}</tbody></table>"
+        f"</details>"
     )
-
-    return row + detail
 
 
 def export_hierarchical_html_report(
@@ -680,22 +689,24 @@ def export_hierarchical_html_report(
     # ── Hierarchy (Block → SubStructure → OpFamily) ──
     hierarchy_html = ""
     if rc.blocks:
-        hierarchy_parts = ['<div class="timeline-dots">']
+        hierarchy_parts = ['<div class="timeline">']
         for bi, blk in enumerate(rc.blocks):
-            block_id = f"b{bi}"
             repeat_str = f" × {blk.repeat} layers" if blk.repeat > 1 else ""
             op_family_count = sum(len(ss.op_families) for ss in blk.sub_structures)
 
-            # Block section with timeline-dot
+            # Block: details/summary with timeline-dot
+            block_title = f"<span class='sum-left'>{rc.phase}.{blk.name}{repeat_str}</span>"
+            block_right = (
+                f"<span class='summary-right'>"
+                f"{blk.total_ms:.3f} ms · Share {blk.pct_of_total:.1f}% · {blk.dominant_bound} bound"
+                f"</span>"
+            )
+
             hierarchy_parts.append(
                 f'<div class="timeline-item">'
                 f'<div class="timeline-dot"></div>'
-                f'<div class="block-section">'
-                f'<div class="block-title">'
-                f'<span>{rc.phase}.{blk.name}{repeat_str}'
-                f'  <span style="font-weight:400;opacity:0.75;font-size:12px">{blk.total_ms:.3f} ms</span></span>'
-                f'<span class="pct">Share {blk.pct_of_total:.1f}% · {blk.dominant_bound} bound</span>'
-                f'</div>'
+                f"<details class='block' open>"
+                f"<summary>{block_title}{block_right}</summary>"
             )
 
             # Block meta chips
@@ -724,18 +735,14 @@ def export_hierarchical_html_report(
                     hierarchy_parts.append('</div></div>')  # subgraph-flow / subgraph-lane
                 hierarchy_parts.append('</div>')  # subgraph-wrap
 
-            # Op families (clickable rows with 12-column detail)
-            hierarchy_parts.append(
-                f'<div style="background:#fff;border:1px solid #e2e8f0;border-top:none;border-radius:0 0 8px 8px;padding:4px 0">'
-            )
+            # Op families as nested <details>/<summary>
             for si, ss in enumerate(blk.sub_structures):
                 for fi, fam in enumerate(ss.op_families):
-                    hierarchy_parts.append(_render_op_family_row(fam, block_id, si, fi))
-            hierarchy_parts.append('</div>')
+                    hierarchy_parts.append(_render_op_family_details(fam))
 
-            hierarchy_parts.append('</div></div>')  # block-section / timeline-item
+            hierarchy_parts.append('</details></div>')  # details.block / timeline-item
 
-        hierarchy_parts.append('</div>')  # timeline-dots
+        hierarchy_parts.append('</div>')  # timeline
         hierarchy_html = "\n".join(hierarchy_parts)
 
     # ── Timeline ──
@@ -764,11 +771,24 @@ def export_hierarchical_html_report(
     # ── Calibration ──
     calib_html = ""
     if rc.calibration:
+        # Helper: safely convert calibration value to float, handling "671.0B" etc.
+        def _safe_calib_float(v):
+            if v is None:
+                return 0.0
+            s = str(v)
+            # Strip trailing non-numeric characters (units like B, M, G, %)
+            while s and not s[-1].isdigit():
+                s = s[:-1]
+            try:
+                return float(s) if s else 0.0
+            except ValueError:
+                return 0.0
+
         # Compute overall consistency
         total_entries = len(rc.calibration)
         exact_matches = sum(
             1 for c in rc.calibration
-            if abs(float(c.get("official", 0) or 0) - float(c.get("modeled", 0) or 0)) < 0.001
+            if abs(_safe_calib_float(c.get("official", 0)) - _safe_calib_float(c.get("modeled", 0))) < 0.001
         )
         consistency = exact_matches / total_entries * 100 if total_entries > 0 else 100
         grade = "高" if consistency >= 90 else ("中" if consistency >= 70 else "低")
@@ -1002,12 +1022,6 @@ def export_hierarchical_html_report(
 <style>
 {_CSS}
 {_HIER_CSS}
-.cite-link {{ color: #2563eb; text-decoration: none; }}
-.cite-link:hover {{ text-decoration: underline; }}
-.mini-value.high {{ color: #166534; }}
-.mini-value.midhigh {{ color: #15803d; }}
-.mini-value.medium {{ color: #b45309; }}
-.mini-value.low {{ color: #b91c1c; }}
 </style>
 </head>
 <body>
@@ -1015,7 +1029,7 @@ def export_hierarchical_html_report(
 <div class="meta">{''.join(f'<span>{p}</span>' for p in meta_parts)}</div>
 <div class="cards">{cards_html}</div>
 {bound_html}
-<h2>Hierarchical Breakdown</h2>
+<h2>模型 → Block → 子结构 → 算子分层展开</h2>
 <div class="chart-container">{hierarchy_html}</div>
 {topo_html}
 {struct_html}
@@ -1099,7 +1113,7 @@ def export_reports(
     from python.zrt.report.summary import E2ESummary, build_summary
 
     output_dir = _Path(output_dir)
-    report_dir = output_dir / "reports"
+    report_dir = output_dir
     report_dir.mkdir(parents=True, exist_ok=True)
 
     # ── 1. Schedule + Simulate ─────────────────────────────────────────────
