@@ -384,6 +384,7 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
     report, ctx, transformed = estimate_training_from_graphs(
         forward_graph=raw_fwd,
         backward_graph=raw_bwd,
+        output_dir=result.output_dir,
         hw_spec=hw,
         total_params=args.total_params,
         hidden=args.hidden,

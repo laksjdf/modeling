@@ -145,9 +145,11 @@ def _instantiate_model(config: Any, effective_id: str) -> nn.Module:
     from transformers import AutoModelForCausalLM
     from python.zrt.graph.compat import find_local_fallback
 
+    saved_exc: Exception | None = None
     try:
         return AutoModelForCausalLM.from_config(config, trust_remote_code=True)
     except Exception as exc:
+        saved_exc = exc
         if not _is_import_compat_error(exc):
             raise
 
@@ -163,7 +165,7 @@ def _instantiate_model(config: Any, effective_id: str) -> nn.Module:
     logger.info(
         "Model instantiation failed for '%s' (%s: %s); "
         "retrying from local fallback: %s",
-        effective_id, type(exc).__name__, exc, local_dir,
+        effective_id, type(saved_exc).__name__, saved_exc, local_dir,
     )
     from transformers import AutoConfig
     local_config = AutoConfig.from_pretrained(str(local_dir), trust_remote_code=True)

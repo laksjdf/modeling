@@ -14,6 +14,7 @@ from python.zrt.report.compare import (
     ComparisonReport, build_comparison_report,
     export_comparison_excel, export_comparison_html,
 )
+
 # Phase 1: hierarchical report types
 from python.zrt.report.report_types import (
     ReportContext, BlockDetail, SubStructureDetail,
@@ -29,6 +30,7 @@ def get_formula_registry() -> FormulaRegistry:
 from python.zrt.report.shape_desc import describe_shapes
 from python.zrt.report.topology_renderer import render_topology_svg
 from python.zrt.report.structure_renderer import render_structure_svg, render_structure_html
+from python.zrt.report.dot_exporter import export_dot, render_dot
 
 __all__ = [
     "E2ESummary", "build_summary",
@@ -45,4 +47,5 @@ __all__ = [
     "get_formula_registry", "FormulaRegistry", "FormulaEntry",
     "describe_shapes",
     "render_topology_svg", "render_structure_svg", "render_structure_html",
+    "export_dot", "render_dot",
 ]

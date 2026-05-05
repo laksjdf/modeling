@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Tech Stack**: Python 3.14+, PyTorch 2.0+, transformers 4.36+ (version-agnostic via compat shims), networkx, openpyxl, onnx
 
-**Hot Paths** (frequently accessed files): `python/zrt/transform/analysis/modeller.py`, `tests/training/test_captured_graph_modelling.py`, `python/zrt/transform/analysis/training.py`
+**Hot Paths** (frequently accessed files): `python/zrt/transform/analysis/modeller.py`, `python/zrt/training/compose/schedules.py`, `python/zrt/transform/context.py`, `tests/training/test_captured_graph_modelling.py`, `python/zrt/transform/analysis/training.py`
 
 ## Commands
 
@@ -49,6 +49,12 @@ python -m python.zrt deepseek-ai/DeepSeek-V3 --layers 4 --train --hw nvidia_h100
 PYTHONPATH=python python -m zrt.training estimate --config python/zrt/training/configs/llama3_70b_3d.yaml
 # Export Chrome Trace alongside training estimate
 PYTHONPATH=python python -m zrt.training estimate --config python/zrt/training/configs/llama3_70b_3d.yaml --trace out.json
+
+# Spec-based training estimate (no graph capture needed)
+python -m python.zrt --estimate-config python/zrt/training/configs/llama3_70b_3d.yaml
+
+# Graph-mode capture (torch.compile backend instead of TorchDispatchMode)
+python -m python.zrt deepseek-ai/DeepSeek-V3 --layers 2 --phases train_backward --graph-mode
 
 # End-to-end validation
 python e2e_check.py
@@ -182,6 +188,8 @@ Key design docs in `docs/`:
 - `training_modeller_zh.md` — Training performance modeling design
 - `phase0_improvement_plan.md` — Phase 0 improvements (forward/backward graph stitching)
 - `training_integration_design.md` — Training integration architecture
+
+> **Note on `ARCHITECTURE.md`**: This is an aspirational V2 design document describing a planned refactoring. Its module paths (`zrt/capture/`, `zrt/stacks/`, `zrt/comm/`, etc.) do **not** match the current codebase. The actual code lives under `python/zrt/` as described in the Architecture section above.
 
 ## Coding Conventions
 

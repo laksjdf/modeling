@@ -751,6 +751,12 @@ def _save_phase_outputs(
     for artifact, path in graph_paths.items():
         logger.info("  %s: %s", artifact, path)
 
+    # DOT export for the fused OpGraph
+    from python.zrt.report.dot_exporter import export_dot, render_dot
+    dot_path = export_dot(fused_opgraph, output_dir / f"{slug}_{phase}_fused_graph.dot")
+    render_dot(dot_path)  # no-op when graphviz absent
+    logger.info("  fused_dot: %s", dot_path)
+
     return raw_opgraph, fused_opgraph
 
 

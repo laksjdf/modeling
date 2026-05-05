@@ -12,6 +12,7 @@ Usage::
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -26,6 +27,7 @@ def estimate_training_from_graphs(
     *,
     forward_graph: "OpGraph",
     backward_graph: "OpGraph | None" = None,
+    output_dir: "str | Path | None" = None,
     hw_spec: "HardwareSpec | None" = None,
     total_params: int | None = None,
     hidden: int = 7168,
@@ -60,6 +62,8 @@ def estimate_training_from_graphs(
         If True, return (TrainingReport, TransformContext, transformed_graphs)
         where transformed_graphs contains the pipeline-processed graphs.
         This enables downstream Excel export via ``export_training_graphs``.
+    output_dir : str or Path, optional
+        If provided, export each transformed graph as a DOT file to this directory.
     """
     from python.zrt.transform.context import ParallelConfig, QuantConfig, TrainingConfig, TransformContext
     from python.zrt.transform.pipeline import build_default_pipeline
@@ -126,6 +130,23 @@ def estimate_training_from_graphs(
         results["unified"] = pipe.run(unified, ctx)
     else:
         results["train_forward"] = pipe.run(forward_graph, ctx)
+
+    # DOT export
+    if output_dir is not None:
+        from python.zrt.report.dot_exporter import export_dot, render_dot
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        model_name = forward_graph.name or "model"
+        # Export raw forward and backward graphs separately
+        dot_path = export_dot(forward_graph, out / f"{model_name}_train_forward.dot")
+        render_dot(dot_path)  # no-op when graphviz absent
+        if backward_graph is not None:
+            dot_path = export_dot(backward_graph, out / f"{model_name}_train_backward.dot")
+            render_dot(dot_path)
+        # Export transformed graphs (unified or forward-only)
+        for tag, g in results.items():
+            dot_path = export_dot(g, out / f"{model_name}_{tag}.dot")
+            render_dot(dot_path)  # no-op when graphviz absent
 
     if "unified" in results:
         g = results["unified"]

@@ -55,6 +55,13 @@ def apply_compat_patches() -> None:
     is imported, so that ``from transformers.xxx import yyy`` at module level
     finds the stub symbols even when the installed transformers version removed them.
     """
+    # 0. Dtype stubs — FP4 packed dtype not in PyTorch < 2.8
+    #    Use float16 as alias: must be a float dtype (nn.Parameter requires_grad),
+    #    and distinct from bfloat16 (the model's default) so the dtype == check
+    #    in Linear.__init__ only triggers for expert (FP4) paths.
+    if not hasattr(torch, "float4_e2m1fn_x2"):
+        torch.float4_e2m1fn_x2 = torch.float16
+
     # 1. Version shims (missing symbols injected into transformers sub-modules)
     from python.zrt.graph.compat import apply_version_shims
     apply_version_shims()
