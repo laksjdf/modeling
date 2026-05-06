@@ -44,6 +44,19 @@ def validate(model: ModelSpec, system: SystemSpec, strategy: Strategy) -> list[s
                     f"Ring CP requires seq_len % (cp * block_size) == 0, "
                     f"got {model.seq_len} % ({strategy.cp} * {block_size})"
                 )
+        if strategy.cp_kind == CPKind.COMPRESSED:
+            # DeepSeek-V4 compressed CP: requires seq_len divisible by cp
+            # Compression ratios are fixed (CSA=4, HCA=128) or model-specific
+            if model.seq_len % strategy.cp != 0:
+                warnings.append(
+                    f"Compressed CP requires seq_len % cp == 0, "
+                    f"got {model.seq_len} % {strategy.cp}"
+                )
+            # Additional check: compression ratio should be compatible
+            if hasattr(model, "attn_compression_ratio") and model.attn_compression_ratio < 1.0:
+                # Model uses compressed attention (DeepSeek-V4 style)
+                # No additional constraints beyond seq_len divisible by cp
+                pass
 
     # EP × DP placement: EP crossing node boundaries is expensive
     if strategy.ep > 1 and strategy.ep > system.gpus_per_node:

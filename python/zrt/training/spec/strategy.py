@@ -33,6 +33,7 @@ class CPKind(Enum):
     ULYSSES = "ulysses"
     RING = "ring"
     HYBRID = "hybrid"
+    COMPRESSED = "compressed"
 
 
 class TPOverlap(Enum):
