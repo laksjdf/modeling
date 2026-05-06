@@ -83,8 +83,27 @@ def apply_compat_patches() -> None:
 
 # ── MoE patch ─────────────────────────────────────────────────────────────────
 # Many MoE implementations call .cpu().numpy() or torch.bincount() on routing
-# indices, which crash on fake tensors.  This simplified forward exercises the
-# gate + one expert + shared experts — enough to capture the full op pattern.
+# indices, which crash on fake tensors.  The replacement forward exercises the
+# gate + n_active representative experts + shared experts to capture the op
+# pattern.  "n_active" = n_activated_experts (V4) / top_k (V3/Mixtral) — the
+# number of experts a single token is actually routed to.  Running more than
+# n_active experts would inflate FLOPs by (n_total / n_active).
+
+def _get_n_active_experts(mod: nn.Module) -> int:
+    """Return how many experts are activated per token (top-k routing count)."""
+    for attr in ("n_activated_experts", "n_experts_per_tok", "num_experts_per_tok",
+                 "top_k", "topk", "k"):
+        val = getattr(mod, attr, None)
+        if isinstance(val, int) and val > 0:
+            return val
+    gate = getattr(mod, "gate", None)
+    if gate is not None:
+        for attr in ("topk", "top_k", "n_experts_per_tok"):
+            val = getattr(gate, attr, None)
+            if isinstance(val, int) and val > 0:
+                return val
+    return 1
+
 
 def is_moe_module(module: nn.Module) -> bool:
     """True if module looks like a MoE layer that needs patching."""
@@ -112,14 +131,20 @@ def _make_fake_moe_forward(mod: nn.Module):
     _tuple_return = _returns_router_tuple(mod)
 
     def _forward(hidden_states: torch.Tensor, *args: Any, **kwargs: Any):
+        # V4 MoE.forward(x, input_ids) — thread input_ids through to the gate
+        # so hash-routing layers (Gate.forward uses self.tid2eid[input_ids])
+        # don't silently drop gate operators.
+        input_ids = kwargs.get("input_ids")
+        if input_ids is None and args:
+            input_ids = args[0]
         try:
-            result = _impl(hidden_states)
+            result = _impl(hidden_states, input_ids)
             return (result, None) if _tuple_return else result
         except Exception as exc:
             logger.debug("Fake MoE forward error (%s) — returning identity.", exc)
             return (hidden_states, None) if _tuple_return else hidden_states
 
-    def _impl(hidden_states: torch.Tensor) -> torch.Tensor:
+    def _impl(hidden_states: torch.Tensor, input_ids=None) -> torch.Tensor:
         orig = hidden_states
         bs, seq, h = orig.shape
         flat = orig.reshape(bs * seq, h)
@@ -128,8 +153,18 @@ def _make_fake_moe_forward(mod: nn.Module):
         gate = getattr(mod, "gate", None)
         if gate is not None and callable(gate):
             try:
-                # Always pass flat [bs*seq, h] — Gate.linear() expects 2-D input.
-                gate_out = gate(flat)
+                # Try with input_ids first (V4 hash-routing gate requires it).
+                # Fall back to no input_ids for older-style gates (V3/Mixtral).
+                gate_out = None
+                if input_ids is not None:
+                    try:
+                        ids_flat = (input_ids.flatten()
+                                    if hasattr(input_ids, "flatten") else input_ids)
+                        gate_out = gate(flat, ids_flat)
+                    except Exception:
+                        pass
+                if gate_out is None:
+                    gate_out = gate(flat)
                 if isinstance(gate_out, (tuple, list)):
                     # gate returns (weights, indices) — use weights (index 0)
                     gate_weight = gate_out[0]
@@ -138,17 +173,30 @@ def _make_fake_moe_forward(mod: nn.Module):
             except Exception as exc:
                 logger.debug("Gate forward failed (%s).", exc)
 
-        first_expert = next((e for e in mod.experts if e is not None), None)
-        if first_expert is None:
+        # Run exactly n_active representative experts — matching the real top-k
+        # routing behaviour (e.g. 6 out of 384 for V4).  Running all experts
+        # would over-count FLOPs by n_total/n_active; running only one would
+        # under-represent the actual compute.  All experts share the same class
+        # so any n_active consecutive experts capture the complete op pattern.
+        n_active = _get_n_active_experts(mod)
+        local_experts = [e for e in mod.experts if e is not None]
+        sample = local_experts[:n_active]
+        y: Optional[torch.Tensor] = None
+        for expert in sample:
+            try:
+                expert_out = expert(flat)
+                y = expert_out if y is None else y + expert_out
+            except Exception as exc:
+                logger.debug("Expert forward failed (%s).", exc)
+
+        if y is None:
             return orig
 
-        try:
-            expert_out = first_expert(flat)
-        except Exception:
-            expert_out = first_expert(orig).reshape(bs * seq, -1)
-
-        y = (expert_out * gate_weight[:, :1]
-             if gate_weight is not None else expert_out)
+        if gate_weight is not None:
+            try:
+                y = y * gate_weight[:, :1]
+            except Exception:
+                pass
         try:
             y = y.reshape(bs, seq, -1)
         except Exception:
@@ -404,26 +452,35 @@ def _diff_gemm(
 ) -> torch.Tensor:
     """Differentiable GEMM placeholder using real aten ops for training-capture mode.
 
-    Uses ``aten.mm`` (or ``aten.bmm`` for batched inputs) so that autograd records
-    a proper backward graph with ``mm_backward`` / ``t`` / ``mm`` ops that
-    ``TorchDispatchMode`` can capture.
+    Uses ``aten.mm`` so that autograd records a proper backward graph with
+    ``mm_backward`` / ``t`` / ``mm`` ops that ``TorchDispatchMode`` can capture.
 
     Signature matches the kernel stub: ``fp8_gemm(x, sx, w, sw, scale_dtype)``.
-    The scale tensors ``sx`` / ``sw`` are ignored — they exist only to satisfy
-    the caller's argument list.
+    Scale tensors ``sx`` / ``sw`` are ignored.
 
-    ``w`` is expected in ``[out_features, in_features]`` layout (matching
-    ``nn.Linear.weight`` and ``F.linear`` convention), so the forward is
-    ``x @ w.T``.
+    FP4 weights (``float4_e2m1fn_x2``) cannot be used in ``torch.mm`` directly.
+    For those, we synthesise a BF16 weight with the correct logical shape so
+    that shape-only FakeTensorMode capture works and mm_backward fires correctly.
+    FP4 packs 2 values per byte, so ``w.shape[-1]`` is half the logical in-dim;
+    logical in-dim is taken from ``x.shape[-1]``.
     """
-    # x: [*, in_features]  w: [out_features, in_features]
-    # F.linear(x, w) = x @ w.T = [*, out_features]
-    # Flatten x to 2-D for mm, then restore batch dims.
+    in_logical = x.shape[-1]
+    out_features = w.shape[0]
     orig_shape = x.shape
-    x_2d = x.reshape(-1, x.shape[-1])
-    # w is [out, in] → transpose to [in, out] for mm
-    out_2d = torch.mm(x_2d, w.t())
-    return out_2d.reshape(*orig_shape[:-1], w.shape[0]).to(torch.bfloat16)
+    x_2d = x.reshape(-1, in_logical).to(torch.bfloat16)
+
+    _fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    if _fp4_dtype is not None and w.dtype == _fp4_dtype:
+        # Packed FP4: logical in-dim = w.shape[-1] * 2 = in_logical.
+        # Synthesise a bf16 weight of the correct logical shape.
+        w_bf = x_2d.new_empty(out_features, in_logical)
+    elif w.dtype != torch.bfloat16:
+        w_bf = w.to(torch.bfloat16)
+    else:
+        w_bf = w
+
+    out_2d = torch.mm(x_2d, w_bf.t())
+    return out_2d.reshape(*orig_shape[:-1], out_features)
 
 
 def _diff_sparse_attn(
@@ -505,12 +562,13 @@ def _act_quant_passthrough(
 
     Returns x unchanged (no dtype cast, no in-place copy_) so that gradients
     flow through activations during backward.  The scale tensor is a dummy
-    ones array to satisfy callers that unpack (y, s).
+    empty array; new_empty avoids aten.full (fill_value=1) noise in the
+    training graph — the scale value is unused since _diff_gemm ignores sx/sw.
     """
     if inplace:
         return x
     n = x.size(-1)
-    s = x.new_ones(*x.shape[:-1], max(1, n // block_size), dtype=scale_dtype)
+    s = x.new_empty(*x.shape[:-1], max(1, n // block_size), dtype=scale_dtype)
     return x, s
 
 
@@ -521,7 +579,7 @@ def _fp4_act_quant_passthrough(
 ) -> torch.Tensor:
     if inplace:
         return x
-    s = x.new_ones(*x.shape[:-1], max(1, x.size(-1) // block_size))
+    s = x.new_empty(*x.shape[:-1], max(1, x.size(-1) // block_size))
     return x, s
 
 
@@ -648,9 +706,14 @@ def _upgrade_kernel_stubs_for_backward() -> None:
     # apply_rotary_emb writes back via copy_() on a view of the input tensor.
     # Once @inference_mode is removed that copy_() increments the version counter
     # of tensors saved for backward (q, kv, o), causing autograd to raise.
-    # For training-capture purposes (FLOPs / memory modelling, not correctness)
-    # we can safely skip the rotation.
+    # rotate_activation asserts x.dtype == bfloat16 then calls hadamard_transform
+    # (already stubbed as identity); the assertion itself fires under FakeTensorMode
+    # when Compressor.forward passes an intermediate tensor with an unexpected dtype.
+    # Both functions are pre-quantisation helpers, not needed for graph capture.
     def _apply_rotary_emb_noop(x, freqs_cis, inverse=False):
+        return x
+
+    def _rotate_activation_noop(x: torch.Tensor) -> torch.Tensor:
         return x
 
     new_fns: dict[str, object] = {
@@ -661,6 +724,7 @@ def _upgrade_kernel_stubs_for_backward() -> None:
         "act_quant": _act_quant_passthrough,
         "fp4_act_quant": _fp4_act_quant_passthrough,
         "apply_rotary_emb": _apply_rotary_emb_noop,
+        "rotate_activation": _rotate_activation_noop,
     }
 
     patched_mods: list[str] = []
