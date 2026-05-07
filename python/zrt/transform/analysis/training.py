@@ -264,16 +264,19 @@ class TrainingMemoryPass(GraphPass):
 
         Improved to use actual recompute annotation fraction when available,
         falling back to policy-based multipliers for "none"/"selective"/"full".
+
+        TP with SP (Sequence Parallel): shards seq by TP.
+        CP: further shards seq by CP.
+        Combined: shard = max(tp, 1) * max(cp, 1).
         """
         base = 34 * hidden * seq_len * num_layers * batch_size
-        shard = tp * max(cp, 1)
 
-        # Try to derive recompute fraction from actual node annotations
+        tp_sp = tp if tp > 1 else 1
+        cp_factor = cp if cp > 1 else 1
+        shard = tp_sp * cp_factor
+
         rc_mult = self._derive_recompute_multiplier(g, ctx)
 
-        # Stage-aware inflight (peak over local stages):
-        # approximate activation volume per stage and scale by each stage's
-        # inflight depth (pp - stage_id), then take the peak.
         stage_ids = {n.annotations.get("stage_id") for n in g.nodes.values()
                      if "stage_id" in n.annotations}
         if stage_ids and pp > 1:
@@ -333,10 +336,13 @@ class TrainingMemoryPass(GraphPass):
         "fwd"/"forward"/"train_forward" and
         "bwd"/"backward"/"train_backward".
         Nodes with annotations["recompute"] == True have their outputs excluded.
-        """
-        shard = tp * max(cp, 1)
 
-        # Classify nodes by phase annotation
+        TP with SP and CP: shard = max(tp, 1) * max(cp, 1).
+        """
+        tp_sp = tp if tp > 1 else 1
+        cp_factor = cp if cp > 1 else 1
+        shard = tp_sp * cp_factor
+
         fwd_nodes = set()
         bwd_nodes = set()
         for nid, node in g.nodes.items():
@@ -346,7 +352,6 @@ class TrainingMemoryPass(GraphPass):
             else:
                 fwd_nodes.add(nid)
 
-        # Sum bytes on edges from forward to backward nodes = saved activations
         saved_bytes = 0
         recomputed_nodes = {
             nid for nid, n in g.nodes.items() if n.annotations.get("recompute")
@@ -354,7 +359,6 @@ class TrainingMemoryPass(GraphPass):
 
         for edge in g.edges:
             if edge.src in fwd_nodes and edge.dst in bwd_nodes:
-                # Skip activations from recomputed nodes (they are freed)
                 if edge.src in recomputed_nodes:
                     continue
                 saved_bytes += edge.tensor.mem_bytes if hasattr(edge.tensor, 'mem_bytes') else 0
@@ -566,17 +570,14 @@ class TrainingPipelinePass(GraphPass):
             for cn in overlap_nodes:
                 comm_lat = cn.annotations["latency_us"]
                 otype = cn.annotations["overlap_type"]
-                # Resolve target compute node latency for overlap
+                cp_rounds = cn.attrs.get("cp_rounds", 1)
                 target_lat = 0.0
                 target_key = cn.annotations.get("overlap_target", "")
                 if target_key:
-                    # For ring_cp: target_key is "fa_tile:<node_id>"
                     target_id = target_key.split(":", 1)[1] if ":" in target_key else target_key
                     target_node = g.nodes.get(target_id)
                     if target_node:
                         target_lat = target_node.annotations.get("latency_us", 0.0)
-                # CoC fallback: if no explicit overlap target, use predecessor
-                # compute latency as the overlap window reference.
                 if otype == "coc" and target_lat <= 0.0:
                     pred_ids = g.predecessors(cn.id)
                     pred_lats = [
@@ -589,6 +590,7 @@ class TrainingPipelinePass(GraphPass):
                 exposed = compute_exposed_comm_time(
                     comm_lat, otype, target_lat,
                     coc_tile_k=cn.attrs.get("coc_tile_k", 4),
+                    cp_rounds=cp_rounds,
                 )
                 total_comm_us += comm_lat
                 total_exposed_us += exposed
@@ -790,6 +792,7 @@ def compute_exposed_comm_time(
     overlap_type: str,
     target_latency_us: float = 0.0,
     coc_tile_k: int = 4,
+    cp_rounds: int = 1,
 ) -> float:
     """Compute exposed (non-hidden) communication time under overlap.
 
@@ -798,20 +801,20 @@ def compute_exposed_comm_time(
         overlap_type: "coc", "mc2", "ring_cp", or "none".
         target_latency_us: latency of the compute node being overlapped.
         coc_tile_k: number of tiles for CoC overlap (default 4).
+        cp_rounds: number of CP P2P rounds (for ring_cp).
 
     Returns:
         Exposed comm time in microseconds (>= 0).
     """
     if overlap_type == "mc2":
-        # MC2: fully fused AG+matmul, zero exposed comm
         return 0.0
     elif overlap_type == "coc":
-        # CoC: comm overlaps with matmul*(k-1)/k window
         overlap_window = target_latency_us * (coc_tile_k - 1) / coc_tile_k
         return max(0.0, comm_latency_us - overlap_window)
     elif overlap_type == "ring_cp":
-        # Ring-CP: P2P overlaps with FA tile
-        return max(0.0, comm_latency_us - target_latency_us)
+        fa_tile_latency = target_latency_us / cp_rounds if cp_rounds > 1 else target_latency_us
+        p2p_round_latency = comm_latency_us / cp_rounds if cp_rounds > 1 else comm_latency_us
+        exposed_per_round = max(0.0, p2p_round_latency - fa_tile_latency)
+        return exposed_per_round * cp_rounds
     else:
-        # No overlap: full comm time is exposed
         return comm_latency_us

@@ -244,7 +244,6 @@ class CommInserterPass(GraphPass):
                     _rewire(g, node.id, post_comm)
 
             elif cp_kind == "ring":
-                # Ring: N rounds of P2P, each overlapped with an FA tile
                 p2p_rounds = cp_split.get("p2p_rounds", cp)
                 for i in range(p2p_rounds):
                     p2p_id = f"comm_p2p_cp_ring_{node.id}_round_{i}"
@@ -257,6 +256,7 @@ class CommInserterPass(GraphPass):
                             attrs={"group_size": cp, "collective": "send_recv",
                                    "role": "cp_ring", "round": i,
                                    "message_size_bytes": ring_msg_bytes,
+                                   "cp_rounds": p2p_rounds,
                                    "scope": node.scope, "layer": node.layer},
                             scope=node.scope,
                             layer=node.layer,

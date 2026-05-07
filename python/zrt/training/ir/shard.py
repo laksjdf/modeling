@@ -51,7 +51,7 @@ class ShardPlan:
         return self.tp > 1
 
 
-def insert_collectives(graph: Graph, shard: ShardPlan, model: ModelSpec) -> None:
+def insert_collectives(graph: Graph, model: ModelSpec, strategy: Strategy) -> None:
     """Insert TP/CP/EP collectives into the graph IN-PLACE.
 
     Megatron-TP pattern per dense layer:
@@ -68,6 +68,7 @@ def insert_collectives(graph: Graph, shard: ShardPlan, model: ModelSpec) -> None
       - All-to-All before routed expert FFN
       - All-to-All after routed expert FFN
     """
+    shard = ShardPlan(strategy)
     collectives: list[Collective] = []
 
     # Insert TP collectives
@@ -96,9 +97,14 @@ def _insert_tp_collectives(
     h_kv = model.num_kv_heads * model.head_dim
     ffn = model.ffn
     act_bytes = model.act_dtype.bytes
+    
+    # When CP is enabled, sequence is already sharded by CP
+    # TP AG/RS should operate on the CP-sharded sequence
+    if shard.cp > 1:
+        seq = seq // shard.cp
 
     for layer_id, (start, end) in graph.layer_index.items():
-        # Compute payload sizes (before sharding, divided by TP for per-rank)
+        # Compute payload sizes (after CP sharding, before TP sharding)
         ag_attn_bytes = seq * h * act_bytes  # AG before QKV
         rs_attn_bytes = seq * h * act_bytes  # RS after O_proj
         ag_ffn_bytes = seq * h * act_bytes   # AG before FFN up
@@ -114,6 +120,7 @@ def _insert_tp_collectives(
                     kind="AG", group="TP",
                     bytes_=ag_attn_bytes,
                     inserted_after=op.name,
+                    phase="both",
                 ))
 
             # RS after O projection
@@ -123,6 +130,7 @@ def _insert_tp_collectives(
                     kind="RS", group="TP",
                     bytes_=rs_attn_bytes,
                     inserted_after=op.name,
+                    phase="both",
                 ))
 
             # AG before FFN up projection
@@ -132,6 +140,7 @@ def _insert_tp_collectives(
                     kind="AG", group="TP",
                     bytes_=ag_ffn_bytes,
                     inserted_after=op.name,
+                    phase="both",
                 ))
 
             # RS after FFN down projection
@@ -141,6 +150,7 @@ def _insert_tp_collectives(
                     kind="RS", group="TP",
                     bytes_=rs_ffn_bytes,
                     inserted_after=op.name,
+                    phase="both",
                 ))
 
         # Adjust tensor shapes for TP sharding
@@ -151,48 +161,215 @@ def _insert_cp_collectives(
     graph: Graph, shard: ShardPlan, model: ModelSpec,
     collectives: list[Collective],
 ) -> None:
-    """Insert CP collectives (A2A pairs for Ulysses sequence parallel).
+    """Insert CP collectives for different CP strategies.
 
     Ulysses-CP pattern:
-      - A2A before attention core (splits sequence across ranks)
-      - A2A after attention core (gathers sequence)
+      - A2A before attention core (scatter-seq / gather-heads)
+      - A2A after attention core (gather-seq / scatter-heads)
+      - Each A2A transfers seq/cp × hidden_tp bytes
 
-    Ring-CP is handled via send/recv pairs but modeled as A2A for simplicity.
+    Ring-CP pattern:
+      - P2P send/recv pairs, cp rounds per attention
+      - Each P2P round transfers seq/cp × hidden_tp bytes
+      - P2P overlaps with FA tile computation
+
+    Hybrid-CP pattern:
+      - Combines Ulysses A2A with Ring P2P overlap
+      - For now, modeled as Ring-CP with extra A2A
+
+    Note: When TP is enabled, hidden dimension is already sharded by TP.
+    CP communication should use hidden_tp = hidden / tp, not full hidden.
     """
-    if shard.cp_kind != CPKind.ULYSSES:
-        # Ring-CP not yet modeled in Stack A IR
+    if shard.cp_kind == CPKind.NONE:
         return
 
     h = model.hidden
+    if shard.tp > 1:
+        h = h // shard.tp
     act_bytes = model.act_dtype.bytes
+    cp = shard.cp
 
     for layer_id, (start, end) in graph.layer_index.items():
-        # A2A payload size: full sequence × hidden
-        a2a_bytes = model.seq_len * h * act_bytes
-
+        # Note: Insert collectives BEFORE sharding metadata.
+        # Collectives use model.seq_len directly (not op.meta["s"]),
+        # so sharding order doesn't affect communication calculation.
+        # Sharding metadata is for subsequent FLOPs calculation.
         for i in range(start, end):
             op = graph.ops[i]
 
-            # A2A before attention core
-            if op.kind == "attn_core":
+            if op.kind != "attn_core":
+                continue
+
+            if shard.cp_kind == CPKind.ULYSSES:
+                a2a_bytes = (model.seq_len // cp) * h * act_bytes
                 collectives.append(Collective(
-                    name=f"a2a_before_{op.name}",
+                    name=f"a2a_fwd_before_{op.name}",
                     kind="A2A", group="CP",
                     bytes_=a2a_bytes,
                     inserted_before=op.name,
+                    phase="fwd",
                 ))
-
-            # A2A after attention core (gathers attention output)
-            if op.kind == "attn_core":
                 collectives.append(Collective(
-                    name=f"a2a_after_{op.name}",
+                    name=f"a2a_fwd_after_{op.name}",
                     kind="A2A", group="CP",
                     bytes_=a2a_bytes,
                     inserted_after=op.name,
+                    phase="fwd",
+                ))
+                collectives.append(Collective(
+                    name=f"a2a_bwd_before_{op.name}",
+                    kind="A2A", group="CP",
+                    bytes_=a2a_bytes,
+                    inserted_before=op.name,
+                    phase="bwd",
+                ))
+                collectives.append(Collective(
+                    name=f"a2a_bwd_after_{op.name}",
+                    kind="A2A", group="CP",
+                    bytes_=a2a_bytes,
+                    inserted_after=op.name,
+                    phase="bwd",
                 ))
 
-        # Adjust tensor shapes for CP sharding (sequence dimension)
-        _apply_cp_sharding(graph, start, end, shard, model.seq_len)
+            elif shard.cp_kind == CPKind.RING:
+                p2p_bytes = (model.seq_len // cp) * h * act_bytes
+                # Forward: P2P overlaps with FA tile computation
+                collectives.append(Collective(
+                    name=f"p2p_ring_fwd_{op.name}",
+                    kind="P2P", group="CP",
+                    bytes_=p2p_bytes,
+                    inserted_before=op.name,
+                    rounds=cp,
+                    overlap=True,
+                    phase="fwd",
+                ))
+                # Backward: P2P for gradient propagation (similar pattern)
+                collectives.append(Collective(
+                    name=f"p2p_ring_bwd_{op.name}",
+                    kind="P2P", group="CP",
+                    bytes_=p2p_bytes,
+                    inserted_before=op.name,
+                    rounds=cp,
+                    overlap=True,
+                    phase="bwd",
+                ))
+
+            elif shard.cp_kind == CPKind.HYBRID:
+                a2a_bytes = (model.seq_len // cp) * h * act_bytes
+                collectives.append(Collective(
+                    name=f"a2a_fwd_before_{op.name}",
+                    kind="A2A", group="CP",
+                    bytes_=a2a_bytes,
+                    inserted_before=op.name,
+                    phase="fwd",
+                ))
+                p2p_bytes = (model.seq_len // cp) * h * act_bytes
+                collectives.append(Collective(
+                    name=f"p2p_ring_{op.name}",
+                    kind="P2P", group="CP",
+                    bytes_=p2p_bytes,
+                    inserted_before=op.name,
+                    rounds=cp,
+                    overlap=True,
+                    phase="fwd",
+                ))
+                collectives.append(Collective(
+                    name=f"a2a_fwd_after_{op.name}",
+                    kind="A2A", group="CP",
+                    bytes_=a2a_bytes,
+                    inserted_after=op.name,
+                    phase="fwd",
+                ))
+                collectives.append(Collective(
+                    name=f"a2a_bwd_before_{op.name}",
+                    kind="A2A", group="CP",
+                    bytes_=a2a_bytes,
+                    inserted_before=op.name,
+                    phase="bwd",
+                ))
+                collectives.append(Collective(
+                    name=f"a2a_bwd_after_{op.name}",
+                    kind="A2A", group="CP",
+                    bytes_=a2a_bytes,
+                    inserted_after=op.name,
+                    phase="bwd",
+                ))
+            
+            elif shard.cp_kind == CPKind.COMPRESSED:
+                # DeepSeek-V4 two-stage compressed CP
+                # Determine layer type (CSA/HCA/SWA) from model spec
+                cp_type = model.get_layer_cp_type(layer_id)
+                
+                # SWA-only layers don't participate in CP communication
+                if cp_type == 'swa':
+                    continue
+                
+                # Import compressed CP analyzer
+                from zrt.training.models.compressed_cp import (
+                    CompressedCPConfig, 
+                    CompressedCPCommAnalyzer,
+                )
+                
+                # Configure compressed CP based on layer type
+                if cp_type == 'csa':
+                    compression_ratio = 4  # CSA: m=4
+                elif cp_type == 'hca':
+                    compression_ratio = 128  # HCA: m'=128
+                else:
+                    continue  # Unknown type, skip
+                
+                # Create analyzer for this layer type
+                cp_config = CompressedCPConfig(
+                    cp_size=cp,
+                    compression_ratio_csa=4 if cp_type == 'csa' else 4,
+                    compression_ratio_hca=128 if cp_type == 'hca' else 128,
+                    kv_head_dim=model.head_dim,
+                )
+                analyzer = CompressedCPCommAnalyzer(cp_config)
+                
+                # Stage 1: P2P boundary exchange (forward + backward)
+                if cp_type == 'csa':
+                    stage1_bytes = analyzer.stage1_comm_bytes_csa()
+                else:  # hca
+                    stage1_bytes = analyzer.stage1_comm_bytes_hca()
+                
+                collectives.append(Collective(
+                    name=f"p2p_boundary_fwd_{op.name}_stage1_{cp_type}",
+                    kind="P2P", group="CP",
+                    bytes_=stage1_bytes,
+                    inserted_before=op.name,
+                    phase="fwd",
+                ))
+                collectives.append(Collective(
+                    name=f"p2p_boundary_bwd_{op.name}_stage1_{cp_type}",
+                    kind="P2P", group="CP",
+                    bytes_=stage1_bytes,
+                    inserted_before=op.name,
+                    phase="bwd",
+                ))
+                
+                # Stage 2: AllGather compressed KV (forward + backward)
+                if cp_type == 'csa':
+                    stage2_bytes = analyzer.stage2_comm_bytes_csa(model.seq_len)
+                else:  # hca
+                    stage2_bytes = analyzer.stage2_comm_bytes_hca(model.seq_len)
+                
+                collectives.append(Collective(
+                    name=f"allgather_kv_fwd_{op.name}_stage2_{cp_type}",
+                    kind="AG", group="CP",
+                    bytes_=stage2_bytes,
+                    inserted_before=op.name,
+                    phase="fwd",
+                ))
+                collectives.append(Collective(
+                    name=f"allgather_kv_bwd_{op.name}_stage2_{cp_type}",
+                    kind="AG", group="CP",
+                    bytes_=stage2_bytes,
+                    inserted_before=op.name,
+                    phase="bwd",
+                ))
+
+        _apply_cp_sharding(graph, start, end, shard, model.seq_len, model.hidden)
 
 
 def _insert_ep_collectives(
@@ -206,6 +383,11 @@ def _insert_ep_collectives(
       - A2A after routed expert FFN (gathers expert outputs)
     """
     h = model.hidden
+    if shard.tp > 1:
+        h = h // shard.tp
+    seq = model.seq_len
+    if shard.cp > 1:
+        seq = seq // shard.cp
     moe_ffn = model.moe_ffn if model.moe_ffn > 0 else model.ffn
     act_bytes = model.act_dtype.bytes
 
@@ -216,8 +398,8 @@ def _insert_ep_collectives(
         if model.layers[layer_id].value != "moe":
             continue
 
-        # A2A payload size: tokens × hidden
-        a2a_bytes = model.seq_len * h * act_bytes
+        # A2A payload size: tokens × hidden (after TP and CP sharding)
+        a2a_bytes = seq * h * act_bytes
 
         for i in range(start, end):
             op = graph.ops[i]
@@ -229,6 +411,7 @@ def _insert_ep_collectives(
                     kind="A2A", group="EP",
                     bytes_=a2a_bytes,
                     inserted_before=op.name,
+                    phase="both",
                 ))
 
             # A2A after routed expert FFN
@@ -238,6 +421,7 @@ def _insert_ep_collectives(
                     kind="A2A", group="EP",
                     bytes_=a2a_bytes,
                     inserted_after=op.name,
+                    phase="both",
                 ))
 
         # Adjust tensor shapes for EP sharding (experts sharded across ranks)
@@ -286,7 +470,10 @@ def _apply_tp_sharding(
                         t.shape_local = (t.shape_logical[0], k_local)
         elif op.kind == "attn_core":
             if "heads" in op.meta:
+                heads_before_tp = op.meta["heads"]
                 op.meta["heads"] = max(1, op.meta["heads"] // shard.tp)
+                op.meta["heads_tp"] = op.meta["heads"]
+                op.meta["heads_before_tp"] = heads_before_tp
             if "h_kv" in op.meta:
                 op.meta["h_kv"] = max(1, op.meta["h_kv"] // shard.tp)
             for t in op.inputs + op.outputs:
@@ -310,12 +497,18 @@ def _apply_tp_sharding(
 
 
 def _apply_cp_sharding(
-    graph: Graph, start: int, end: int, shard: ShardPlan, seq: int,
+    graph: Graph, start: int, end: int, shard: ShardPlan, seq: int, hidden: int,
 ) -> None:
-    """Adjust tensor shape_local for CP sharding (Ulysses sequence parallel).
+    """Adjust tensor shape_local for CP sharding.
 
-    For Ulysses CP, the sequence dimension is split across ranks.
-    Each rank processes seq/cp tokens.
+    Ulysses-CP: sequence split by cp, heads multiplied by cp for attention.
+    Ring-CP: sequence split by cp, heads unchanged (KV chunks sent round-robin).
+    Hybrid-CP: both sequence and heads adjustments apply.
+
+    For attention core:
+      - Ulysses: heads_local = heads_tp * cp (heads gathered by A2A)
+      - Ring: heads_local = heads_tp (unchanged)
+      - seq_local = seq / cp for all CP kinds
     """
     if not shard.has_cp:
         return
@@ -325,21 +518,25 @@ def _apply_cp_sharding(
     for i in range(start, end):
         op = graph.ops[i]
 
-        # Adjust sequence dimension for all ops
         for t in op.inputs + op.outputs:
             if t.shape_logical and len(t.shape_logical) > 0:
-                # First dimension is typically sequence/batch
                 if t.shape_logical[0] == seq:
                     t.shape_local = (seq_local,) + t.shape_logical[1:]
 
-        # Scale compute metadata for FLOPs model
-        # The FLOPs model reads meta['m'] for matmul and meta['s'] for attn_core
         if op.kind == "matmul":
             if "m" in op.meta:
                 op.meta["m"] = op.meta["m"] // shard.cp
         elif op.kind == "attn_core":
             if "s" in op.meta:
                 op.meta["s"] = op.meta["s"] // shard.cp
+            if shard.cp_kind == CPKind.ULYSSES or shard.cp_kind == CPKind.HYBRID:
+                if "heads" in op.meta:
+                    heads_tp = op.meta.get("heads_tp", op.meta["heads"])
+                    op.meta["heads"] = heads_tp * shard.cp
+                    op.meta["heads_gathered_by_cp"] = True
+            if shard.cp_kind == CPKind.RING:
+                op.meta["heads_gathered_by_cp"] = False
+                op.meta["cp_tiles"] = shard.cp
         elif op.kind in ("ln", "rope", "swiglu", "add"):
             if "bytes_fwd" in op.meta:
                 op.meta["bytes_fwd"] = int(op.meta["bytes_fwd"]) // shard.cp

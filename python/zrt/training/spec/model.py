@@ -28,6 +28,11 @@ class ModelSpec:
 
     # attention
     attn_compression_ratio: float = 1.0
+    
+    # Compressed-CP (DeepSeek-V4 style): CSA vs HCA layer distribution
+    num_csa_layers: int = 0  # number of CSA layers (compression_ratio=4)
+    num_hca_layers: int = 0  # number of HCA layers (compression_ratio=128)
+    num_swa_only_layers: int = 0  # SWA-only layers (no CP communication)
 
     # MoE (ignored when no MOE layers)
     num_experts: int = 0
@@ -64,6 +69,41 @@ class ModelSpec:
                 "attn_compression_ratio must be in (0, 1], "
                 f"got {self.attn_compression_ratio}"
             )
+        
+        # Validate compressed-CP layer distribution
+        total_compressed_layers = self.num_csa_layers + self.num_hca_layers + self.num_swa_only_layers
+        if total_compressed_layers > 0:
+            if total_compressed_layers != len(self.layers):
+                raise ValueError(
+                    f"Compressed-CP layer distribution ({total_compressed_layers}) "
+                    f"must match total layers ({len(self.layers)})"
+                )
+    
+    def get_layer_cp_type(self, layer_id: int) -> str:
+        """Determine CP type (CSA/HCA/SWA) for a given layer.
+        
+        Returns: 'csa', 'hca', or 'swa'
+        """
+        if self.num_csa_layers == 0 and self.num_hca_layers == 0:
+            return 'none'
+        
+        # SWA-only layers come first
+        if layer_id < self.num_swa_only_layers:
+            return 'swa'
+        
+        # CSA layers come after SWA
+        csa_start = self.num_swa_only_layers
+        csa_end = csa_start + self.num_csa_layers
+        if csa_start <= layer_id < csa_end:
+            return 'csa'
+        
+        # HCA layers come after CSA
+        hca_start = csa_end
+        hca_end = hca_start + self.num_hca_layers
+        if hca_start <= layer_id < hca_end:
+            return 'hca'
+        
+        return 'none'
 
     @property
     def head_dim_total(self) -> int:

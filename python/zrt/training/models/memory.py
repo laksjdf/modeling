@@ -208,27 +208,26 @@ def _activation_memory(
     Per layer: seq * hidden * dtype_bytes * coefficient(layer_kind)
     Coefficient accounts for number of activation tensors held simultaneously.
 
-    Returns
-    -------
-    (total_activations, hc_overhead_bytes)
-        ``hc_overhead_bytes`` is the slice of ``total_activations`` attributable
-        to HC residual replication (``(hc_mult - 1) × residual_count`` extra
-        copies).  Reporting it separately lets the breakdown distinguish the
-        cost of HC from the rest of the activation footprint.
+    TP with SP (Sequence Parallel): shards activations by TP along sequence dim.
+    CP: further shards activations by CP along sequence dim.
+    Combined: total_shard = max(tp_sp, 1) * max(cp, 1)
+
+    Note: TP SP only activates when TP>1 (Megatron-style SP).
+    CP activates independently and stacks on top of SP.
     """
     s = model.seq_len
     h = model.hidden
     act_bytes = model.act_dtype.bytes
     hc_mult = max(1, getattr(model, "hc_mult", 1))
 
-    # Coefficient per layer kind (number of activation tensors that must be
-    # materialized simultaneously for backward, roughly)
-    # Dense: ~10 tensors (x, x_ln, q, k, v, attn_out, x_attn, x_ln2, up, gate, swiglu)
     COEFF_DENSE = 10
-    COEFF_MOE = 14  # additional dispatch/combine tensors
+    COEFF_MOE = 14
     COEFF_MTP = 12
-    # HC residual streams that must be retained across attn / ffn (one each).
     COEFF_HC_RESIDUAL = 2
+
+    tp_sp = strategy.tp if strategy.tp > 1 else 1
+    cp = strategy.cp if strategy.cp > 1 else 1
+    total_seq_shard = tp_sp * cp
 
     total_act = 0
     total_hc = 0
@@ -245,35 +244,20 @@ def _activation_memory(
         else:
             coeff = COEFF_DENSE
 
-        # Base: seq * hidden * dtype_bytes * coeff
         layer_act = s * h * act_bytes * coeff
-
-        # HC overhead: (hc-1) extra residual copies per layer, both around
-        # attn and ffn.  hc_mult=1 ⇒ 0 overhead.
         hc_layer = (hc_mult - 1) * s * h * act_bytes * COEFF_HC_RESIDUAL
         layer_act += hc_layer
 
-        # TP with SP reduces activation by factor of tp for seq-sharded portion
-        if strategy.tp > 1:
-            layer_act //= strategy.tp
-            hc_layer //= strategy.tp
-
-        # CP reduces further
-        if strategy.cp > 1:
-            layer_act //= strategy.cp
-            hc_layer //= strategy.cp
+        layer_act = layer_act // total_seq_shard
+        hc_layer = hc_layer // total_seq_shard
 
         total_act += layer_act
         total_hc += hc_layer
 
-    # Scale by microbatch
     total_act *= strategy.micro_batch
     total_hc *= strategy.micro_batch
 
-    # Scale by in-flight microbatches (PP bubble depth)
     if strategy.pp > 1:
-        # 1F1B: worst case is first stage holding pp-1 microbatches
-        # Average over training step: use (pp) // 2 as approximation
         in_flight = max(1, strategy.pp // 2)
         total_act *= in_flight
         total_hc *= in_flight
@@ -282,22 +266,43 @@ def _activation_memory(
 
 
 def _comm_buffer_memory(model: ModelSpec, strategy: Strategy) -> int:
-    """Communication buffer memory (AG/RS buffers)."""
-    if strategy.tp <= 1:
-        return 0
-
+    """Communication buffer memory (AG/RS + CP A2A + EP A2A buffers)."""
     s = model.seq_len
     h = model.hidden
     act_bytes = model.act_dtype.bytes
-
-    # Per layer: 2 AG buffers + 2 RS buffers (attn + FFN), each = seq * hidden * dtype
-    # AG buffer: full tensor before sharding
-    # RS buffer: full tensor after reduction
-    per_layer = 4 * s * h * act_bytes
-
     n_layers = len(model.layers)
+    
     if strategy.pp > 1:
         layers_per_stage = n_layers // strategy.pp
         n_layers = layers_per_stage
 
-    return per_layer * n_layers * strategy.micro_batch
+    total = 0
+
+    # TP AG/RS buffers (only when TP>1)
+    if strategy.tp > 1:
+        h_tp = h // strategy.tp
+        per_layer_tp = 4 * s * h_tp * act_bytes
+        total += per_layer_tp * n_layers * strategy.micro_batch
+
+    # CP A2A buffers (only when CP>1)
+    # Note: Ulysses CP has 4 A2A per layer (fwd_before, fwd_after, bwd_before, bwd_after)
+    # Buffer memory assumes no reuse between forward and backward (保守估算)
+    if strategy.cp > 1:
+        seq_cp = s // strategy.cp
+        h_tp = h // strategy.tp if strategy.tp > 1 else h
+        per_layer_cp = 4 * seq_cp * h_tp * act_bytes
+        total += per_layer_cp * n_layers * strategy.micro_batch
+
+    # EP A2A buffers (only when EP>1, MoE layers only)
+    # Note: EP has 4 A2A per MoE layer (fwd_before, fwd_after, bwd_before, bwd_after)
+    # Buffer memory assumes no reuse between forward and backward (保守估算)
+    if strategy.ep > 1 and model.num_experts > 0:
+        seq_cp = s // strategy.cp if strategy.cp > 1 else s
+        h_tp = h // strategy.tp if strategy.tp > 1 else h
+        per_layer_ep = 4 * seq_cp * h_tp * act_bytes
+        n_moe = sum(1 for lk in model.layers if lk.value == "moe")
+        if strategy.pp > 1:
+            n_moe = max(1, n_moe // strategy.pp)
+        total += per_layer_ep * n_moe * strategy.micro_batch
+
+    return total

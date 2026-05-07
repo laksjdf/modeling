@@ -109,16 +109,27 @@ def stage_time(
     recompute_t = _recompute_time(stage_ops, model, system, strategy, gpu_name)
     t_bwd_dx += recompute_t
 
-    # Communication time for this stage's collectives
     t_comm_fwd = 0.0
     t_comm_bwd = 0.0
     for c in stage_collectives:
         group_size = _group_size(c.group, strategy)
         tier = tier_for_group(c.group, group_size, system)
         ct = collective_time(c, group_size, tier)
-        # AG/RS at matmul boundaries: split evenly between fwd and bwd
-        t_comm_fwd += ct * 0.5
-        t_comm_bwd += ct * 0.5
+
+        if c.group == "CP":
+            if c.phase == "fwd":
+                t_comm_fwd += ct
+            elif c.phase == "bwd":
+                t_comm_bwd += ct
+            elif c.phase == "both":
+                t_comm_fwd += ct * 0.5
+                t_comm_bwd += ct * 0.5
+        elif c.group in ("TP", "EP"):
+            t_comm_fwd += ct * 0.5
+            t_comm_bwd += ct * 0.5
+        else:
+            t_comm_fwd += ct * 0.5
+            t_comm_bwd += ct * 0.5
 
     t_fwd += t_comm_fwd
     t_bwd_dx += t_comm_bwd
@@ -131,6 +142,8 @@ def stage_time(
             t_fwd *= imb
             t_bwd_dx *= imb
             t_bwd_dw *= imb
+            t_comm_fwd *= imb
+            t_comm_bwd *= imb
 
     t_bwd = t_bwd_dx + t_bwd_dw
     return StageTime(

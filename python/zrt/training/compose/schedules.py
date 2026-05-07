@@ -382,10 +382,13 @@ def pipeline_step_time(
         layer_ids = stage_ids[s]
         stage_ops = graph.ops_for_stage(layer_ids)
 
-        # Collectives belonging to this stage
         stage_colls = [
             c for c in graph.collectives
-            if any(c.inserted_after.startswith(f"L{lid}") for lid in layer_ids)
+            if any(
+                (c.inserted_after and c.inserted_after.startswith(f"L{lid}")) or
+                (c.inserted_before and c.inserted_before.startswith(f"L{lid}"))
+                for lid in layer_ids
+            )
         ]
 
         st = stage_time(stage_ops, stage_colls, model, system, strategy)

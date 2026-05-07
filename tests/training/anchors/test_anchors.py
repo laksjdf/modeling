@@ -17,7 +17,7 @@ ANCHOR_DIR = Path(__file__).parent
 
 
 def _load_anchor(yaml_path: Path) -> dict:
-    return yaml.safe_load(yaml_path.read_text())
+    return yaml.safe_load(yaml_path.read_text(encoding='utf-8'))
 
 
 @pytest.mark.parametrize("yaml_file", sorted(ANCHOR_DIR.glob("*.yaml")))

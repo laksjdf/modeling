@@ -17,28 +17,31 @@ def collective_time(c: Collective, group_size: int, tier: NetTier) -> float:
     Uses the alpha-beta model:
       alpha = per-link latency (seconds)
       beta = per-byte transfer time (seconds/byte) = 1 / (bw_bytes_per_sec)
+
+    For P2P with multiple rounds (Ring CP), the total time is:
+      rounds × (alpha + S × beta)
+
+    Note: When P2P overlaps with compute, only exposed portion counts.
     """
     alpha = tier.latency_us * 1e-6
-    bw_bytes = tier.bw_gbps * 1e9 / 8  # convert GB/s to bytes/s
+    bw_bytes = tier.bw_gbps * 1e9 / 8
     beta = 1.0 / bw_bytes if bw_bytes > 0 else float("inf")
 
     N = group_size
     S = c.bytes_
+    rounds = c.rounds
 
     if c.kind in ("AG", "RS"):
-        # Ring algorithm: (N-1) steps of S/N bytes each
         return (N - 1) * (alpha + (S / N) * beta)
 
     if c.kind == "AR":
-        # Ring all-reduce = AG + RS
         return 2 * (N - 1) * (alpha + (S / N) * beta)
 
     if c.kind == "A2A":
-        # Each rank sends S/N to each of N-1 peers
         return (N - 1) * (alpha + (S / N) * beta)
 
     if c.kind == "P2P":
-        return alpha + S * beta
+        return rounds * (alpha + S * beta)
 
     return 0.0
 
@@ -50,22 +53,21 @@ def tier_for_group(
 
     If all ranks in the group are on one node, use intra_node.
     Otherwise use inter_node.
+
+    TP and CP are typically within a node due to their small group sizes.
     """
     intra = system.intra_tier()
     inter = system.inter_tier()
 
-    if group in ("TP",) and group_size <= system.gpus_per_node:
-        # TP is typically within a node
+    if group in ("TP", "CP") and group_size <= system.gpus_per_node:
         return intra if intra else inter
 
     if group in ("DP",) and group_size <= system.gpus_per_node:
         return intra if intra else inter
 
     if group in ("PP",):
-        # PP P2P: depends on rank placement; default to inter
         return inter if inter else intra
 
-    # Default: if group fits in one node use intra, else inter
     if group_size <= system.gpus_per_node and intra:
         return intra
     return inter if inter else (intra if intra else NetTier("default", 0, 0, "unknown"))

@@ -694,6 +694,6 @@ def build_graph(model: ModelSpec, strategy: Strategy) -> Graph:
 
     # Apply sharding and insert collectives
     shard = ShardPlan(strategy)
-    insert_collectives(graph, shard, model)
+    insert_collectives(graph, model, strategy)
 
     return graph

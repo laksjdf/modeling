@@ -2,13 +2,28 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 
+
+def _check_torch_available():
+    """Check if torch is available."""
+    try:
+        import torch
+        return True
+    except ImportError:
+        return False
+
+
+@pytest.mark.skipif(not _check_torch_available(), reason="torch not installed")
 class _Report:
     def summary(self) -> str:
         return "graph-native report"
 
 
 def test_train_hw_cli_delegates_to_graph_native_modeller(monkeypatch, capsys):
+    if not _check_torch_available():
+        pytest.skip("torch not installed")
+    
     from python.zrt import cli
 
     calls = []

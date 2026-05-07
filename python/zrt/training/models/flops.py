@@ -70,27 +70,38 @@ def _attn_cost(op: Op, model: ModelSpec) -> OpCost:
     d = op.meta.get("head_dim", 0)
     causal = op.meta.get("causal", True)
 
-    # Sharded heads
-    tp_factor = 1
-    if model.num_heads > h > 0:
-        tp_factor = model.num_heads // h
+    # Note: shard.py has already modified s and heads metadata to reflect
+    # TP/CP sharding. We directly use the modified values here:
+    # - Ulysses CP: s -> s/cp, heads -> heads_tp * cp
+    #   FLOPs = 2 × b × (s/cp) × (s/cp) × (heads_tp × cp) × d
+    #         = 2 × b × s × s × heads_tp × d / cp
+    # - Ring CP: s -> s/cp, heads unchanged, cp_tiles = cp
+    #   FLOPs = cp × [2 × b × (s/cp) × (s/cp) × heads_tp × d]
+    #         = 2 × b × s × s × heads_tp × d / cp
+    #   Note: Ring has cp rounds of attention, each round uses (s/cp) query length,
+    #   but accesses full s KV length (handled by P2P通信).
+    #   The meta["s"] is切分后的值, so we need to multiply by cp_tiles to get total FLOPs.
+    # - TP: heads -> heads/tp
+    # The FLOPs formula automatically accounts for sharding through these modified values.
 
     compression_ratio = _attn_compression_ratio(
         op.meta.get("attn_compression_ratio", model.attn_compression_ratio)
     )
 
-    # Fwd: flash-attn ≈ 2*b*s^2*h*d for causal (halved due to causal mask)
-    # Non-causal: 4*b*s^2*h*d
     mult = 2.0 if causal else 4.0
     fwd = mult * b * s * s * h * d * compression_ratio
 
-    # Bwd derives from compressed fwd, so dx inherits the same CSA/HCA ratio.
+    # Ring-CP: multiply by cp_tiles to account for multiple rounds
+    # Ulysses-CP: heads已经乘cp，所以不需要额外因子
+    if op.meta.get("cp_tiles", 0) > 1:
+        fwd *= op.meta.get("cp_tiles", 1)
+
     dx = 2.5 * fwd
 
     return OpCost(
         fwd_flops=fwd,
         dx_flops=dx,
-        dw_flops=0.0,  # Attention has no learnable parameters
+        dw_flops=0.0,
     )
 
 

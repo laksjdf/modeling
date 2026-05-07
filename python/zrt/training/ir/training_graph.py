@@ -47,6 +47,9 @@ class Collective:
     bytes_: int     # per-rank payload in bytes
     inserted_after: str | None = None  # op name it follows
     inserted_before: str | None = None  # op name it precedes
+    rounds: int = 1  # number of rounds for P2P (Ring CP)
+    overlap: bool = False  # whether this communication overlaps with compute
+    phase: str = "fwd"  # "fwd" | "bwd" | "both"
 
     @property
     def payload_mb(self) -> float:
