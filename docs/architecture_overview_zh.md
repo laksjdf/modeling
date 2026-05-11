@@ -181,7 +181,8 @@ CLAUDE.md 描述了 `python/zrt/training/builtins/`，但仓库中只剩下空 `
                  │     │ 选 _COMPOSERS[strategy.pp_schedule] 计算 step_time / bubble_fraction
                  │     │ memory_breakdown / compute_mfu / compute_hfu (recompute_overhead_flops)
                  │     └── StepResult
-                 └── Report（含 step_time_ms / mfu / hfu / memory / per_stage / warnings）
+                 └── TrainingReport（含 step_time_ms / mfu / hfu / memory / per_stage / warnings）
+                    （`Report = TrainingReport` 向后兼容别名保留于 `estimator.py:22`）
 ```
 
 ---
@@ -348,7 +349,7 @@ CLAUDE.md 描述了 `python/zrt/training/builtins/`，但仓库中只剩下空 `
 见 §3.5（OpGraph 版三 Pass）。
 
 ### 4.4 优化 Pass（`optim/passes.py`）
-- `QuantizationPass`：给 compute 节点写 `quant_weight/quant_act` 注解；不真正换 op_type。
+- `QuantizationPass`：给 compute 节点写 `quant_weight/quant_act` 注解；不真正换 op_type。通过 `--quant DTYPE` CLI 参数激活（内部构造 `QuantConfig(weight=dtype, activation=dtype)` 注入 `TransformContext`）；`ctx.quant is None` 时 Pass 永久跳过。
 - `SharedExpertPass`：scope 含 `shared_expert` → `shared_expert_external=True`。
 - `EPLBPass / MTPPass`：**stub，只 return 输入图**（见 TODO 总览）。
 
@@ -367,7 +368,8 @@ CLAUDE.md 描述了 `python/zrt/training/builtins/`，但仓库中只剩下空 `
 
 - **RooflinePass**（`passes.py:112`）  
   `compute_us = flops/peak`，`memory_us = (R+W)/bw`，`latency_us=max(...)`，分类 `bound∈{compute,memory,latency}`。  
-  保留预先注入的 `latency_us`（测试或 profiling 注入场景）。
+  保留预先注入的 `latency_us`（测试或 profiling 注入场景）。  
+  compute 节点的 peak TFLOPS dtype 由 `_effective_compute_dtype()` 确定：优先读 `quant_act` 注解（假设量化分析路径），其次用 `inputs[0].dtype`（激活 dtype 决定张量核算子类），最后回退到输出 dtype（非 compute 节点或无输入节点）。
 
 - **CommLatencyPass**（`comm_latency.py`）  
   通信节点用 α-β + 集合形 ring/ tree 公式（`_estimate_comm_latency`）覆盖通用 Roofline 估计；自动判断是否跨节点（`group_size > intra_node.num_devices`）。
@@ -377,8 +379,8 @@ CLAUDE.md 描述了 `python/zrt/training/builtins/`，但仓库中只剩下空 `
   写 `stream_id / stream_type / overlap_type`。`overlap_type` 通过 `overlap_target.startswith("fa_tile:")→ring_cp`，`attrs.fused_ag_matmul→mc2`，`attrs.coc_tile_k→coc`，否则 `none`。
 
 - **TrainingFlopsPass / TrainingMemoryPass / TrainingPipelinePass**（`analysis/training.py`）  
-  - TrainingFlopsPass：拼接图（`fwd_bwd_stitched=True`）按 `phase` 切分前后向 FLOPs；非拼接图退化为 dx+dw 估算；最后兜底用 6P 规则。还按 layer_scale 把"实际跟踪层数"放大到"完整层数"。`recompute_flops = ½·flops_fwd[recompute=true 且 phase=fwd]`。
-  - TrainingMemoryPass：weights/grads/opt_state 按 `metadata["zero"]` 或 zero stage 自推；activations 走两条路：①拼接图内取 fwd→bwd 边活字节再除以 `tp×cp`；②退化到 Korthikanti `34·h·s·L·bs · rc_mult / (tp·cp) · max_inflight`，其中按 stage_id 计算 peak inflight。
+  - TrainingFlopsPass：拼接图（`fwd_bwd_stitched=True`）按 `phase` 切分前后向 FLOPs；非拼接图退化为 dx+dw 估算；6P 规则**仅在 `forward_flops == 0 and backward_flops == 0` 时作兜底**，不覆盖逐节点值。还按 layer_scale 把"实际跟踪层数"放大到"完整层数"。`recompute_flops = ½·flops_fwd[recompute=true 且 phase=fwd]`。
+  - TrainingMemoryPass：weights/grads/opt_state 按 `metadata["zero"]` 或 zero stage 自推；activations 走两条路：①拼接图内取 fwd→bwd 边活字节再除以 `tp×cp`（`_graph_native_activations()`）；②退化到 Korthikanti `34·h·s·L·bs · rc_mult / (tp·cp) · max_inflight`，`rc_mult` 由 `_derive_recompute_multiplier()` 从 recompute 注解或 `recompute_policy` 动态推导，按 stage_id 计算 peak inflight。
   - TrainingPipelinePass：见业务流 B 描述；最重要的是它**不重算** stage time——直接拿 DAGScheduler 调度结果给 PipelineComposer。
 
 ### 4.7 `analysis/modeller.py`
@@ -437,6 +439,8 @@ CLAUDE.md 描述了 `python/zrt/training/builtins/`，但仓库中只剩下空 `
 
 ## 6. 训练子系统（`zrt.training`，独立）
 
+> **设计定位（Stack A）**：`zrt.training` 是规格驱动的快速估算路径，服务于搜索/扫描场景，无需真实图捕获。图捕获路径（Stack B，`transform/analysis/modeller.py`）为主路径，提供真实算子级精度。两路均共享 `PipelineComposer` 类（`training/compose/schedules.py`）。**两条路径均返回 `TrainingReport`**（定义于 `training/spec/report.py`）；Stack A 保留 `Report = TrainingReport` 向后兼容别名（`estimator.py:22`）。详见 `docs/training_modeller_zh.md`。
+
 ### 6.1 Spec 层
 - `spec/model.py:ModelSpec`：geometry + `layers: list[LayerKind]` + MoE/MTP 字段 + `attn_compression_ratio`（构造期校验 ∈ (0,1]）+ 各 dtype。`total_params() / effective_params_for_flops()`（MoE 用 `top_k/num_experts` 缩放）。
 - `spec/strategy.py:Strategy`：tp/cp/pp/ep/dp + micro/global_batch + `pp_schedule(PPSched)` + vpp + `cp_kind` + zero + recompute(`RecomputePolicy.per_layer`) + offload + tp_overlap(`TPOverlap`) + `dualbatch / dp_overlap_in_bubble` + optimizer。  
@@ -489,12 +493,31 @@ CLAUDE.md 描述了 `python/zrt/training/builtins/`，但仓库中只剩下空 `
 
 ---
 
-## 7. TODO / 未完成项总览（精确定位）
+## 7. TODO / 开放项总览（精确定位）
+
+### 7.0 已解决项（近期已完成）
+
+| 原问题 | 解决方式 | 参考 |
+|--------|---------|------|
+| Stack A `estimate()` 返回 `Report` 而非 `TrainingReport` | `TrainingReport` 移至 `training/spec/report.py`；两条路径均返回 `TrainingReport` | `estimator.py:22,25` |
+| `TrainingFlopsPass` 6P 规则有时覆盖逐节点 FLOPs | 6P 规则改为仅在 `forward_flops==0` 时触发 | `training.py:79–92` |
+| PP>1 时按 pp 平均 stage time（`fwd /= pp`）为**主路径** | 主路径改为逐阶段 DAGScheduler；`fwd/pp` 仅在无 `stage_id` 注解时作 fallback warning | `training.py:423–469` |
+| TrainingMemoryPass 激活内存使用固定系数（不感知 recompute/CP）| 引入动态 `_derive_recompute_multiplier()`；图原生路径优先 | `training.py:228–326` |
+| `PipelineParallelPass` 未按 `compute_us` 装箱 + 未插 P2P 节点 | 贪心装箱 + 跨 stage 边替换为 `comm.send_recv` | `pipeline_parallel.py:84–234` |
+
+---
+
+### 7.0 已解决项
+
+| 问题 | 修复方案 | 文件 |
+|------|---------|------|
+| `QuantizationPass` 永久被跳过：所有 `TransformContext` 构造点均未设 `ctx.quant`，无 CLI 入口 | 新增 `--quant DTYPE` CLI 参数；`QuantConfig` 注入推理和训练路径的 `TransformContext` | `python/zrt/cli.py` |
+| `RooflinePass` 对量化节点使用错误 dtype（输出 BF16）查询 peak TFLOPS，应为输入 INT8/FP8 | 新增 `_effective_compute_dtype()` 辅助函数：compute 节点优先读 `quant_act` 注解，其次用 `inputs[0].dtype`；FP8 别名归一化为 `fp8_e4m3` | `python/zrt/transform/analysis/passes.py` |
 
 ### 7.1 显式 `TODO Phase 3` 标注（5 处）
 | 文件:行 | 内容 |
 |---|---|
-| `python/zrt/training/trace/exporter.py:34` | TODO：当 graph-native per-stage timelines 可用后，给 chrome trace 加 stage_id/phase/CP/DP/EP overlap 标签。 |
+| `python/zrt/training/trace/exporter.py:34` | TODO：给 chrome trace 加 stage_id/phase/CP/DP/EP overlap 标签。**graph-native per-stage timelines 现已可用**（`training.py:415–469`），此 TODO 现已具备实施条件。 |
 | `python/zrt/training/compose/pipeline.py:331` | TODO：`pipeline_step_time` 应改为消费 executor 提供的 per-stage timelines（取代现在公式驱动的 stage_time）。 |
 | `python/zrt/training/search/space.py:22` | TODO：`enable_cross_node_tp_pruning / enable_cp_pruning / enable_ep_pruning` 三个剪枝规则依赖 CP/EP 实现就绪，目前是保守默认值。 |
 | `python/zrt/training/search/estimator.py:123` | TODO：`pareto_frontier` 目前只按 `(step_time, memory)` 简单求 Pareto；没强制 CP/EP/跨节点 TP 等通信成本约束。 |
@@ -547,8 +570,8 @@ CLAUDE.md 描述了 `python/zrt/training/builtins/`，但仓库中只剩下空 `
 ### 7.9 占位 latency
 - `python/zrt/executor/scheduler.py:13, 127` 文档说明：节点既无 `latency_us` 注解又无 `hw_spec` 时，`1µs` 占位（无报错）。
 
-### 7.10 调度器关于 PP 的弱化路径
-- `python/zrt/transform/analysis/training.py:393-405`：当 PP>1 但节点没有 `stage_id` 注解时，整图调度后 `fwd /= pp` 平均估计——会丢真实 stage 异质性与 warmup/cooldown 结构，仅作 fallback warning。
+### 7.10 调度器关于 PP 的弱化路径（fallback only）
+- ~~`python/zrt/transform/analysis/training.py:393-405`~~：`fwd /= pp` 平均估计路径**已降为次要 fallback**。主路径（`training.py:423–469`）当 PP>1 且节点有 `stage_id` 注解时，对每个阶段子图分别运行 `DAGScheduler`，得到真实 per-stage latency；仅在节点缺少 `stage_id` 注解时回退到 `fwd /= pp`，并输出 warning。此项问题已于阶段 A.1 解决（见 §7.0）。
 
 ### 7.11 dispatch 阶段的反向边裁剪
 - `python/zrt/ir/adapter.py:181-186, 326-331`：`producer_idx > consumer_idx` 时跳过该边，注释解释是为了规避 KV 缓存别名导致的"反向引用"。这是设计取舍，不算 bug，但若未来切换捕获逻辑可能误删合法环（OpGraph.topo_sort 只在显式环时报错，所以不会沉默崩溃）。
@@ -558,6 +581,20 @@ CLAUDE.md 描述了 `python/zrt/training/builtins/`，但仓库中只剩下空 `
 
 ### 7.13 builtins 子包消失
 - `python/zrt/training/builtins/` 目录在源码层面只剩 `__pycache__`——CLAUDE.md 中提到的 `builtins/registry.py` 似乎被删除/迁移，仓库 grep 不到任何 `builtins.registry` 引用。属于"文档落后于代码"的痕迹。
+
+### 7.14 `QuantizationPass` 死代码路径 —— `ctx.quant` 从未被设置
+- `python/zrt/transform/optim/passes.py:18`：`QuantizationPass.run()` 首行 `if ctx.quant is None: return graph`，永远走早退路径。
+- 所有 `TransformContext` 构造点（`cli.py`、`modeller.py`、`transform_runner.py`）均未传入 `quant=` 参数；CLI 也没有 `--quant` 标志。
+- `pipeline.py:103` 的注册条件 `condition=lambda c: c.quant is not None` 始终为 False。
+- 影响：`QuantizationPass` 写入的 `quant_weight` / `quant_act` 注解永远不会被写入图中。
+- **修复方向**：在 `cli.py` 中增加 `--quant <dtype>` 标志，并在构造 `TransformContext` 时传入 `QuantConfig(weight=args.quant)`。
+
+### 7.15 `RooflinePass` 对量化节点使用了错误的峰值 TFLOPS
+- `python/zrt/transform/analysis/passes.py:141`：`peak = hw.peak_flops(node.outputs[0].dtype)`。
+- 对于量化矩阵乘（如 W8A8：输入为 INT8，输出为 BF16），输出 dtype=BF16 → 误用 BF16 峰值（H100: 989 TFLOPS），而非 INT8 峰值（H100: 1978 TOPS），导致 `compute_us` 偏高 2×。
+- 底层基础设施已就绪：`DType` 含 INT8/FP8/INT4；`hw_spec.peak_flops()` 已映射所有量化 dtype；H100 YAML 含 `int8_tops: 1978`。
+- **修复方向**：对 `category == "compute"` 节点，改用激活输入 dtype（`inputs[0].dtype`）决定峰值吞吐量（激活 dtype 决定硬件 Tensor Core 调度路径：W8A16 激活为 BF16 → BF16 峰值；W8A8 激活为 INT8 → INT8 峰值）。同时检查 `quant_act` 注解，支持基于注解的假设量化分析路径。
+- **注意**：`_fmr()` 对各张量独立使用 `.dtype.itemsize`，读写字节数已正确反映量化 dtype，无需另行修复。
 
 ---
 
@@ -601,7 +638,7 @@ CLAUDE.md 描述了 `python/zrt/training/builtins/`，但仓库中只剩下空 `
 
       Spec-based (training only):
           YAML → load_specs → estimate → build_graph → op_cost → stage_time
-          → pipeline_step_time → Report
+          → pipeline_step_time → TrainingReport
 ```
 
 ---

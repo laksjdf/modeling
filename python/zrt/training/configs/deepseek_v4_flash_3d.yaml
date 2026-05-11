@@ -1,0 +1,27 @@
+# DeepSeek-V4 671B-class training estimate — placeholder 3D parallel
+# References model spec from models/deepseek_v4.yaml + hw registry
+
+model: deepseek_v4_flash
+
+system:
+  hw: nvidia_h100_sxm
+  nodes: 8
+  gpus_per_node: 8
+  host_mem_gb: 2048
+
+strategy:
+  tp: 8
+  cp: 1
+  pp: 2
+  ep: 1            # EP rank-product policy still pending; keep ep=1 for now
+  dp: 4
+  micro_batch: 1
+  global_batch: 32
+  pp_schedule: 1f1b
+  zero_stage: 1
+  recompute:
+    per_layer:
+      moe: ["attn"]
+  offload: {opt_state: false, grads: false, params: false}
+  tp_overlap: none
+  optimizer: adam

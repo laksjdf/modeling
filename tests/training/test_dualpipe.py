@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from zrt.training.compose.pipeline import (
+from zrt.training.compose.schedules import (
     DualPipeComposer,
     DualPipeVComposer,
     OneF1BComposer,

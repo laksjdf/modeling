@@ -1,0 +1,463 @@
+/*
+ Navicat Premium Dump SQL
+
+ Source Server         : costmodel_database
+ Source Server Type    : MySQL
+ Source Server Version : 80029 (8.0.29)
+ Source Schema         : simulator
+
+ Target Server Type    : MySQL
+ Target Server Version : 80029 (8.0.29)
+ File Encoding         : 65001
+
+ Date: 29/04/2026 16:08:38
+*/
+
+SET NAMES utf8mb4;
+SET FOREIGN_KEY_CHECKS = 0;
+
+-- ----------------------------
+-- Table structure for sim_master_statistics_info
+-- ----------------------------
+DROP TABLE IF EXISTS `sim_master_statistics_info`;
+CREATE TABLE `sim_master_statistics_info`  (
+  `id` bigint NOT NULL AUTO_INCREMENT COMMENT '自增id',
+  `cluster_id` varchar(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL COMMENT '集群id',
+  `script_name` varchar(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NULL DEFAULT NULL COMMENT '集群运行的脚本名称',
+  `image_name` varchar(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NULL DEFAULT NULL COMMENT '集群使用的simulator镜像名称',
+  `master_count` int NULL DEFAULT NULL COMMENT '集群中master节点数量',
+  `worker_count` int NULL DEFAULT NULL COMMENT '集群中worker节点数量',
+  `task_status` tinyint NULL DEFAULT NULL COMMENT '集群任务状态，用于判断是否开始扫描日志 -1：任务未完成 0 ：已完成，扫日志进行中 1：完成日志扫描',
+  `unsupported_ops` text CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NULL COMMENT '不支持的算子集合',
+  `task_start_time` datetime NULL DEFAULT NULL COMMENT '集群任务开始时间',
+  `task_end_time` datetime NULL DEFAULT NULL COMMENT '集群任务结束时间',
+  `create_time` datetime NOT NULL COMMENT '记录插入时间',
+  `update_time` datetime NOT NULL COMMENT '记录最后修改时间',
+  PRIMARY KEY (`id`) USING BTREE,
+  UNIQUE INDEX `cluster_id_idx`(`cluster_id` ASC) USING BTREE COMMENT '集群id',
+  INDEX `create_time_idx`(`create_time` ASC) USING BTREE COMMENT '添加时间'
+) ENGINE = InnoDB AUTO_INCREMENT = 4 CHARACTER SET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci ROW_FORMAT = DYNAMIC;
+
+-- ----------------------------
+-- Table structure for sim_op_call_process
+-- ----------------------------
+DROP TABLE IF EXISTS `sim_op_call_process`;
+CREATE TABLE `sim_op_call_process`  (
+  `id` bigint UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键id',
+  `sim_scene` smallint NOT NULL COMMENT '仿真场景：50 llama2，51 llama3，52 deepseek等',
+  `sim_scene_key` varchar(512) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '仿真场景key',
+  `op_type` varchar(64) CHARACTER SET utf8 COLLATE utf8_general_ci NOT NULL COMMENT '算子类型',
+  `call_num` int NOT NULL COMMENT '算子调用次数',
+  `shape_align_type` varchar(128) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT 'shape对齐方式',
+  `data_type_key` varchar(32) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '数据类型key',
+  `stage_num` smallint NOT NULL COMMENT '所处阶段',
+  `gmt_create` datetime NOT NULL COMMENT '创建时间',
+  PRIMARY KEY (`id`) USING BTREE,
+  INDEX `idx_scene_op`(`sim_scene` ASC, `op_type` ASC) USING BTREE
+) ENGINE = InnoDB CHARACTER SET = utf8 COLLATE = utf8_general_ci COMMENT = '仿真算子调用过程表' ROW_FORMAT = DYNAMIC;
+
+-- ----------------------------
+-- Table structure for sim_op_collect_error
+-- ----------------------------
+DROP TABLE IF EXISTS `sim_op_collect_error`;
+CREATE TABLE `sim_op_collect_error`  (
+  `id` bigint UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键id',
+  `sim_scene` smallint NOT NULL COMMENT '仿真场景：0芯片场景，10仿真场景',
+  `sim_scene_key` varchar(512) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '仿真场景key',
+  `op_model_id` bigint UNSIGNED NOT NULL COMMENT '算子模型id',
+  `op_type` varchar(64) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '算子类型',
+  `input_shape` varchar(2048) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '输入shape，多个用;分隔',
+  `gmt_create` datetime NOT NULL COMMENT '创建时间',
+  PRIMARY KEY (`id`) USING BTREE,
+  INDEX `idx_scene_model`(`sim_scene` ASC, `sim_scene_key` ASC, `op_model_id` ASC) USING BTREE,
+  INDEX `idx_model_scene`(`op_model_id` ASC, `sim_scene` ASC) USING BTREE
+) ENGINE = InnoDB CHARACTER SET = utf8 COLLATE = utf8_general_ci COMMENT = '仿真采集失败算子表' ROW_FORMAT = DYNAMIC;
+
+-- ----------------------------
+-- Table structure for sim_op_model
+-- ----------------------------
+DROP TABLE IF EXISTS `sim_op_model`;
+CREATE TABLE `sim_op_model`  (
+  `id` bigint UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '算子模型id',
+  `op_type` varchar(64) CHARACTER SET utf8 COLLATE utf8_general_ci NOT NULL COMMENT '算子类型',
+  `op_version` varchar(32) CHARACTER SET utf8 COLLATE utf8_general_ci NOT NULL COMMENT '算子版本',
+  `hardware_version` varchar(32) CHARACTER SET utf8 COLLATE utf8_general_ci NOT NULL COMMENT '硬件版本',
+  `cann_version` varchar(32) CHARACTER SET utf8 COLLATE utf8_general_ci NOT NULL COMMENT 'CANN版本',
+  `pta_version` varchar(32) CHARACTER SET utf8 COLLATE utf8_general_ci NOT NULL COMMENT 'torch_npu版本',
+  `gmt_create` datetime NOT NULL COMMENT '创建时间',
+  `creator_code` varchar(32) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '创建人编码',
+  `creator_name` varchar(32) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '创建人名称',
+  `gmt_update` datetime NULL DEFAULT NULL COMMENT '更新时间',
+  `updater_code` varchar(32) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '更新人编码',
+  `updater_name` varchar(32) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '更新人名称',
+  `is_delete` tinyint NOT NULL COMMENT '是否删除：0正常，1逻辑删除',
+  PRIMARY KEY (`id`) USING BTREE,
+  INDEX `idx_op_hardware`(`op_type` ASC, `hardware_version` ASC) USING BTREE
+) ENGINE = InnoDB AUTO_INCREMENT = 1844 CHARACTER SET = utf8 COLLATE = utf8_general_ci COMMENT = '仿真算子模型表' ROW_FORMAT = DYNAMIC;
+
+-- ----------------------------
+-- Table structure for sim_op_parallel_model_log
+-- ----------------------------
+DROP TABLE IF EXISTS `sim_op_parallel_model_log`;
+CREATE TABLE `sim_op_parallel_model_log`  (
+  `id` bigint UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键id',
+  `sim_scene` smallint NOT NULL COMMENT '仿真场景：0芯片场景，10仿真场景',
+  `sim_scene_key` varchar(512) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '仿真场景key',
+  `op_model_id` bigint UNSIGNED NOT NULL COMMENT '算子模型id',
+  `input_shape` varchar(2048) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '输入shape，多个用;分隔',
+  `input_data_type` varchar(256) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '输入数据类型，多个用;分隔',
+  `input_data_format` varchar(256) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '输入数据格式，多个用;分隔',
+  `output_shape` varchar(2048) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '输出shape',
+  `output_data_type` varchar(128) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '输出数据类型，多个用;分隔',
+  `output_data_format` varchar(128) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '输出数据格式，多个用;分隔',
+  `original_input` text CHARACTER SET utf8 COLLATE utf8_general_ci NULL COMMENT '原始输入，json格式',
+  `original_output` varchar(2048) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '原始输出，json格式',
+  `attribute` varchar(1024) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '属性，json格式',
+  `stage_num` tinyint NULL DEFAULT NULL COMMENT '算子阶段：0普通阶段，1缓存阶段',
+  `npu_id` int NULL DEFAULT NULL COMMENT 'NPU ID，即进程id',
+  `gmt_create` datetime NOT NULL COMMENT '创建时间',
+  PRIMARY KEY (`id`) USING BTREE,
+  INDEX `idx_scene_model`(`sim_scene` ASC, `sim_scene_key` ASC, `op_model_id` ASC) USING BTREE,
+  INDEX `idx_model_scene`(`op_model_id` ASC, `sim_scene` ASC) USING BTREE
+) ENGINE = InnoDB AUTO_INCREMENT = 3 CHARACTER SET = utf8 COLLATE = utf8_general_ci COMMENT = '仿真算子并行模型日志表' ROW_FORMAT = DYNAMIC;
+
+-- ----------------------------
+-- Table structure for sim_op_profiling_data
+-- ----------------------------
+DROP TABLE IF EXISTS `sim_op_profiling_data`;
+CREATE TABLE `sim_op_profiling_data`  (
+  `id` bigint UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键id',
+  `sim_scene` smallint NULL DEFAULT NULL COMMENT '仿真场景：0芯片场景，10仿真场景',
+  `sim_scene_key` varchar(512) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '仿真场景key',
+  `op_model_id` bigint UNSIGNED NOT NULL COMMENT '算子模型id',
+  `op_shape_id` bigint UNSIGNED NOT NULL COMMENT '算子shape id',
+  `data_type` tinyint NOT NULL COMMENT '数据类型：0训练数据，1测试数据',
+  `data_type_key` varchar(32) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '数据类型key',
+  `stream_id` int NULL DEFAULT NULL COMMENT '流id',
+  `task_id` int NULL DEFAULT NULL COMMENT '任务id',
+  `task_type` varchar(32) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '任务类型',
+  `task_start_time` decimal(20, 4) NULL DEFAULT NULL COMMENT '任务开始时间，单位us',
+  `task_duration` decimal(16, 4) NULL DEFAULT NULL COMMENT '任务持续时间，单位us',
+  `task_wait_time` decimal(16, 4) NULL DEFAULT NULL COMMENT '任务等待时间，单位us',
+  `block_dim` int NULL DEFAULT NULL COMMENT '阻塞维度',
+  `mix_block_dim` int NULL DEFAULT NULL COMMENT '混合块维度',
+  `stage_num` smallint NULL DEFAULT NULL COMMENT '所处阶段：0普通阶段，1缓存阶段',
+  `op_state` smallint NULL DEFAULT NULL COMMENT '算子状态，0 dynamic, 1 static',
+  `hf32_eligible` tinyint NULL DEFAULT NULL COMMENT 'HF32使能，0 No, 1 Yes',
+  `input_shape` varchar(2048) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '输入shape，多个用;分隔',
+  `input_data_type` varchar(2048) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '输入数据类型，多个用;分隔',
+  `input_data_format` varchar(512) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '输入数据格式，多个用;分隔',
+  `output_shape` varchar(2048) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '输出shape',
+  `output_data_type` varchar(128) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '输出数据类型，多个用;分隔',
+  `output_data_format` varchar(128) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '输出数据格式，多个用;分隔',
+  `total_cycle_cnt` bigint UNSIGNED NULL DEFAULT NULL COMMENT '总循环数',
+  `aicore_time` decimal(16, 4) NULL DEFAULT NULL COMMENT '核心时间，单位us',
+  `predict_time` decimal(16, 4) NULL DEFAULT NULL COMMENT '预测时间，单位us',
+  `original_input` text CHARACTER SET utf8 COLLATE utf8_general_ci NULL COMMENT '原始输入，json格式',
+  `original_output` varchar(2048) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '原始输出，json格式',
+  `attribute` varchar(1024) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '属性，json格式',
+  `gmt_create` datetime NOT NULL COMMENT '创建时间',
+  `gmt_update` datetime NULL DEFAULT NULL COMMENT '更新时间',
+  `is_delete` tinyint NULL DEFAULT NULL COMMENT '是否删除：0正常，1逻辑删除',
+  PRIMARY KEY (`id`) USING BTREE,
+  INDEX `idx_model_shape`(`op_model_id` ASC, `op_shape_id` ASC) USING BTREE,
+  INDEX `idx_scene_model`(`sim_scene` ASC, `sim_scene_key` ASC, `op_model_id` ASC) USING BTREE,
+  INDEX `idx_model_scene`(`op_model_id` ASC, `sim_scene` ASC) USING BTREE,
+  INDEX `idx_comm_query`(`op_model_id` ASC, `stage_num` ASC, `op_state` ASC, `sim_scene` ASC, `sim_scene_key` ASC) USING BTREE,
+  INDEX `idx_data_type`(`op_model_id` ASC, `data_type` ASC, `stage_num` ASC, `op_state` ASC) USING BTREE
+) ENGINE = InnoDB AUTO_INCREMENT = 2049472512827461633 CHARACTER SET = utf8 COLLATE = utf8_general_ci COMMENT = '仿真算子分析数据表' ROW_FORMAT = DYNAMIC;
+
+-- ----------------------------
+-- Table structure for sim_op_profiling_data_ext
+-- ----------------------------
+DROP TABLE IF EXISTS `sim_op_profiling_data_ext`;
+CREATE TABLE `sim_op_profiling_data_ext`  (
+  `id` bigint UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键id',
+  `profiling_data_id` bigint UNSIGNED NOT NULL COMMENT '分析数据id',
+  `sim_scene` smallint NULL DEFAULT NULL COMMENT '仿真场景：0芯片场景，10仿真场景',
+  `sim_scene_key` varchar(512) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '仿真场景key',
+  `op_model_id` bigint UNSIGNED NOT NULL COMMENT '算子模型id',
+  `op_shape_id` bigint UNSIGNED NOT NULL COMMENT '算子shape id',
+  `data_type` tinyint NOT NULL COMMENT '数据类型：0训练数据，1测试数据',
+  `vec_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'vec时间，单位us',
+  `vec_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'vec时间占比',
+  `mac_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'mac时间，单位us',
+  `mac_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'mac时间占比',
+  `scalar_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'scalar时间，单位us',
+  `scalar_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'scalar时间占比',
+  `mte1_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'met1时间，单位us',
+  `mte1_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'mte1时间占比',
+  `mte2_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'met2时间，单位us',
+  `mte2_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'mte2时间占比',
+  `mte3_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'met3时间，单位us',
+  `mte3_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'mte3时间占比',
+  `fixpipe_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'fixpipe时间，单位us',
+  `fixpipe_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'fixpipe时间占比',
+  `icache_miss_rate` decimal(8, 6) NULL DEFAULT NULL COMMENT '缓存遗失率',
+  `memory_bound` decimal(16, 4) NULL DEFAULT NULL COMMENT '内存边界',
+  `cube_utilization` decimal(8, 4) NULL DEFAULT NULL COMMENT '立方体利用率，单位%',
+  `mem_size` int NULL DEFAULT NULL COMMENT '内存大小',
+  `mem_real_size` int NULL DEFAULT NULL COMMENT '内存实际大小',
+  `ub_read_bw` decimal(10, 6) NULL DEFAULT NULL COMMENT 'ub读速率，单位GB/s',
+  `ub_write_bw` decimal(10, 6) NULL DEFAULT NULL COMMENT 'ub写速率，单位GB/s',
+  `l1_read_bw` decimal(10, 6) NULL DEFAULT NULL COMMENT 'l1读速率，单位GB/s',
+  `l1_write_bw` decimal(10, 6) NULL DEFAULT NULL COMMENT 'l1写速率，单位GB/s',
+  `main_mem_read_bw` decimal(10, 6) NULL DEFAULT NULL COMMENT '主内存读速率，单位GB/s',
+  `main_mem_write_bw` decimal(10, 6) NULL DEFAULT NULL COMMENT '主内存写速率，单位GB/s',
+  `hit_rate` decimal(8, 6) NULL DEFAULT NULL COMMENT 'hit率',
+  `victim_rate` decimal(8, 6) NULL DEFAULT NULL COMMENT 'victim率',
+  `aiv_total_cycle_cnt` bigint UNSIGNED NULL DEFAULT NULL COMMENT 'aiv总循环数',
+  `aiv_core_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'aiv核心时间，单位us',
+  `aiv_vec_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'vec时间，单位us',
+  `aiv_vec_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'vec时间占比',
+  `aiv_mac_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'mac时间，单位us',
+  `aiv_mac_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'mac时间占比',
+  `aiv_scalar_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'scalar时间，单位us',
+  `aiv_scalar_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'scalar时间占比',
+  `aiv_mte1_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'met1时间，单位us',
+  `aiv_mte1_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'mte1时间占比',
+  `aiv_mte2_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'met2时间，单位us',
+  `aiv_mte2_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'mte2时间占比',
+  `aiv_mte3_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'met3时间，单位us',
+  `aiv_mte3_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'mte3时间占比',
+  `aiv_icache_miss_rate` decimal(8, 6) NULL DEFAULT NULL COMMENT '缓存遗失率',
+  `aiv_cube_utilization` decimal(8, 4) NULL DEFAULT NULL COMMENT '立方体利用率，单位%',
+  `gmt_create` datetime NOT NULL COMMENT '创建时间',
+  `is_delete` tinyint NULL DEFAULT NULL COMMENT '是否删除：0正常，1逻辑删除',
+  PRIMARY KEY (`id`) USING BTREE,
+  INDEX `idx_profiling_data_id`(`profiling_data_id` ASC) USING BTREE,
+  INDEX `idx_model_shape`(`op_model_id` ASC, `op_shape_id` ASC) USING BTREE,
+  INDEX `idx_scene_model`(`sim_scene` ASC, `sim_scene_key` ASC, `op_model_id` ASC) USING BTREE
+) ENGINE = InnoDB AUTO_INCREMENT = 2049100190903832587 CHARACTER SET = utf8 COLLATE = utf8_general_ci COMMENT = '仿真算子分析数据扩展表' ROW_FORMAT = DYNAMIC;
+
+-- ----------------------------
+-- Table structure for sim_op_profiling_data_gpt4
+-- ----------------------------
+DROP TABLE IF EXISTS `sim_op_profiling_data_gpt4`;
+CREATE TABLE `sim_op_profiling_data_gpt4`  (
+  `id` bigint UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键id',
+  `sim_scene` smallint NULL DEFAULT NULL COMMENT '仿真场景：0芯片场景，10仿真场景',
+  `sim_scene_key` varchar(512) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '仿真场景key',
+  `op_model_id` bigint UNSIGNED NOT NULL COMMENT '算子模型id',
+  `op_shape_id` bigint UNSIGNED NOT NULL COMMENT '算子shape id',
+  `data_type` tinyint NOT NULL COMMENT '数据类型：0训练数据，1测试数据',
+  `data_type_key` varchar(32) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '数据类型key',
+  `stream_id` int NULL DEFAULT NULL COMMENT '流id',
+  `task_id` int NULL DEFAULT NULL COMMENT '任务id',
+  `task_type` varchar(32) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '任务类型',
+  `task_start_time` decimal(20, 4) NULL DEFAULT NULL COMMENT '任务开始时间，单位us',
+  `task_duration` decimal(16, 4) NULL DEFAULT NULL COMMENT '任务持续时间，单位us',
+  `task_wait_time` decimal(16, 4) NULL DEFAULT NULL COMMENT '任务等待时间，单位us',
+  `block_dim` int NULL DEFAULT NULL COMMENT '块维度',
+  `mix_block_dim` int NULL DEFAULT NULL COMMENT '混合块维度',
+  `stage_num` smallint NULL DEFAULT NULL COMMENT '所处阶段：0普通阶段，1缓存阶段',
+  `op_state` smallint NULL DEFAULT NULL COMMENT '算子状态，0 dynamic, 1 static',
+  `hf32_eligible` tinyint NULL DEFAULT NULL COMMENT 'HF32使能，0 No, 1 Yes',
+  `input_shape` varchar(2048) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '输入shape，多个用;分隔',
+  `input_data_type` varchar(512) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '输入数据类型，多个用;分隔',
+  `input_data_format` varchar(256) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '输入数据格式，多个用;分隔',
+  `output_shape` varchar(2048) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '输出shape',
+  `output_data_type` varchar(128) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '输出数据类型，多个用;分隔',
+  `output_data_format` varchar(128) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '输出数据格式，多个用;分隔',
+  `total_cycle_cnt` bigint UNSIGNED NULL DEFAULT NULL COMMENT '总循环数',
+  `aicore_time` decimal(16, 4) NULL DEFAULT NULL COMMENT '核心时间，单位us',
+  `predict_time` decimal(16, 4) NULL DEFAULT NULL COMMENT '预测时间，单位us',
+  `original_input` text CHARACTER SET utf8 COLLATE utf8_general_ci NULL COMMENT '原始输入，json格式',
+  `original_output` varchar(2048) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '原始输出，json格式',
+  `attribute` varchar(1024) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '属性，json格式',
+  `gmt_create` datetime NOT NULL COMMENT '创建时间',
+  `gmt_update` datetime NULL DEFAULT NULL COMMENT '更新时间',
+  `is_delete` tinyint NULL DEFAULT NULL COMMENT '是否删除：0正常，1逻辑删除',
+  PRIMARY KEY (`id`) USING BTREE,
+  INDEX `idx_model_shape`(`op_model_id` ASC, `op_shape_id` ASC) USING BTREE,
+  INDEX `idx_scene_model`(`sim_scene` ASC, `sim_scene_key` ASC, `op_model_id` ASC) USING BTREE,
+  INDEX `idx_model_scene`(`op_model_id` ASC, `sim_scene` ASC) USING BTREE,
+  INDEX `idx_comm_query`(`op_model_id` ASC, `stage_num` ASC, `op_state` ASC, `sim_scene` ASC, `sim_scene_key` ASC) USING BTREE
+) ENGINE = InnoDB AUTO_INCREMENT = 1962816876736286727 CHARACTER SET = utf8 COLLATE = utf8_general_ci COMMENT = 'GPT4模型算子分析数据表' ROW_FORMAT = DYNAMIC;
+
+-- ----------------------------
+-- Table structure for sim_op_profiling_data_gpt4_ext
+-- ----------------------------
+DROP TABLE IF EXISTS `sim_op_profiling_data_gpt4_ext`;
+CREATE TABLE `sim_op_profiling_data_gpt4_ext`  (
+  `id` bigint UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键id',
+  `profiling_data_id` bigint UNSIGNED NOT NULL COMMENT '分析数据id',
+  `sim_scene` smallint NULL DEFAULT NULL COMMENT '仿真场景：0芯片场景，10仿真场景',
+  `sim_scene_key` varchar(512) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '仿真场景key',
+  `op_model_id` bigint UNSIGNED NOT NULL COMMENT '算子模型id',
+  `op_shape_id` bigint UNSIGNED NOT NULL COMMENT '算子shape id',
+  `data_type` tinyint NOT NULL COMMENT '数据类型：0训练数据，1测试数据',
+  `vec_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'vec时间，单位us',
+  `vec_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'vec时间占比',
+  `mac_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'mac时间，单位us',
+  `mac_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'mac时间占比',
+  `scalar_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'scalar时间，单位us',
+  `scalar_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'scalar时间占比',
+  `mte1_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'met1时间，单位us',
+  `mte1_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'mte1时间占比',
+  `mte2_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'met2时间，单位us',
+  `mte2_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'mte2时间占比',
+  `mte3_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'met3时间，单位us',
+  `mte3_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'mte3时间占比',
+  `fixpipe_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'fixpipe时间，单位us',
+  `fixpipe_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'fixpipe时间占比',
+  `icache_miss_rate` decimal(8, 6) NULL DEFAULT NULL COMMENT '缓存遗失率',
+  `memory_bound` decimal(16, 4) NULL DEFAULT NULL COMMENT '内存边界',
+  `cube_utilization` decimal(8, 4) NULL DEFAULT NULL COMMENT '立方体利用率，单位%',
+  `mem_size` int NULL DEFAULT NULL COMMENT '内存大小',
+  `mem_real_size` int NULL DEFAULT NULL COMMENT '内存实际大小',
+  `ub_read_bw` decimal(10, 6) NULL DEFAULT NULL COMMENT 'ub读速率，单位GB/s',
+  `ub_write_bw` decimal(10, 6) NULL DEFAULT NULL COMMENT 'ub写速率，单位GB/s',
+  `l1_read_bw` decimal(10, 6) NULL DEFAULT NULL COMMENT 'l1读速率，单位GB/s',
+  `l1_write_bw` decimal(10, 6) NULL DEFAULT NULL COMMENT 'l1写速率，单位GB/s',
+  `main_mem_read_bw` decimal(10, 6) NULL DEFAULT NULL COMMENT '主内存读速率，单位GB/s',
+  `main_mem_write_bw` decimal(10, 6) NULL DEFAULT NULL COMMENT '主内存写速率，单位GB/s',
+  `hit_rate` decimal(8, 6) NULL DEFAULT NULL COMMENT 'hit率',
+  `victim_rate` decimal(8, 6) NULL DEFAULT NULL COMMENT 'victim率',
+  `aiv_total_cycle_cnt` bigint UNSIGNED NULL DEFAULT NULL COMMENT 'aiv总循环数',
+  `aiv_core_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'aiv核心时间，单位us',
+  `aiv_vec_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'vec时间，单位us',
+  `aiv_vec_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'vec时间占比',
+  `aiv_mac_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'mac时间，单位us',
+  `aiv_mac_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'mac时间占比',
+  `aiv_scalar_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'scalar时间，单位us',
+  `aiv_scalar_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'scalar时间占比',
+  `aiv_mte1_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'met1时间，单位us',
+  `aiv_mte1_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'mte1时间占比',
+  `aiv_mte2_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'met2时间，单位us',
+  `aiv_mte2_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'mte2时间占比',
+  `aiv_mte3_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'met3时间，单位us',
+  `aiv_mte3_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'mte3时间占比',
+  `aiv_icache_miss_rate` decimal(8, 6) NULL DEFAULT NULL COMMENT '缓存遗失率',
+  `aiv_cube_utilization` decimal(8, 4) NULL DEFAULT NULL COMMENT '立方体利用率，单位%',
+  `gmt_create` datetime NOT NULL COMMENT '创建时间',
+  `is_delete` tinyint NULL DEFAULT NULL COMMENT '是否删除：0正常，1逻辑删除',
+  PRIMARY KEY (`id`) USING BTREE,
+  INDEX `idx_profiling_data_id`(`profiling_data_id` ASC) USING BTREE,
+  INDEX `idx_model_shape`(`op_model_id` ASC, `op_shape_id` ASC) USING BTREE,
+  INDEX `idx_scene_model`(`sim_scene` ASC, `sim_scene_key` ASC, `op_model_id` ASC) USING BTREE
+) ENGINE = InnoDB AUTO_INCREMENT = 1962816876736286728 CHARACTER SET = utf8 COLLATE = utf8_general_ci COMMENT = 'GPT4模型算子分析数据扩展表' ROW_FORMAT = DYNAMIC;
+
+-- ----------------------------
+-- Table structure for sim_op_profiling_data_model
+-- ----------------------------
+DROP TABLE IF EXISTS `sim_op_profiling_data_model`;
+CREATE TABLE `sim_op_profiling_data_model`  (
+  `id` bigint UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键id',
+  `sim_scene` smallint NULL DEFAULT NULL COMMENT '仿真场景：0芯片场景，10仿真场景',
+  `sim_scene_key` varchar(512) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '仿真场景key',
+  `op_model_id` bigint UNSIGNED NOT NULL COMMENT '算子模型id',
+  `op_shape_id` bigint UNSIGNED NOT NULL COMMENT '算子shape id',
+  `data_type` tinyint NOT NULL COMMENT '数据类型：0训练数据，1测试数据',
+  `data_type_key` varchar(32) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '数据类型key',
+  `stream_id` int NULL DEFAULT NULL COMMENT '流id',
+  `task_id` int NULL DEFAULT NULL COMMENT '任务id',
+  `task_type` varchar(32) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '任务类型',
+  `task_start_time` decimal(20, 4) NULL DEFAULT NULL COMMENT '任务开始时间，单位us',
+  `task_duration` decimal(16, 4) NULL DEFAULT NULL COMMENT '任务持续时间，单位us',
+  `task_wait_time` decimal(16, 4) NULL DEFAULT NULL COMMENT '任务等待时间，单位us',
+  `block_dim` int NULL DEFAULT NULL COMMENT '块维度',
+  `mix_block_dim` int NULL DEFAULT NULL COMMENT '混合块维度',
+  `stage_num` smallint NULL DEFAULT NULL COMMENT '所处阶段：0普通阶段，1缓存阶段',
+  `op_state` smallint NULL DEFAULT NULL COMMENT '算子状态，0 dynamic, 1 static',
+  `hf32_eligible` tinyint NULL DEFAULT NULL COMMENT 'HF32使能，0 No, 1 Yes',
+  `input_shape` varchar(2048) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '输入shape，多个用;分隔',
+  `input_data_type` varchar(512) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '输入数据类型，多个用;分隔',
+  `input_data_format` varchar(256) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '输入数据格式，多个用;分隔',
+  `output_shape` varchar(2048) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '输出shape',
+  `output_data_type` varchar(128) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '输出数据类型，多个用;分隔',
+  `output_data_format` varchar(128) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '输出数据格式，多个用;分隔',
+  `total_cycle_cnt` bigint UNSIGNED NULL DEFAULT NULL COMMENT '总循环数',
+  `aicore_time` decimal(16, 4) NULL DEFAULT NULL COMMENT '核心时间，单位us',
+  `predict_time` decimal(16, 4) NULL DEFAULT NULL COMMENT '预测时间，单位us',
+  `original_input` text CHARACTER SET utf8 COLLATE utf8_general_ci NULL COMMENT '原始输入，json格式',
+  `original_output` varchar(2048) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '原始输出，json格式',
+  `attribute` varchar(1024) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '属性，json格式',
+  `gmt_create` datetime NOT NULL COMMENT '创建时间',
+  `gmt_update` datetime NULL DEFAULT NULL COMMENT '更新时间',
+  `is_delete` tinyint NULL DEFAULT NULL COMMENT '是否删除：0正常，1逻辑删除',
+  PRIMARY KEY (`id`) USING BTREE,
+  INDEX `idx_model_shape`(`op_model_id` ASC, `op_shape_id` ASC) USING BTREE,
+  INDEX `idx_scene_model`(`sim_scene` ASC, `sim_scene_key` ASC, `op_model_id` ASC) USING BTREE,
+  INDEX `idx_model_scene`(`op_model_id` ASC, `sim_scene` ASC) USING BTREE,
+  INDEX `idx_comm_query`(`op_model_id` ASC, `stage_num` ASC, `op_state` ASC, `sim_scene` ASC, `sim_scene_key` ASC) USING BTREE
+) ENGINE = InnoDB AUTO_INCREMENT = 2048964323358937098 CHARACTER SET = utf8 COLLATE = utf8_general_ci COMMENT = '模型算子分析数据表' ROW_FORMAT = DYNAMIC;
+
+-- ----------------------------
+-- Table structure for sim_op_profiling_data_model_ext
+-- ----------------------------
+DROP TABLE IF EXISTS `sim_op_profiling_data_model_ext`;
+CREATE TABLE `sim_op_profiling_data_model_ext`  (
+  `id` bigint UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键id',
+  `profiling_data_id` bigint UNSIGNED NOT NULL COMMENT '分析数据id',
+  `sim_scene` smallint NULL DEFAULT NULL COMMENT '仿真场景：0芯片场景，10仿真场景',
+  `sim_scene_key` varchar(512) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '仿真场景key',
+  `op_model_id` bigint UNSIGNED NOT NULL COMMENT '算子模型id',
+  `op_shape_id` bigint UNSIGNED NOT NULL COMMENT '算子shape id',
+  `data_type` tinyint NOT NULL COMMENT '数据类型：0训练数据，1测试数据',
+  `vec_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'vec时间，单位us',
+  `vec_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'vec时间占比',
+  `mac_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'mac时间，单位us',
+  `mac_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'mac时间占比',
+  `scalar_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'scalar时间，单位us',
+  `scalar_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'scalar时间占比',
+  `mte1_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'met1时间，单位us',
+  `mte1_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'mte1时间占比',
+  `mte2_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'met2时间，单位us',
+  `mte2_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'mte2时间占比',
+  `mte3_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'met3时间，单位us',
+  `mte3_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'mte3时间占比',
+  `fixpipe_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'fixpipe时间，单位us',
+  `fixpipe_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'fixpipe时间占比',
+  `icache_miss_rate` decimal(8, 6) NULL DEFAULT NULL COMMENT '缓存遗失率',
+  `memory_bound` decimal(16, 4) NULL DEFAULT NULL COMMENT '内存边界',
+  `cube_utilization` decimal(8, 4) NULL DEFAULT NULL COMMENT '立方体利用率，单位%',
+  `mem_size` int NULL DEFAULT NULL COMMENT '内存大小',
+  `mem_real_size` int NULL DEFAULT NULL COMMENT '内存实际大小',
+  `ub_read_bw` decimal(10, 6) NULL DEFAULT NULL COMMENT 'ub读速率，单位GB/s',
+  `ub_write_bw` decimal(10, 6) NULL DEFAULT NULL COMMENT 'ub写速率，单位GB/s',
+  `l1_read_bw` decimal(10, 6) NULL DEFAULT NULL COMMENT 'l1读速率，单位GB/s',
+  `l1_write_bw` decimal(10, 6) NULL DEFAULT NULL COMMENT 'l1写速率，单位GB/s',
+  `main_mem_read_bw` decimal(10, 6) NULL DEFAULT NULL COMMENT '主内存读速率，单位GB/s',
+  `main_mem_write_bw` decimal(10, 6) NULL DEFAULT NULL COMMENT '主内存写速率，单位GB/s',
+  `hit_rate` decimal(8, 6) NULL DEFAULT NULL COMMENT 'hit率',
+  `victim_rate` decimal(8, 6) NULL DEFAULT NULL COMMENT 'victim率',
+  `aiv_total_cycle_cnt` bigint UNSIGNED NULL DEFAULT NULL COMMENT 'aiv总循环数',
+  `aiv_core_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'aiv核心时间，单位us',
+  `aiv_vec_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'vec时间，单位us',
+  `aiv_vec_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'vec时间占比',
+  `aiv_mac_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'mac时间，单位us',
+  `aiv_mac_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'mac时间占比',
+  `aiv_scalar_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'scalar时间，单位us',
+  `aiv_scalar_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'scalar时间占比',
+  `aiv_mte1_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'met1时间，单位us',
+  `aiv_mte1_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'mte1时间占比',
+  `aiv_mte2_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'met2时间，单位us',
+  `aiv_mte2_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'mte2时间占比',
+  `aiv_mte3_time` decimal(16, 4) NULL DEFAULT NULL COMMENT 'met3时间，单位us',
+  `aiv_mte3_ratio` decimal(8, 6) NULL DEFAULT NULL COMMENT 'mte3时间占比',
+  `aiv_icache_miss_rate` decimal(8, 6) NULL DEFAULT NULL COMMENT '缓存遗失率',
+  `aiv_cube_utilization` decimal(8, 4) NULL DEFAULT NULL COMMENT '立方体利用率，单位%',
+  `gmt_create` datetime NOT NULL COMMENT '创建时间',
+  `is_delete` tinyint NULL DEFAULT NULL COMMENT '是否删除：0正常，1逻辑删除',
+  PRIMARY KEY (`id`) USING BTREE,
+  INDEX `idx_profiling_data_id`(`profiling_data_id` ASC) USING BTREE,
+  INDEX `idx_model_shape`(`op_model_id` ASC, `op_shape_id` ASC) USING BTREE,
+  INDEX `idx_scene_model`(`sim_scene` ASC, `sim_scene_key` ASC, `op_model_id` ASC) USING BTREE
+) ENGINE = InnoDB AUTO_INCREMENT = 2048964323358937099 CHARACTER SET = utf8 COLLATE = utf8_general_ci COMMENT = '模型算子分析数据扩展表' ROW_FORMAT = DYNAMIC;
+
+-- ----------------------------
+-- Table structure for sim_op_profiling_data_sora
+-- ----------------------------
+DROP TABLE IF EXISTS `sim_op_profiling_data_sora`;
+CREATE TABLE `sim_op_profiling_data_sora`  (
+  `id` bigint UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键id',
+  `sim_scene` smallint NULL DEFAULT NULL COMMENT '仿真场景：0芯片场景，10仿真场景',
+  `sim_scene_key` varchar(512) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '仿真场景key',
+  `op_model_id` bigint UNSIGNED NOT NULL COMMENT '算子模型id',
+  `op_shape_id` bigint UNSIGNED NOT NULL COMMENT '算子shape id',
+  `data_type` tinyint NOT NULL COMMENT '数据类型：0训练数据，1测试数据',
+  `data_type_key` varchar(32) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT '数据类型key',
+  `stream_id` int NULL DEFAULT NULL COMMENT '流id',
+  `task_id` int NULL DEFAULT NULL COMMENT '任务id',
+  `task_type` varchar(32) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL COMMENT

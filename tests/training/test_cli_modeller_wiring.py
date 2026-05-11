@@ -2,20 +2,36 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 
+
+def _check_torch_available():
+    """Check if torch is available."""
+    try:
+        import torch
+        return True
+    except ImportError:
+        return False
+
+
+@pytest.mark.skipif(not _check_torch_available(), reason="torch not installed")
 class _Report:
     def summary(self) -> str:
         return "graph-native report"
 
 
 def test_train_hw_cli_delegates_to_graph_native_modeller(monkeypatch, capsys):
+    if not _check_torch_available():
+        pytest.skip("torch not installed")
+    
     from python.zrt import cli
 
     calls = []
 
     def fake_estimate_training_from_graphs(**kwargs):
         calls.append(kwargs)
-        return _Report()
+        # cli.py unpacks (report, ctx, transformed); return matching 3-tuple
+        return _Report(), None, {}
 
     monkeypatch.setattr(
         "python.zrt.transform.analysis.estimate_training_from_graphs",
@@ -34,11 +50,14 @@ def test_train_hw_cli_delegates_to_graph_native_modeller(monkeypatch, capsys):
         cp=5,
         zero_stage=2,
         optimizer="adamw",
+        muon_rotation=True,
+        muon_ns_steps=None,
         micro_batch=1,
         global_batch=16,
         total_params=123e9,
         hidden=4096,
         num_layers_full=32,
+        quant=None,
     )
     fwd_graph = object()
     bwd_graph = object()
@@ -46,7 +65,8 @@ def test_train_hw_cli_delegates_to_graph_native_modeller(monkeypatch, capsys):
         graphs={
             "train_forward": (fwd_graph, None),
             "train_backward": (bwd_graph, None),
-        }
+        },
+        output_dir=None,
     )
     hw = object()
 

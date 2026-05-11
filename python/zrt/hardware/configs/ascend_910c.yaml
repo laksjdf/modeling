@@ -11,6 +11,12 @@ compute:
   int4_tops: 2560
   fp8_tops: 1280
 
+  # Heterogeneous-core (DaVinci Cube/Vector split, ~2x 910B)
+  cube_bf16_tflops: 560
+  vector_bf16_tflops: 80
+  overlap_ratio:
+    attn_core: 0.6   # ~60% pipeline overlap for fused attention
+
 memory:
   capacity_gb: 96
   hbm_bandwidth_gbps: 3200

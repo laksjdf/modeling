@@ -12,7 +12,6 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 from python.zrt.graph.classifier import get_fill
-from python.zrt.graph.fusion import FusionEngine, FusionSpec
 from python.zrt.graph.tracker import ModuleTracker
 
 logger = logging.getLogger(__name__)
@@ -23,7 +22,7 @@ class ExcelWriter:
 
     def __init__(self, tracker: ModuleTracker, platform: str = "generic"):
         self._tracker = tracker
-        self._fusion_engine = FusionEngine(tracker, platform=platform)
+        self._platform = platform
         self._header_fill = PatternFill(start_color="263238", end_color="263238", fill_type="solid")
         self._header_font_white = Font(bold=True, color="FFFFFF", size=11)
         self._header_font = Font(bold=True, size=12)
@@ -33,8 +32,9 @@ class ExcelWriter:
               config_summary: Dict[str, Any]):
         wb = openpyxl.Workbook()
 
+        from python.zrt.transform.fusion._dict_bridge import fuse_records
         self._write_config_sheet(wb, config_summary)
-        fused = self._fusion_engine.fuse(records)
+        fused = fuse_records(records, self._tracker, platform=self._platform, keep_children=False)
         self._write_fused_sheet(wb, fused, records)
         self._write_raw_sheet(wb, records)
         self._write_summary_sheet(wb, fused)
@@ -42,6 +42,32 @@ class ExcelWriter:
         self._write_fusion_rules_sheet(wb, fused, output_path)
 
         wb.save(output_path)
+
+    def _write_optimizer_sheet(self, wb, summary: "TrainingSummary") -> None:
+        """Write Optimizer sheet (per §6.3 of muon_optimizer_design.md)."""
+        ws = wb.create_sheet("Optimizer")
+        header_font = Font(bold=True, size=11)
+
+        ws.cell(row=1, column=1, value="Metric").font = header_font
+        ws.cell(row=1, column=2, value="Value").font = header_font
+
+        rows = [
+            ("optimizer_type", summary.optimizer_type),
+            ("muon_param_fraction", f"{summary.muon_param_fraction:.2%}"),
+            ("opt_state_gb", round(summary.opt_state_gb, 3)),
+            ("opt_state_savings_gb", round(summary.opt_state_savings_gb, 3)),
+            ("optimizer_step_ms", round(summary.optimizer_step_ms, 3)),
+            ("muon_ag_rs_ms", round(summary.muon_ag_rs_ms, 3)),
+            ("muon_ns_tflops", round(summary.muon_ns_tflops, 3)),
+            ("optimizer_time_fraction", f"{summary.optimizer_time_fraction:.2%}"),
+        ]
+
+        for row_idx, (metric, value) in enumerate(rows, 2):
+            ws.cell(row=row_idx, column=1, value=metric)
+            ws.cell(row=row_idx, column=2, value=value)
+
+        ws.column_dimensions["A"].width = 25
+        ws.column_dimensions["B"].width = 20
 
     def _write_config_sheet(self, wb, config_summary):
         ws = wb.active
@@ -149,7 +175,8 @@ class ExcelWriter:
         ws.column_dimensions["D"].width = 100
 
     def _write_fusion_rules_sheet(self, wb, fused, output_path):
-        fusion_specs = self._fusion_engine.extract_specs(fused)
+        from python.zrt.transform.fusion._dict_bridge import extract_fusion_specs
+        fusion_specs = extract_fusion_specs(fused)
         ws = wb.create_sheet("Fusion Rules")
         columns = [
             ("Module Class", 30), ("Fusion Level", 12), ("Aten Op Sequence", 80),
@@ -299,3 +326,21 @@ def append_perf_summary(xlsx_path: Path, summary: "E2ESummary") -> None:
 
     wb.save(xlsx_path)
     logger.info("Appended '%s' sheet to %s", sheet_name, xlsx_path)
+
+
+def append_optimizer_sheet(xlsx_path: Path, summary: "TrainingSummary") -> None:
+    """Open *xlsx_path* and append Optimizer sheet for *summary*.
+
+    Per §6.3 of muon_optimizer_design.md, includes optimizer_type,
+    muon_param_fraction, opt_state_gb, optimizer_step_ms, etc.
+    """
+    wb = openpyxl.load_workbook(xlsx_path)
+
+    if "Optimizer" in wb.sheetnames:
+        del wb["Optimizer"]
+
+    writer = ExcelWriter.__new__(ExcelWriter)
+    writer._write_optimizer_sheet(wb, summary)
+
+    wb.save(xlsx_path)
+    logger.info("Appended 'Optimizer' sheet to %s", xlsx_path)

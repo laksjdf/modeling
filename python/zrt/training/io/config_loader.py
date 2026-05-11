@@ -9,10 +9,10 @@ import yaml
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import LayerKind, ModelSpec
 from zrt.training.spec.strategy import (
-    CPKind, OffloadPolicy, OptKind, PPSched, RecomputePolicy, Strategy,
+    CPKind, MuonConfig, OffloadPolicy, OptKind, PPSched, RecomputePolicy, Strategy,
     TPOverlap,
 )
-from zrt.training.spec.system import GPU, NetTier, SystemSpec
+from zrt.training.spec.system import GPU, SystemSpec
 
 _MODELS_DIR = Path(__file__).parent.parent / "configs" / "models"
 
@@ -99,6 +99,27 @@ def _parse_model(d: dict) -> ModelSpec:
         seq_len=d["seq_len"],
         layers=layers,
         attn_compression_ratio=d.get("attn_compression_ratio", 1.0),
+        # MLA (V3 / V3.2)
+        q_lora_rank=d.get("q_lora_rank", 0),
+        kv_lora_rank=d.get("kv_lora_rank", 0),
+        qk_nope_head_dim=d.get("qk_nope_head_dim", 0),
+        qk_rope_head_dim=d.get("qk_rope_head_dim", 0),
+        v_head_dim=d.get("v_head_dim", 0),
+        # Indexer (V3.2 / V4 CSA)
+        index_n_heads=d.get("index_n_heads", 0),
+        index_head_dim=d.get("index_head_dim", 0),
+        index_topk=d.get("index_topk", 0),
+        # V4 attention
+        o_lora_rank=d.get("o_lora_rank", 0),
+        o_groups=d.get("o_groups", 0),
+        compress_ratios=d.get("compress_ratios", []),
+        swa_window=d.get("swa_window", 0),
+        # V4 MoE
+        n_hash_routed_layers=d.get("n_hash_routed_layers", 0),
+        scoring_func=d.get("scoring_func", "sigmoid"),
+        routed_expert_dtype=d.get("routed_expert_dtype", "bf16"),
+        swiglu_clamp=d.get("swiglu_clamp", 0.0),
+        # MoE
         num_experts=d.get("num_experts", 0),
         moe_ffn=d.get("moe_ffn", 0),
         top_k=d.get("top_k", 0),
@@ -106,11 +127,23 @@ def _parse_model(d: dict) -> ModelSpec:
         expert_imbalance=d.get("expert_imbalance", 0.0),
         n_group=d.get("n_group", 0),
         n_shared_experts=d.get("n_shared_experts", 1),
+        # Compressed-CP
+        num_csa_layers=d.get("num_csa_layers", 0),
+        num_hca_layers=d.get("num_hca_layers", 0),
+        num_swa_only_layers=d.get("num_swa_only_layers", 0),
+        # MTP / HC
         mtp_depth=d.get("mtp_depth", 0),
+        hc_mult=d.get("hc_mult", 1),
+        hc_sinkhorn_iters=d.get("hc_sinkhorn_iters", 20),
+        # dtypes
         param_dtype=_parse_dtype(d.get("param_dtype", "bf16")),
         grad_dtype=_parse_dtype(d.get("grad_dtype", "fp32")),
         master_dtype=_parse_dtype(d.get("master_dtype", "fp32")),
         act_dtype=_parse_dtype(d.get("act_dtype", "bf16")),
+        # normalization
+        norm_kind=d.get("norm_kind", "rmsnorm"),
+        model_type=d.get("model_type", "default"),
+        muon_ns_steps=d.get("muon_ns_steps"),
     )
 
 
@@ -125,25 +158,14 @@ def _parse_system(d: dict) -> SystemSpec:
         flops_fp8=hw.compute.fp8_tops or hw.compute.bf16_tflops * 2,
         hbm_gb=hw.memory.capacity_gb,
         hbm_bw_gbps=hw.memory.hbm_bandwidth_gbps,
+        cube_tflops=hw.compute.cube_bf16_tflops,
+        vector_tflops=hw.compute.vector_bf16_tflops,
+        overlap_ratio=dict(hw.compute.overlap_ratio),
     )
-    nets = [
-        NetTier(
-            scope="intra_node",
-            bw_gbps=hw.interconnect.intra_node.bandwidth_gbps,
-            latency_us=hw.interconnect.intra_node.latency_us,
-            topology=hw.interconnect.intra_node.topology,
-        ),
-        NetTier(
-            scope="inter_node",
-            bw_gbps=hw.interconnect.inter_node.bandwidth_gbps,
-            latency_us=hw.interconnect.inter_node.latency_us,
-            topology=hw.interconnect.inter_node.topology,
-        ),
-    ]
     return SystemSpec(
         gpu=gpu,
         host_mem_gb=d.get("host_mem_gb", 256),
-        nets=nets,
+        interconnect=hw.interconnect,
         nodes=d["nodes"],
         gpus_per_node=d["gpus_per_node"],
     )
@@ -168,6 +190,16 @@ def _parse_strategy(d: dict) -> Strategy:
             pct=ol.get("pct", 1.0),
         )
 
+    muon_config = None
+    if "muon_config" in d:
+        mc = d["muon_config"]
+        muon_config = MuonConfig(
+            ns_steps=mc.get("ns_steps", 5),
+            rotation=mc.get("rotation", True),
+            adam_param_types=set(mc.get("adam_param_types", ["embed", "lm_head", "router", "bias"])),
+            muon_param_fraction=mc.get("muon_param_fraction", 0.85),
+        )
+
     return Strategy(
         tp=d.get("tp", 1),
         cp=d.get("cp", 1),
@@ -188,6 +220,7 @@ def _parse_strategy(d: dict) -> Strategy:
         dualbatch=d.get("dualbatch", False),
         dp_overlap_in_bubble=d.get("dp_overlap_in_bubble", True),
         optimizer=OptKind(d.get("optimizer", "adam")),
+        muon_config=muon_config,
     )
 
 

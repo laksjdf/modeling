@@ -62,7 +62,7 @@
   "tie_word_embeddings": false,
   "topk_group": 4,
   "topk_method": "noaux_tc",
-  "torch_dtype": "bfloat16",
+  "dtype": "bfloat16",
   "transformers_version": "4.44.2",
   "use_cache": true,
   "v_head_dim": 128,

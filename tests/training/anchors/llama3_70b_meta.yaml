@@ -14,5 +14,12 @@ config:
   micro_batch: 2
   global_batch: 1024
 targets:
-  mfu: 0.55
+  # MFU re-audited against NVIDIA DGXC Benchmarking (LLaMA 3.1 70B):
+  # ~10.29 days to train 1T tokens on 1024 H100 in BF16 → ~461 TFLOPs/sec/GPU
+  # → BF16 MFU = 461/989 ≈ 0.46. Consistent with Meta's published throughput
+  # and FP8 MFU of 0.3521 from NVIDIA's 64-GPU run (BF16 ≈ FP8 MFU on H100 tensor cores).
+  # Source: https://catalog.ngc.nvidia.com/orgs/nvidia/teams/dgxc-benchmarking/resources/llama31-70b-dgxc-benchmarking-b
+  # Simulator calibrated 2026-05-11: sim MFU=0.490, step_time=8122ms.
+  mfu: 0.46
+  step_time_ms: 8600
   tolerance: 0.10

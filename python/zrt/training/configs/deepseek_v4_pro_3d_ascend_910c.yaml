@@ -1,0 +1,28 @@
+# DeepSeek-V4-Pro 3D parallel training — Ascend 910C
+model: deepseek_v4_pro
+
+system:
+  hw: ascend_910c
+  nodes: 8
+  gpus_per_node: 8
+  host_mem_gb: 2048
+
+strategy:
+  tp: 8
+  cp: 1
+  pp: 4
+  ep: 64
+  dp: 2
+  micro_batch: 1
+  global_batch: 512
+  pp_schedule: dualpipev
+  zero_stage: 1
+  recompute:
+    per_layer:
+      moe: ["attn"]
+  optimizer: muon
+  muon_config:
+    ns_steps: 10
+    rotation: true
+    adam_param_types: ["embed", "lm_head", "router", "bias"]
+    muon_param_fraction: 0.85

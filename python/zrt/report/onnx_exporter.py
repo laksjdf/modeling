@@ -16,8 +16,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import networkx as nx
-import onnx
-from onnx import AttributeProto, TensorProto, helper
+
+try:
+    import onnx
+    from onnx import AttributeProto, TensorProto, helper
+    _HAS_ONNX = True
+except ImportError:
+    onnx = None  # type: ignore[assignment]
+    _HAS_ONNX = False
 
 logger = logging.getLogger(__name__)
 
@@ -376,6 +382,8 @@ def export_all(
     phase: str = "forward",
 ) -> Dict[str, Path]:
     """Export all graph artifacts to the output directory."""
+    if not _HAS_ONNX:
+        raise ImportError("onnx is required for graph export. Install it with: pip install onnx")
     output_dir.mkdir(parents=True, exist_ok=True)
     results: Dict[str, Path] = {}
 

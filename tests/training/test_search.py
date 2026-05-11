@@ -7,7 +7,8 @@ from zrt.training.search.space import SearchSpace
 from zrt.training.search.estimator import pareto_frontier, Report
 from zrt.training.spec.strategy import PPSched
 from zrt.training.spec.model import ModelSpec, LayerKind
-from zrt.training.spec.system import SystemSpec, GPU, NetTier
+from zrt.hardware.spec import InterconnectSpec, LinkSpec
+from zrt.training.spec.system import SystemSpec, GPU
 
 
 def _make_model():
@@ -35,10 +36,10 @@ def _make_system():
             hbm_bw_gbps=3350,
         ),
         host_mem_gb=512,
-        nets=[
-            NetTier(scope="intra_node", bw_gbps=900, latency_us=0.5, topology="nvswitch"),
-            NetTier(scope="inter_node", bw_gbps=100, latency_us=10, topology="fattree"),
-        ],
+        interconnect=InterconnectSpec(
+            intra_node=LinkSpec(type="NVLink", bandwidth_gbps=900, latency_us=0.5, topology="all_to_all", num_devices=8),
+            inter_node=LinkSpec(type="IB", bandwidth_gbps=100, latency_us=10, topology="fat_tree"),
+        ),
         nodes=1,
         gpus_per_node=8,
     )

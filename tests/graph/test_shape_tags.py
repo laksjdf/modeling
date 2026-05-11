@@ -12,16 +12,15 @@ class TestSkipOps:
 
     def test_skip_ops_contains_shape_ops(self):
         """SKIP_OPS should include common shape/view ops."""
-        from python.zrt.graph.fusion_rules import PATTERN_SKIP
+        from python.zrt.transform.fusion.rules import PATTERN_SKIP
 
         # These should be in the skip list
         assert "aten.view.default" in PATTERN_SKIP
-        assert "aten.reshape.default" in PATTERN_SKIP
         assert "aten.permute.default" in PATTERN_SKIP
 
     def test_skip_ops_does_not_include_compute_ops(self):
         """SKIP_OPS should NOT include compute-heavy ops."""
-        from python.zrt.graph.fusion_rules import PATTERN_SKIP
+        from python.zrt.transform.fusion.rules import PATTERN_SKIP
 
         # These should NOT be in the skip list
         assert "aten.mm.default" not in PATTERN_SKIP

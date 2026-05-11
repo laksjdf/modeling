@@ -84,9 +84,19 @@ def run_transform(
     logger.info(f"Exporting transformed graph to {output_dir}")
     export_paths = export_transformed_graph(transformed_graph, ctx, output_dir)
 
+    # DOT export
+    from python.zrt.report.dot_exporter import export_dot as _export_dot, render_dot as _render_dot
+    base_name = raw_graph.name or "graph"
+    dot_path = _export_dot(
+        transformed_graph,
+        output_dir / f"{base_name}_transformed_graph.dot",
+    )
+    _render_dot(dot_path)  # no-op when graphviz absent
+
     logger.info("Transform pipeline complete")
     logger.info(f"  Excel: {export_paths['excel']}")
     logger.info(f"  JSON:  {export_paths['json']}")
+    logger.info(f"  DOT:   {dot_path}")
 
     return output_dir, transformed_graph
 

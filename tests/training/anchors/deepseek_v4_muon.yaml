@@ -1,0 +1,23 @@
+name: deepseek_v4_muon
+description: "DeepSeek-V4 Muon optimizer test, H100 SXM, TP8 PP1 DP8, with Muon optimizer (K=10, 85% params)."
+model: deepseek_v3
+system:
+  hw: nvidia_h100_sxm
+  nodes: 8
+  gpus_per_node: 8
+  host_mem_gb: 512
+config:
+  tp: 8
+  pp: 1
+  ep: 1
+  dp: 8
+  zero_stage: 1
+  micro_batch: 1
+  global_batch: 1024
+  optimizer: muon
+  muon_config:
+    ns_steps: 10
+    muon_param_fraction: 0.85
+targets:
+  mfu: 0.4563
+  tolerance: 0.20

@@ -5,29 +5,11 @@ from typing import Any, List
 
 import torch
 
-SKIP_OPS = {
-    "prim.device.default",
-    "aten.t.default",
-    # "aten.detach.default", "aten.alias.default",
-    # "aten.view.default", "aten._unsafe_view.default",
-    # "aten.expand.default", "aten.contiguous.default",
-    # "aten.slice.Tensor", "aten.select.int",
-    # "aten.unsqueeze.default", "aten.squeeze.dim",
-    # "aten.split.Tensor", "aten.split_with_sizes.default",
-    # "aten.permute.default", "aten.reshape.default",
-    # "aten.clone.default",
-    # "aten.arange.default", "aten.arange.start",
-    # "aten.ones.default", "aten.zeros.default",
-    # "aten.full.default", "aten.scalar_tensor.default",
-    # "aten.tril.default", "aten.triu.default",
-    # "aten.empty_like.default", "aten.zeros_like.default",
-    # "aten.index_put_.default", "aten.index_put.default",
-    # "aten.scatter_.value", "aten.scatter_.src",
-    # "aten.histc.default", "aten.cumsum.default",
-    # "aten.bitwise_not.default",
-    # "aten.sort.default", "aten.sort.stable",
-}
+from python.zrt.transform.fusion.rules import ALWAYS_TRANSPARENT, SHAPE_OPS
 
+SKIP_OPS: set[str] = ALWAYS_TRANSPARENT | SHAPE_OPS | {
+    "aten._to_copy.default",
+}
 
 def shape_str(t: torch.Tensor) -> str:
     return str(list(t.shape))

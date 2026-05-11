@@ -4,7 +4,8 @@ from __future__ import annotations
 import pytest
 
 from zrt.training.spec.strategy import Strategy, rank_product
-from zrt.training.spec.system import SystemSpec, GPU, NetTier
+from zrt.hardware.spec import InterconnectSpec, LinkSpec
+from zrt.training.spec.system import SystemSpec, GPU
 from zrt.training.spec.model import ModelSpec, LayerKind
 
 
@@ -28,7 +29,10 @@ def _make_system(world_size=64):
     return SystemSpec(
         gpu=GPU(name="h100", flops_bf16=989, flops_fp8=1979, hbm_gb=80, hbm_bw_gbps=3350),
         host_mem_gb=512,
-        nets=[NetTier("intra_node", 900, 1.0, "nvswitch")],
+        interconnect=InterconnectSpec(
+            intra_node=LinkSpec(type="NVLink", bandwidth_gbps=900, latency_us=1.0, topology="all_to_all", num_devices=8),
+            inter_node=LinkSpec(type="IB", bandwidth_gbps=400, latency_us=5.0, topology="fat_tree"),
+        ),
         nodes=world_size // 8,
         gpus_per_node=8,
     )

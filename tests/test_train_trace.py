@@ -1,6 +1,6 @@
 """Tests for training phase tracing (train_forward / train_backward)."""
 import pytest
-from python.zrt.graph import run_trace_phases
+from python.zrt.pipeline import run_trace_phases
 
 # Uses local config only — no network required
 # MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"

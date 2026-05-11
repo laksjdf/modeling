@@ -162,22 +162,31 @@ def _mock_timeline(values):
     return mock_timeline
 
 
-def test_vpp_reduces_step_time_vs_1f1b():
+def test_vpp_composer_reduces_bubble_vs_1f1b():
+    # MagicMock scheduler → validates composer dispatch + bubble arithmetic, not DAG timing
     f1b = _run_pass(pp=4, pp_schedule="1f1b")
     vpp = _run_pass(pp=4, pp_schedule="interleaved", vpp_chunks=2)
     assert vpp.step_time_ms < f1b.step_time_ms
+    assert vpp.bubble_fraction < f1b.bubble_fraction
+    assert f1b.warmup_steps == 3 and f1b.cooldown_steps == 3
+    assert vpp.warmup_steps == 2 and vpp.cooldown_steps == 2
 
 
-def test_dualpipe_reduces_step_time_vs_1f1b():
+def test_dualpipe_composer_reduces_bubble_vs_1f1b():
+    # MagicMock scheduler → validates composer dispatch + bubble arithmetic, not DAG timing
     f1b = _run_pass(pp=4, pp_schedule="1f1b")
     dp = _run_pass(pp=4, pp_schedule="dualpipe")
     assert dp.step_time_ms < f1b.step_time_ms
+    assert dp.bubble_fraction < f1b.bubble_fraction
+    assert dp.warmup_steps == 2 and dp.cooldown_steps == 2
 
 
-def test_dualpipev_reduces_step_time_vs_dualpipe():
+def test_dualpipev_composer_matches_or_beats_dualpipe():
+    # MagicMock scheduler → validates composer dispatch + bubble arithmetic, not DAG timing
     dp = _run_pass(pp=4, pp_schedule="dualpipe")
     dpv = _run_pass(pp=4, pp_schedule="dualpipev", vpp_chunks=2)
     assert dpv.step_time_ms <= dp.step_time_ms
+    assert dpv.warmup_steps == 1 and dpv.cooldown_steps == 1
 
 
 def test_zero_bubble_uses_dw_split_to_reduce_dualpipe_bubble():
@@ -215,12 +224,12 @@ def test_zero_bubble_uses_bottleneck_stage_dw_split():
     assert zero_bubble.step_time_ms == pytest.approx(expected_step_ms)
 
 
-def test_zero_bubble_logs_when_dw_annotations_missing(caplog):
-    caplog.set_level("DEBUG", logger="python.zrt.transform.analysis.training")
+def test_zero_bubble_falls_back_to_homogeneous_when_no_stage_ids(caplog):
+    caplog.set_level("WARNING", logger="python.zrt.transform.analysis.training")
 
     metrics = _run_pass(pp=4, pp_schedule="zb")
-
     assert metrics.step_time_ms > 0
+    assert any("homogeneous fallback" in r.message for r in caplog.records)
 
 
 def test_1f1b_bubble_fraction():
@@ -234,3 +243,6 @@ def test_1f1b_bubble_fraction():
 def test_pp1_no_pipeline():
     metrics = _run_pass(pp=1, pp_schedule="1f1b")
     assert metrics.step_time_ms > 0
+    assert metrics.bubble_fraction == 0.0
+    assert metrics.warmup_steps == 0
+    assert metrics.cooldown_steps == 0

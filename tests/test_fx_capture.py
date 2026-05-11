@@ -3,7 +3,7 @@
 Uses DeepSeek-V3 local config — no network required.
 """
 import pytest
-from python.zrt.graph import run_trace_phases
+from python.zrt.pipeline import run_trace_phases
 
 MODEL_ID = "deepseek-ai/DeepSeek-V3"
 _COMMON = dict(

@@ -1,0 +1,25 @@
+name: deepseek_v4_flash_ascend_910c
+description: "DeepSeek-V4-Flash 291B, Ascend 910C, TP8 PP2 EP32 DP2, Muon, 4 nodes"
+model: deepseek_v4_flash
+system:
+  hw: ascend_910c
+  nodes: 4
+  gpus_per_node: 8
+  host_mem_gb: 2048
+config:
+  tp: 8
+  pp: 2
+  ep: 32
+  dp: 2
+  zero_stage: 1
+  micro_batch: 1
+  global_batch: 256
+  optimizer: muon
+  muon_config:
+    ns_steps: 10
+    rotation: true
+    adam_param_types: ["embed", "lm_head", "router", "bias"]
+    muon_param_fraction: 0.85
+targets:
+  mfu: 0.2602
+  tolerance: 0.15

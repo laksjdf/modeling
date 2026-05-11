@@ -75,6 +75,11 @@ _LOCAL_REGISTRY: Dict[str, str] = {
     # DeepSeek-V3.2 (deepseek_v32 model type — not in transformers registry)
     "deepseek_v32":                  "hf_models/deepseek_v3_2",
     "deepseek-ai/DeepSeek-V3.2":     "hf_models/deepseek_v3_2",
+
+    # DeepSeek-V4 (deepseek_v4 model type — not in transformers registry)
+    "deepseek_v4":                   "hf_models/deepseek_v4",
+    "deepseek-ai/DeepSeek-V4":       "hf_models/deepseek_v4",
+    "deepseek-ai/DeepSeek-V4-Pro":   "hf_models/deepseek_v4",
 }
 
 

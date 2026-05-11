@@ -1,0 +1,25 @@
+name: deepseek_v4_flash
+description: "DeepSeek-V4-Flash 291B, H100 SXM, TP8 PP1 EP64 DP8, Muon, 8 nodes"
+model: deepseek_v4_flash
+system:
+  hw: nvidia_h100_sxm
+  nodes: 8
+  gpus_per_node: 8
+  host_mem_gb: 2048
+config:
+  tp: 8
+  pp: 1
+  ep: 64
+  dp: 8
+  zero_stage: 1
+  micro_batch: 1
+  global_batch: 1024
+  optimizer: muon
+  muon_config:
+    ns_steps: 10
+    rotation: true
+    adam_param_types: ["embed", "lm_head", "router", "bias"]
+    muon_param_fraction: 0.85
+targets:
+  mfu: 0.1967
+  tolerance: 0.15

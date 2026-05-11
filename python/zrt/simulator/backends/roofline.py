@@ -74,7 +74,7 @@ The bound column in SimResult tells you which term dominates.
 │                │ rope (cos*x + sin*x_rot)               │ 2·N                                   │
 ├─────────────────────────────────────────────────────────────────────────────────────────────────┤
 │ 激活 — 4 ops/elem                                                                               │
-│                │ silu (x·σ(x), σ≈4 ops)                │ 4·N                                   │
+│                │ silu / SiLUActivation (x·σ(x), σ≈4)   │ 4·N                                   │
 │                │ gelu  (~x·Φ(x), ≈4 ops)               │ 4·N                                   │
 │                │ sigmoid (1/(1+e^-x))                   │ 4·N                                   │
 ├─────────────────────────────────────────────────────────────────────────────────────────────────┤
@@ -162,12 +162,27 @@ def _numel(shape: tuple[int, ...]) -> int:
 
 
 def _primary_dtype(node: "OpNode") -> DType:
-    """Return the dominant dtype for compute-throughput lookup."""
-    if node.outputs:
-        return node.outputs[0].dtype
-    if node.inputs:
-        return node.inputs[0].dtype
-    return DType.BF16
+    """Return the dominant dtype for compute-throughput lookup.
+
+    For compute nodes, activation dtype (inputs[0]) drives tensor-core selection.
+    Falls back to output dtype for non-compute or no-input nodes.
+    Also respects quant_act annotation for hypothetical-quant analysis.
+    """
+    if node.category != "compute" or not node.inputs:
+        if node.outputs:
+            return node.outputs[0].dtype
+        return DType.BF16
+    # Annotation path: QuantizationPass wrote quant_act on this node
+    quant_act = node.annotations.get("quant_act")
+    if quant_act and quant_act not in ("bf16", "fp16", "fp32"):
+        # Normalize fp8 alias to fp8_e4m3 (default FP8 format for training)
+        normalized = "fp8_e4m3" if quant_act == "fp8" else quant_act
+        try:
+            return DType(normalized)
+        except ValueError:
+            pass
+    # Captured dtype path: use activation tensor (inputs[0]) dtype
+    return node.inputs[0].dtype
 
 
 def _itemsize(node: "OpNode") -> float:
@@ -630,17 +645,27 @@ def _elementwise(node: "OpNode", ops_per_elem: float = 1.0) -> FMR:
 
 def _embedding(node: "OpNode") -> FMR:
     """aten.embedding.default / embedding / embedding_backward
-    FLOPs = 0  (纯查表, 无算术运算)
-    R=|output|·b   W=|output|·b   (cache-miss dominated random reads)
+    FLOPs = 0  (pure table lookup, no arithmetic)
+    R = weight_bytes + index_bytes + output_bytes
+    W = output_bytes
     """
     if not node.outputs:
         return _default(node)
     out = node.outputs[0]
-    n = _numel(out.shape)
     it = out.dtype.itemsize
     flops = 0.0
-    read  = n * it
-    write = n * it
+    # Weight read (input 0 is the embedding weight): full table load
+    weight_read = 0.0
+    if len(node.inputs) >= 1:
+        weight_read = _numel(node.inputs[0].shape) * node.inputs[0].dtype.itemsize
+    # Index read (input 1): negligible but accounted
+    index_read = 0.0
+    if len(node.inputs) >= 2:
+        index_read = _numel(node.inputs[1].shape) * node.inputs[1].dtype.itemsize
+    # Output write: indexed rows only
+    write = _numel(out.shape) * it
+    # Total read: weight + indices + output
+    read = weight_read + index_read + write
     return flops, read, write
 
 
@@ -1045,6 +1070,8 @@ _EXACT_FORMULAS: dict[str, "callable"] = {
     # ── activation — ~4 ops/elem ─────────────────────────────────────────────
     "aten.silu.default":                lambda n: _elementwise(n, 4.0),
     "aten.silu_.default":               lambda n: _elementwise(n, 4.0),
+    "SiLUActivation":                   lambda n: _elementwise(n, 4.0),
+    "silu":                             lambda n: _elementwise(n, 4.0),
     "aten.gelu.default":                lambda n: _elementwise(n, 4.0),
     "aten.sigmoid.default":             lambda n: _elementwise(n, 4.0),
     # ── transcendental — ~10 ops/elem (CORDIC / polynomial approx) ───────────
@@ -1700,6 +1727,7 @@ _EW_DISPATCH: dict[str, tuple] = {
     "aten.clamp_min.default": (2.0, "2"), "aten.clamp_max.default": (2.0, "2"),
     "aten.var.correction": (3.0, "3"),
     "aten.silu.default": (4.0, "4"), "aten.silu_.default": (4.0, "4"),
+    "SiLUActivation": (4.0, "4"), "silu": (4.0, "4"),
     "aten.gelu.default": (4.0, "4"), "aten.sigmoid.default": (4.0, "4"),
     "aten.sin.default": (10.0, "10"), "aten.cos.default": (10.0, "10"),
     "aten.atan2.default": (10.0, "10"),

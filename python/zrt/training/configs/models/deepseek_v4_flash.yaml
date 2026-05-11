@@ -1,0 +1,64 @@
+# DeepSeek-V4-Flash model specification
+# NOTE: This file defines V4-Flash (the default V4 variant).
+# V4-Pro is in deepseek_v4_pro.yaml. The model key "deepseek_v4" maps here.
+# Reference: DeepSeek-V4 technical report, ModelArgs defaults
+
+name: deepseek-v4-flash
+model_type: deepseek_v4
+muon_ns_steps: 10
+
+hidden: 4096
+ffn: 18432              # placeholder; V4 has no real dense layers
+num_heads: 64
+num_kv_heads: 1         # single KV head (MQA)
+head_dim: 512
+vocab: 129280
+seq_len: 4096
+layers: "[moe]*43+[mtp]*1"
+
+# Low-rank Q projection
+q_lora_rank: 1024
+qk_rope_head_dim: 64
+
+# Grouped output projection
+o_lora_rank: 1024
+o_groups: 8
+
+# Per-layer compression ratios (V4-Flash: 2 SWA + 41 CSA/HCA alternating)
+# L0-L1: SWA(0), L2-L42: alternating CSA(4)/HCA(128), L43: MTP(0)
+compress_ratios: [0, 0, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 0, 0]
+swa_window: 128
+
+# Indexer (CSA layers only)
+index_n_heads: 64
+index_head_dim: 128
+index_topk: 512
+
+# MoE
+num_experts: 256
+moe_ffn: 2048
+top_k: 6
+n_group: 8
+top_k_group: 4
+n_shared_experts: 1
+capacity_factor: 1.0
+expert_imbalance: 0.10
+
+# V4-specific MoE
+n_hash_routed_layers: 3
+scoring_func: sqrt_softplus
+routed_expert_dtype: fp4
+swiglu_clamp: 10.0
+
+# Hyper-Connections
+hc_mult: 4
+hc_sinkhorn_iters: 20
+
+# Attention compression ratio (avg)
+attn_compression_ratio: 0.5
+
+mtp_depth: 1
+param_dtype: bf16
+grad_dtype: fp32
+master_dtype: fp32
+act_dtype: bf16

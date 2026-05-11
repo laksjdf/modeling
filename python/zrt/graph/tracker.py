@@ -21,6 +21,8 @@ class ModuleTracker:
         self.path_to_children: Dict[str, List[str]] = {}
         self._forward_depth: int = 0       # >0 while inside a module forward
         self._in_backward_phase: bool = False  # set externally before loss.backward()
+        self._pre_backward_module: str = ""    # module path at backward entry
+        self._bwd_expected_pop: int = 0    # pending backward post-hook pops
         self._install(root, "")
 
     def _install(self, module: nn.Module, prefix: str):
@@ -44,14 +46,25 @@ class ModuleTracker:
                 self._forward_depth = max(0, self._forward_depth - 1)
 
             def _pre_bwd_hook(m, grad_out, _fn=full_name, _cls=class_name):
+                # Track backward module entry (fires regardless of output type).
+                # Clean up stale entries from sibling modules whose
+                # register_full_backward_hook never fired (e.g. when output is
+                # a NamedTuple like BaseModelOutputWithPast).
+                while self._bwd_expected_pop > 0:
+                    if self._stack and self._class_stack:
+                        self._stack.pop()
+                        self._class_stack.pop()
+                    self._bwd_expected_pop -= 1
                 self._stack.append(_fn)
                 self._class_stack.append(_cls)
+                self._bwd_expected_pop += 1
 
             def _post_bwd_hook(m, grad_in, grad_out, _fn=full_name):
                 if self._stack and self._stack[-1] == _fn:
                     self._stack.pop()
                     if self._class_stack:
                         self._class_stack.pop()
+                    self._bwd_expected_pop = max(0, self._bwd_expected_pop - 1)
 
             h1 = child.register_forward_pre_hook(_pre_hook)
             h2 = child.register_forward_hook(_post_hook)

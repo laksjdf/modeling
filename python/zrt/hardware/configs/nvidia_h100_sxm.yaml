@@ -11,6 +11,15 @@ compute:
   int4_tops: 3958
   fp8_tops: 3958    # FP8 E4M3 / E5M2 (Transformer Engine)
 
+  # Heterogeneous-core split:
+  # - cube/matrix: dense Tensor Core BF16 peak (no sparsity)
+  # - vector: CUDA-core scalar/vector peak, using FP32 peak as the BF16
+  #   elementwise roofline proxy
+  cube_bf16_tflops: 989
+  vector_bf16_tflops: 66.9
+  overlap_ratio:
+    attn_core: 0.6
+
 memory:
   capacity_gb: 80
   hbm_bandwidth_gbps: 3350    # HBM3

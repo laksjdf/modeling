@@ -11,6 +11,14 @@ compute:
   int4_tops: 1280
   fp8_tops: 0       # 910B does not support FP8
 
+  # Heterogeneous-core (DaVinci Cube/Vector split)
+  # Cube: matmul unit peak ~280 TFLOPS bf16 (primary AI-Core throughput)
+  # Vector: elementwise/norm unit peak ~40 TFLOPS bf16
+  cube_bf16_tflops: 280
+  vector_bf16_tflops: 40
+  overlap_ratio:
+    attn_core: 0.6   # ~60% pipeline overlap for fused attention
+
 memory:
   capacity_gb: 64
   hbm_bandwidth_gbps: 1600

@@ -32,15 +32,32 @@ class FlopsPass(GraphPass):
 
     name = "flops"
 
+    # Scope substrings that identify individual expert computation.
+    _EXPERT_KEYWORDS = ("experts.", "expert_", ".experts[")
+
+    @staticmethod
+    def _is_expert_scope(scope: str) -> bool:
+        s = scope.lower()
+        return any(k in s for k in FlopsPass._EXPERT_KEYWORDS)
+
     def run(self, graph: "OpGraph", ctx: "TransformContext") -> "OpGraph":
         from python.zrt.simulator.backends.roofline import RooflineSimulator
         sim = RooflineSimulator()
         g = graph.clone()
 
         is_train = ctx.training is not None
+        moe_scale = graph.metadata.get("moe_active_experts", 1)
 
         for node in g.nodes.values():
             flops, read_b, write_b = sim._fmr(node)
+
+            # MoE expert scaling: captured graph has only 1 expert's ops,
+            # but real model activates moe_active_experts per token.
+            if moe_scale > 1 and node.scope and self._is_expert_scope(node.scope):
+                flops = int(flops * moe_scale)
+                read_b = int(read_b * moe_scale)
+                write_b = int(write_b * moe_scale)
+
             node.annotations["flops"]       = int(flops)
             node.annotations["read_bytes"]  = int(read_b)
             node.annotations["write_bytes"] = int(write_b)
@@ -109,6 +126,30 @@ def _attn_compression_ratio(node, graph) -> float:
 
 # ── RooflinePass ──────────────────────────────────────────────────────────────
 
+def _effective_compute_dtype(node: "OpNode") -> "DType":
+    """Return the compute dtype for throughput lookup.
+
+    For compute nodes, activation dtype (inputs[0]) drives tensor-core selection.
+    Falls back to output dtype for non-compute or no-input nodes.
+    Also respects quant_act annotation for hypothetical-quant analysis.
+    """
+    from python.zrt.ir.types import DType
+
+    if node.category != "compute" or not node.inputs:
+        return node.outputs[0].dtype if node.outputs else DType.BF16
+    # Annotation path: QuantizationPass wrote quant_act on this node
+    quant_act = node.annotations.get("quant_act")
+    if quant_act and quant_act not in ("bf16", "fp16", "fp32"):
+        # Normalize fp8 alias to fp8_e4m3 (default FP8 format for training)
+        normalized = "fp8_e4m3" if quant_act == "fp8" else quant_act
+        try:
+            return DType(normalized)
+        except ValueError:
+            pass
+    # Captured dtype path: use activation tensor (inputs[0]) dtype
+    return node.inputs[0].dtype
+
+
 class RooflinePass(GraphPass):
     """Annotate nodes with Roofline-model timing estimates and bound classification.
 
@@ -137,8 +178,8 @@ class RooflinePass(GraphPass):
                 flops, read_b, write_b = sim._fmr(node)
             total_b = read_b + write_b
 
-            # Use primary dtype for peak throughput lookup
-            dtype = node.outputs[0].dtype if node.outputs else DType.BF16
+            # Use activation input dtype for compute throughput (INT8/FP8 vs BF16)
+            dtype = _effective_compute_dtype(node)
             peak  = hw.peak_flops(dtype)   # ops/s
             bw    = hw.hbm_bandwidth()     # bytes/s
 

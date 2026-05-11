@@ -1,0 +1,62 @@
+# DeepSeek-V4-Pro model specification
+# Reference: DeepSeek-V4 technical report §2-3, config.json
+
+name: deepseek-v4-pro
+model_type: deepseek_v4
+muon_ns_steps: 10
+
+hidden: 7168
+ffn: 18432              # placeholder; V4 has no real dense layers
+num_heads: 128
+num_kv_heads: 1         # single KV head (MQA)
+head_dim: 512
+vocab: 129280
+seq_len: 4096
+layers: "[moe]*61+[mtp]*1"
+
+# Low-rank Q projection (shared with MLA pattern)
+q_lora_rank: 1536
+qk_rope_head_dim: 64
+
+# Grouped output projection
+o_lora_rank: 1024
+o_groups: 16
+
+# Per-layer compression ratios (from config.json compress_ratios)
+# L0-L1: HCA(128), L2-L60: alternating CSA(4)/HCA(128), L61: MTP(0)
+compress_ratios: [128, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 0]
+swa_window: 128
+
+# Indexer (CSA layers only)
+index_n_heads: 64
+index_head_dim: 128
+index_topk: 1024
+
+# MoE
+num_experts: 384
+moe_ffn: 3072
+top_k: 6
+n_group: 8
+top_k_group: 4
+n_shared_experts: 1
+capacity_factor: 1.0
+expert_imbalance: 0.10
+
+# V4-specific MoE
+n_hash_routed_layers: 3
+scoring_func: sqrt_softplus
+routed_expert_dtype: fp4
+swiglu_clamp: 10.0
+
+# Hyper-Connections
+hc_mult: 4
+hc_sinkhorn_iters: 20
+
+# Attention compression ratio (avg, for backward compat)
+attn_compression_ratio: 0.5
+
+mtp_depth: 1
+param_dtype: bf16
+grad_dtype: fp32
+master_dtype: fp32
+act_dtype: bf16

@@ -37,7 +37,7 @@ Supports:
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch.nn as nn
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -45,9 +45,12 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from python.zrt.graph.patches import (
     apply_compat_patches,
     is_moe_module as _is_moe_module,
+    patch_for_training_capture,
+    patch_hc_for_capture,
     patch_indexer_for_fake,
     patch_moe_for_fake,
     patch_moe_for_meta,  # backward-compat alias
+    patch_v4_inference_stubs,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,6 +64,77 @@ def _normalize_config(config: Any) -> None:
     if isinstance(rs, dict) and "rope_type" in rs and "type" not in rs:
         rs["type"] = rs["rope_type"]
     config._attn_implementation = "eager"
+
+
+# ── Layer-type inference ─────────────────────────────────────────────────────
+
+def infer_layer_types(config: Any) -> Dict[str, List[int]]:
+    """Infer which transformer layers are dense vs. sparse (MoE) from config.
+
+    Handles three architectures without hard-coding model names:
+
+    * **DeepSeek-V3 / V3.2 style** — config has ``first_k_dense_replace`` and
+      (optionally) ``moe_layer_freq``:
+      layers ``[0, first_k_dense_replace)`` are dense; the remaining layers are
+      MoE when ``layer_idx % moe_layer_freq == 0``, otherwise dense.
+    * **Mixtral style** — config has ``num_local_experts`` (but no
+      ``first_k_dense_replace``): all layers are treated as MoE.
+    * **Standard dense models** — no MoE fields: all layers are dense.
+
+    The layer count is taken from ``config._full_num_hidden_layers`` when
+    available (set by :func:`load_model`), falling back to
+    ``config.num_hidden_layers``.
+
+    Returns
+    -------
+    {"dense": [layer_idx, ...], "sparse": [layer_idx, ...]}
+        Each list is sorted; together they cover every layer index.
+    """
+    total: int = (
+        getattr(config, "_full_num_hidden_layers", None)
+        or getattr(config, "num_hidden_layers", 0)
+    )
+
+    first_k_dense: Optional[int] = getattr(config, "first_k_dense_replace", None)
+    moe_layer_freq: int = getattr(config, "moe_layer_freq", 1) or 1
+    has_local_experts: bool = getattr(config, "num_local_experts", None) is not None
+    has_routed_experts: bool = getattr(config, "n_routed_experts", None) is not None
+
+    dense: List[int] = []
+    sparse: List[int] = []
+
+    if first_k_dense is not None:
+        for i in range(total):
+            if i < first_k_dense:
+                dense.append(i)
+            elif i % moe_layer_freq == 0:
+                sparse.append(i)
+            else:
+                dense.append(i)
+    elif has_local_experts or has_routed_experts:
+        sparse = list(range(total))
+    else:
+        dense = list(range(total))
+
+    return {"dense": dense, "sparse": sparse}
+
+
+def auto_target_layers(config: Any) -> List[int]:
+    """Return the representative layer indices to trace for this config.
+
+    Selects the **first dense layer** and the **first sparse (MoE) layer**
+    (when the model has MoE layers).  For purely dense models returns ``[0]``.
+    For all-MoE models returns ``[0]``.
+
+    The returned list is sorted and deduplicated.
+    """
+    types = infer_layer_types(config)
+    result: List[int] = []
+    if types["dense"]:
+        result.append(types["dense"][0])
+    if types["sparse"]:
+        result.append(types["sparse"][0])
+    return sorted(set(result)) or [0]
 
 
 # ── Error classification ──────────────────────────────────────────────────────
@@ -143,9 +217,11 @@ def _instantiate_model(config: Any, effective_id: str) -> nn.Module:
     from transformers import AutoModelForCausalLM
     from python.zrt.graph.compat import find_local_fallback
 
+    saved_exc: Exception | None = None
     try:
         return AutoModelForCausalLM.from_config(config, trust_remote_code=True)
     except Exception as exc:
+        saved_exc = exc
         if not _is_import_compat_error(exc):
             raise
 
@@ -161,7 +237,7 @@ def _instantiate_model(config: Any, effective_id: str) -> nn.Module:
     logger.info(
         "Model instantiation failed for '%s' (%s: %s); "
         "retrying from local fallback: %s",
-        effective_id, type(exc).__name__, exc, local_dir,
+        effective_id, type(saved_exc).__name__, saved_exc, local_dir,
     )
     from transformers import AutoConfig
     local_config = AutoConfig.from_pretrained(str(local_dir), trust_remote_code=True)
@@ -178,6 +254,7 @@ def _instantiate_model(config: Any, effective_id: str) -> nn.Module:
 def load_model(
     model_id: str,
     num_hidden_layers: int = 4,
+    training: bool = False,
 ) -> Tuple[nn.Module, Any, FakeTensorMode]:
     """Load any HF causal LM via FakeTensorMode for op-sequence tracing.
 
@@ -192,11 +269,19 @@ def load_model(
     num_hidden_layers:
         Number of transformer blocks to instantiate (2–4 is enough to see all
         distinct op patterns including dense + MoE layers).
+    training:
+        When True, apply ``patch_for_training_capture`` instead of the standard
+        inference patches.  This enables ``backward()`` through the model so the
+        training op graph (forward + backward matmuls, gradient accumulation ops,
+        etc.) can be captured.  Only meaningful for DeepSeek-V4; safe to pass for
+        other models (the patch silently no-ops when the ZRT kernel stubs are not
+        loaded).  The model is left in ``train()`` mode rather than ``eval()``.
 
     Returns
     -------
     (model, config, fake_mode)
-        model     — eval mode, MoE-patched, all params are FakeTensors.
+        model     — MoE-patched, all params are FakeTensors.
+                    eval mode when training=False; train mode when training=True.
         config    — ``config._full_num_hidden_layers`` stores the original depth.
         fake_mode — the active ``FakeTensorMode`` context; must remain entered
                     during forward pass so that new tensors (inputs, intermediates)
@@ -219,8 +304,8 @@ def load_model(
 
     # Step 4: instantiate model (with local-registry fallback on import errors)
     logger.info(
-        "Instantiating %s with FakeTensorMode (%d layers) …",
-        type(config).__name__, num_hidden_layers,
+        "Instantiating %s with FakeTensorMode (%d layers, training=%s) …",
+        type(config).__name__, num_hidden_layers, training,
     )
     try:
         model = _instantiate_model(config, effective_id)
@@ -228,8 +313,16 @@ def load_model(
         fake_mode.__exit__(None, None, None)
         raise
 
-    model.eval()
-    patch_moe_for_fake(model)
-    patch_indexer_for_fake(model)
+    if training:
+        # train() keeps requires_grad=True on parameters; patch_for_training_capture
+        # also calls patch_moe_for_fake / patch_indexer_for_fake / patch_hc_for_capture.
+        model.train()
+        patch_for_training_capture(model)
+    else:
+        model.eval()
+        patch_moe_for_fake(model)
+        patch_indexer_for_fake(model)
+        patch_hc_for_capture(model)
+        patch_v4_inference_stubs()
 
     return model, config, fake_mode

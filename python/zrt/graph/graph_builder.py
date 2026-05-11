@@ -196,11 +196,24 @@ def _find_sub_ops(frec: Dict[str, Any],
     if "_children" in frec:
         return frec["_children"]
 
-    # Otherwise match by module_path and layer
+    # Otherwise match by module_path and layer.
+    # Use path-boundary-aware prefix matching to avoid false positives
+    # on module names with shared prefixes (e.g. "model.layers.1" should
+    # NOT match "model.layers.10.self_attn" within the same layer).
     module_path = frec.get("module_path", "")
     layer = frec.get("layer", "")
+
+    def _path_match(rec_path: str) -> bool:
+        if not rec_path.startswith(module_path):
+            return False
+        if len(rec_path) == len(module_path):
+            return True
+        # Ensure dot boundary: "model.layers.1" matches "model.layers.1.self_attn"
+        # but NOT "model.layers.10.self_attn"
+        return rec_path[len(module_path)] == "."
+
     matched = [r for r in raw_records
-               if r.get("module_path", "").startswith(module_path)
+               if _path_match(r.get("module_path", ""))
                and r.get("layer", "") == layer]
     return matched if matched else raw_records[:0]
 

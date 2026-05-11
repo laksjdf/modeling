@@ -14,7 +14,17 @@ def achieved_flops_efficiency(
 ) -> float:
     """Achieved FLOP/s fraction of peak for a given matmul size.
 
-    Phase 1 heuristic: larger matmuls achieve higher efficiency.
+    Calibrated against:
+      - NVIDIA MLPerf Training v4.0: 904 TFLOPs/s/GPU FP8 at 512 H100 GPUs
+        → BF16 ~452 TFLOPs/s/GPU → eff ≈ 0.46 (source: NVIDIA blog, June 2024)
+      - NVIDIA DGXC LLaMA 3.1 70B: ~461 TFLOPs/s/GPU BF16 on 1024 H100
+        → eff ≈ 0.47 (source: NGC DGXC Benchmarking)
+
+    Realistic large-GEMM BF16 efficiency on H100 at training scale: ~0.50,
+    not 0.85.  The 0.85 figure reflects single-kernel microbenchmarks;
+    sustained training throughput includes optimizer overheads, gradient
+    accumulation, pipeline bubbles, and scheduling gaps that reduce
+    effective utilization by ~40%.
     """
     if flops <= 0:
         return 0.0
@@ -24,11 +34,11 @@ def achieved_flops_efficiency(
     if flops < 1e9:
         return 0.50
     elif flops < 1e10:
-        return 0.65
+        return 0.55
     elif flops < 1e11:
-        return 0.75
+        return 0.60
     else:
-        return 0.85
+        return 0.50
 
 
 def achieved_bandwidth_efficiency(gpu_name: str, bytes_: float) -> float:

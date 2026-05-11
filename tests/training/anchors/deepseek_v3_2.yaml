@@ -1,0 +1,22 @@
+name: deepseek_v3_2
+description: "DeepSeek-V3.2 (V3 + DSA/Indexer), H100 SXM, TP8 PP2 EP64 DP4, 8 nodes"
+model: deepseek_v3_2
+system:
+  hw: nvidia_h100_sxm
+  nodes: 8
+  gpus_per_node: 8
+  host_mem_gb: 2048
+config:
+  tp: 8
+  pp: 2
+  ep: 64
+  dp: 4
+  zero_stage: 1
+  micro_batch: 1
+  global_batch: 1024
+targets:
+  # Re-derived after achieved_flops_efficiency calibration to MLPerf v4.0.
+  mfu: 0.3331
+  step_time_ms: 34580
+  tolerance: 0.20
+  strict_mfu_check: false

@@ -150,6 +150,15 @@ class RecordingDispatch(TorchDispatchMode):
         if self._module_tracker:
             module_path = self._module_tracker.current_module
             module_class = self._module_tracker.current_module_class
+            # During backward, forward hooks don't fire for autograd-generated
+            # intermediate ops, so module_path stays frozen at the last forward
+            # module (typically mlp.gate).  Clear the path when it's unchanged
+            # from the pre-backward value to avoid misattribution.
+            if getattr(self._module_tracker, '_in_backward_phase', False):
+                stale = getattr(self._module_tracker, '_pre_backward_module', '')
+                if module_path == stale:
+                    module_path = ""
+                    module_class = ""
 
         if self._target_layers is not None:
             layer_str = extract_layer_idx(module_path)

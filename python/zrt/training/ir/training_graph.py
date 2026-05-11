@@ -29,9 +29,10 @@ class Tensor:
 @dataclass
 class Op:
     name: str
-    kind: str   # "matmul" | "attn_core" | "softmax" | "ln" | "rope"
-                # | "swiglu" | "router" | "dispatch" | "combine"
-                # | "embed" | "lm_head" | "add"
+    kind: str   # "matmul" | "attn_core" | "sparse_attn" | "hca_attn" | "swa_attn"
+                # | "softmax" | "ln" | "rope" | "swiglu" | "router" | "dispatch"
+                # | "combine" | "embed" | "lm_head" | "add"
+                # | "compressor_pool" | "indexer_topk" | "hash_route"
     inputs: list[Tensor] = field(default_factory=list)
     outputs: list[Tensor] = field(default_factory=list)
     meta: dict[str, Any] = field(default_factory=dict)
@@ -45,7 +46,11 @@ class Collective:
     kind: str       # "AG" | "RS" | "AR" | "A2A" | "P2P"
     group: str      # "TP" | "CP" | "EP" | "DP" | "PP"
     bytes_: int     # per-rank payload in bytes
-    inserted_after: str  # op name it follows
+    inserted_after: str | None = None  # op name it follows
+    inserted_before: str | None = None  # op name it precedes
+    rounds: int = 1  # number of rounds for P2P (Ring CP)
+    overlap: bool = False  # whether this communication overlaps with compute
+    phase: str = "fwd"  # "fwd" | "bwd" | "both"
 
     @property
     def payload_mb(self) -> float:

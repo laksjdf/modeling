@@ -95,6 +95,10 @@ def _parse_spec(d: dict[str, Any]) -> HardwareSpec:
 
 
 def _parse_compute(c: dict[str, Any]) -> ComputeSpec:
+    cube_raw = c.get("cube_bf16_tflops")
+    vector_raw = c.get("vector_bf16_tflops")
+    overlap_raw: dict[str, Any] = c.get("overlap_ratio", {})
+
     return ComputeSpec(
         fp16_tflops=float(c.get("fp16_tflops", 0.0)),
         bf16_tflops=float(c.get("bf16_tflops", 0.0)),
@@ -102,6 +106,9 @@ def _parse_compute(c: dict[str, Any]) -> ComputeSpec:
         int8_tops=float(c.get("int8_tops", 0.0)),
         int4_tops=float(c.get("int4_tops", 0.0)),
         fp8_tops=float(c.get("fp8_tops", 0.0)),
+        cube_bf16_tflops=float(cube_raw) if cube_raw is not None else None,
+        vector_bf16_tflops=float(vector_raw) if vector_raw is not None else None,
+        overlap_ratio={k: float(v) for k, v in overlap_raw.items()},
     )
 
 

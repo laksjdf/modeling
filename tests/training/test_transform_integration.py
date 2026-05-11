@@ -1,7 +1,6 @@
 """Test training modeller integration with transform infrastructure."""
 
 import pytest
-from dataclasses import dataclass
 from zrt.ir.graph import OpGraph, OpNode
 from zrt.ir.types import TensorMeta, DType
 from zrt.transform.context import (
@@ -112,60 +111,57 @@ def test_training_flops_pass():
 
 
 def test_training_memory_pass_zero_1():
-    """Test TrainingMemoryPass with ZeRO-1."""
+    """Test TrainingMemoryPass with ZeRO-1 (optimizer state sharded by dp)."""
     graph = _make_simple_graph()
     hw = _make_hardware_spec()
-    ctx = TransformContext(
-        hw_spec=hw,
-        parallel=ParallelConfig(tp=1, pp=1, dp=4),
-        training=TrainingConfig(
-            micro_batch=1,
-            global_batch=32,
-            zero_stage=1,
-        ),
-    )
+    dp = 4
+
+    def _ctx(zero_stage):
+        return TransformContext(
+            hw_spec=hw,
+            parallel=ParallelConfig(tp=1, pp=1, dp=dp),
+            training=TrainingConfig(
+                micro_batch=1,
+                global_batch=32,
+                zero_stage=zero_stage,
+            ),
+        )
 
     pass_ = TrainingMemoryPass()
-    result = pass_.run(graph, ctx)
+    z0 = pass_.run(graph, _ctx(0)).metadata["memory_breakdown"]
+    z1 = pass_.run(graph, _ctx(1)).metadata["memory_breakdown"]
 
-    assert "memory_breakdown" in result.metadata
-    breakdown = result.metadata["memory_breakdown"]
-    assert breakdown.weights > 0
-    assert breakdown.grads > 0
-    assert breakdown.opt_state > 0
-    assert breakdown.activations > 0
-    assert breakdown.total > 0
+    # ZeRO-1: optimizer state sharded by dp; weights and grads unchanged
+    assert z1.opt_state == pytest.approx(z0.opt_state / dp, rel=0.01)
+    assert z1.weights == pytest.approx(z0.weights, rel=0.01)
+    assert z1.grads == pytest.approx(z0.grads, rel=0.01)
 
 
 def test_training_memory_pass_zero_2():
-    """Test TrainingMemoryPass with ZeRO-2 (gradients sharded)."""
+    """Test TrainingMemoryPass with ZeRO-2 (optimizer state + gradients sharded by dp)."""
     graph = _make_simple_graph()
     hw = _make_hardware_spec()
-    ctx_zero1 = TransformContext(
-        hw_spec=hw,
-        parallel=ParallelConfig(tp=1, pp=1, dp=4),
-        training=TrainingConfig(
-            micro_batch=1,
-            global_batch=32,
-            zero_stage=1,
-        ),
-    )
-    ctx_zero2 = TransformContext(
-        hw_spec=hw,
-        parallel=ParallelConfig(tp=1, pp=1, dp=4),
-        training=TrainingConfig(
-            micro_batch=1,
-            global_batch=32,
-            zero_stage=2,
-        ),
-    )
+    dp = 4
+
+    def _ctx(zero_stage):
+        return TransformContext(
+            hw_spec=hw,
+            parallel=ParallelConfig(tp=1, pp=1, dp=dp),
+            training=TrainingConfig(
+                micro_batch=1,
+                global_batch=32,
+                zero_stage=zero_stage,
+            ),
+        )
 
     pass_ = TrainingMemoryPass()
-    result_z1 = pass_.run(graph, ctx_zero1)
-    result_z2 = pass_.run(graph, ctx_zero2)
+    z0 = pass_.run(graph, _ctx(0)).metadata["memory_breakdown"]
+    z2 = pass_.run(graph, _ctx(2)).metadata["memory_breakdown"]
 
-    # ZeRO-2 should have smaller gradients than ZeRO-1
-    assert result_z2.metadata["memory_breakdown"].grads < result_z1.metadata["memory_breakdown"].grads
+    # ZeRO-2: both optimizer state AND gradients sharded by dp; weights unchanged
+    assert z2.opt_state == pytest.approx(z0.opt_state / dp, rel=0.01)
+    assert z2.grads == pytest.approx(z0.grads / dp, rel=0.01)
+    assert z2.weights == pytest.approx(z0.weights, rel=0.01)
 
 
 def test_training_pipeline_pass():
@@ -287,15 +283,15 @@ def test_adam_opt_state_12_bytes_per_param():
     total_params = result.metadata.get("total_params", 0)
     if total_params == 0:
         total_params = 4096 * (4096 * 4)  # weight_0 shape
-    # opt_state should be 12 * total_params bytes (not 4 * total_params)
+    # opt_state should be 12 * total_params bytes for Adam (FP32: master + m + v = 3 × 4 bytes)
     expected_opt_bytes = total_params * 12
     assert breakdown.opt_state == pytest.approx(expected_opt_bytes, rel=0.01), (
-        f"Expected opt_state ≈ {expected_opt_bytes} (12 B/P), got {breakdown.opt_state}"
+        f"Expected opt_state ≈ {expected_opt_bytes} (12 B/P for FP32 Adam), got {breakdown.opt_state}"
     )
 
 
 def test_adamw_opt_state_same_as_adam():
-    """AdamW should use same 12 B/P as Adam."""
+    """AdamW should use same 12 B/P as Adam (FP32: master + m + v = 3 × 4 bytes)."""
     graph = _make_simple_graph()
     hw = _make_hardware_spec()
     ctx_adam = TransformContext(

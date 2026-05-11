@@ -1,0 +1,41 @@
+# DeepSeek-V3.2 model specification (= V3 + Lightning Indexer / DSA)
+# Reference: https://arxiv.org/pdf/2512.02556
+
+name: deepseek-v3-2
+hidden: 7168
+ffn: 18432
+num_heads: 128
+num_kv_heads: 128       # MLA: projected back to num_heads KV
+head_dim: 128           # qk_nope_head_dim only; effective MLA QK = qk_nope+qk_rope=192
+vocab: 129280
+seq_len: 4096
+layers: "[dense]*3+[moe]*57+[mtp]*1"
+
+# MLA (Multi-head Latent Attention) — same as V3
+q_lora_rank: 1536
+kv_lora_rank: 512
+qk_nope_head_dim: 128
+qk_rope_head_dim: 64
+v_head_dim: 128
+
+# Lightning Indexer / DSA (V3.2 addition)
+index_n_heads: 64
+index_head_dim: 128
+index_topk: 2048
+
+# MoE — same as V3
+num_experts: 256
+moe_ffn: 2048
+top_k: 8
+n_group: 8
+top_k_group: 4
+n_shared_experts: 1
+capacity_factor: 1.0
+expert_imbalance: 0.10
+scoring_func: sigmoid
+
+mtp_depth: 1
+param_dtype: bf16
+grad_dtype: fp32
+master_dtype: fp32
+act_dtype: bf16

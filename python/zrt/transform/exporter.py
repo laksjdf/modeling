@@ -236,7 +236,6 @@ class TransformedGraphExcelWriter:
 
         self._write_header(ws, columns)
 
-        # Infer layer-to-stage mapping for pipeline parallelism
         layer_to_stage = {}
         if ctx.parallel.pp > 1:
             layers = set(n.layer for n in graph.nodes.values() if n.layer)
@@ -244,7 +243,11 @@ class TransformedGraphExcelWriter:
             for i, layer in enumerate(sorted_layers):
                 layer_to_stage[layer] = i % ctx.parallel.pp
 
-        for row_idx, node in enumerate(layer_stable_sort(graph.topo_sort()), 2):
+        nodes_to_write = list(layer_stable_sort(graph.topo_sort()))
+        if graph.phase == "train" or graph.metadata.get("fwd_bwd_stitched"):
+            nodes_to_write = [n for n in nodes_to_write if n.annotations.get("phase") != "bwd"]
+
+        for row_idx, node in enumerate(nodes_to_write, 2):
             parallelism = get_parallelism_info(node, ctx.parallel)
             formulas = get_op_formulas(node)
 
@@ -1057,26 +1060,23 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
     def write_training(
         self,
         fwd_graph: OpGraph,
-        bwd_graph: OpGraph,
+        bwd_graph: OpGraph | None,
         ctx: TransformContext,
         output_path: Path,
-        training_summary=None,  # TrainingSummary | None
+        training_summary=None,
     ) -> None:
         """Write training workbook (fwd + bwd graphs + summary sheet)."""
         wb = openpyxl.Workbook()
 
-        # Standard sheets for the forward graph
         self._write_metadata_sheet(wb, fwd_graph, ctx)
         self._write_transformed_ops_sheet(wb, fwd_graph, ctx)
         self._write_communication_sheet(wb, fwd_graph, ctx)
         self._write_parallelism_summary_sheet(wb, fwd_graph, ctx)
         self._write_stream_assignment_sheet(wb, fwd_graph, ctx)
 
-        # Backward graph ops (separate sheet)
-        self._write_backward_ops_sheet(wb, bwd_graph, ctx)
-
-        # Training-specific sheets
-        self._write_recompute_sheet(wb, bwd_graph)
+        if bwd_graph is not None:
+            self._write_backward_ops_sheet(wb, bwd_graph, ctx)
+            self._write_recompute_sheet(wb, bwd_graph)
         if training_summary is not None:
             self._write_training_summary_sheet(wb, training_summary)
 
@@ -1123,7 +1123,11 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
 
         _recompute_fill = PatternFill(start_color="fce4ec", end_color="fce4ec", fill_type="solid")
 
-        for row_idx, node in enumerate(layer_stable_sort(graph.topo_sort()), 2):
+        nodes_to_write = list(layer_stable_sort(graph.topo_sort()))
+        if graph.phase == "train" or graph.metadata.get("fwd_bwd_stitched"):
+            nodes_to_write = [n for n in nodes_to_write if n.annotations.get("phase") == "bwd"]
+
+        for row_idx, node in enumerate(nodes_to_write, 2):
             is_recompute = (
                 node.annotations.get("recompute", False)
                 or node.attrs.get("recompute", False)
@@ -1310,17 +1314,19 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
 
 def export_training_graphs(
     fwd_graph: OpGraph,
-    bwd_graph: OpGraph,
+    bwd_graph: OpGraph | None,
     ctx: TransformContext,
     output_dir: Path,
-    training_summary=None,  # TrainingSummary | None
+    training_summary=None,
 ) -> Dict[str, Path]:
     """Export forward + backward training graphs to Excel and JSON.
 
     Parameters
     ----------
-    fwd_graph / bwd_graph
-        Transformed train_forward / train_backward graphs.
+    fwd_graph
+        Transformed train_forward graph, or unified graph (phase="train").
+    bwd_graph
+        Transformed train_backward graph, or None if fwd_graph is unified.
     ctx
         Transform context (shared between phases).
     output_dir
@@ -1335,8 +1341,9 @@ def export_training_graphs(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Use forward graph name (strip phase suffix for base name)
-    base = fwd_graph.name.replace("/", "_").replace(":", "_").replace("_train_forward", "")
+    base = fwd_graph.name.replace("/", "_").replace(":", "_")
+    for suffix in ("_train_forward", "_train_backward", "_train"):
+        base = base.replace(suffix, "")
 
     excel_path = output_dir / f"{base}_training.xlsx"
     writer = TrainingGraphExcelWriter()
@@ -1345,10 +1352,12 @@ def export_training_graphs(
     json_fwd = output_dir / f"{base}_train_forward.json"
     _export_json(fwd_graph, ctx, json_fwd)
 
-    json_bwd = output_dir / f"{base}_train_backward.json"
-    _export_json(bwd_graph, ctx, json_bwd)
+    if bwd_graph is not None and bwd_graph != fwd_graph:
+        json_bwd = output_dir / f"{base}_train_backward.json"
+        _export_json(bwd_graph, ctx, json_bwd)
+        return {"excel": excel_path, "json_fwd": json_fwd, "json_bwd": json_bwd}
 
-    return {"excel": excel_path, "json_fwd": json_fwd, "json_bwd": json_bwd}
+    return {"excel": excel_path, "json_fwd": json_fwd}
 
 
 # ── Unified full-report exports ───────────────────────────────────────────────

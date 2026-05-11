@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from zrt.training.compose.pipeline import Interleaved1F1BComposer, OneF1BComposer, StepResult
+from zrt.training.compose.schedules import Interleaved1F1BComposer, OneF1BComposer, StepResult
 from zrt.training.compose.stage import StageTime
 from zrt.training.spec.strategy import PPSched, Strategy
 

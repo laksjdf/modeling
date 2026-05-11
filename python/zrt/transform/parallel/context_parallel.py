@@ -57,6 +57,18 @@ class ContextParallelPass(GraphPass):
                     "cp": cp
                 }
 
+            elif cp_kind == "compressed":
+                # DeepSeek-V4 two-stage compressed CP:
+                # Stage 1: P2P boundary exchange (last m/m' uncompressed KV entries)
+                # Stage 2: All-Gather to collect compressed KV from all CP ranks
+                # CSA: compression_ratio=4, HCA: compression_ratio=128
+                node.annotations["cp_split"] = {
+                    "kind": "compressed",
+                    "cp": cp,
+                    "stage1": "p2p_boundary_exchange",
+                    "stage2": "allgather_compressed_kv",
+                }
+
         return g
 
     def _is_attention_op(self, node: OpNode) -> bool:

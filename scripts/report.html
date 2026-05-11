@@ -1,0 +1,3201 @@
+<!doctype html>
+<html lang='zh-CN'>
+<head>
+    <meta charset='utf-8'/>
+    <title>AI Infra Performance Report</title>
+    <style>
+        :root {
+            --bg: #f6f9fc;
+            --card: #ffffff;
+            --text: #172033;
+            --muted: #64748b;
+            --line: #dbe4ee;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            font-family: -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif;
+            background: linear-gradient(180deg, #f8fbff 0%, #f6f9fc 100%);
+            color: var(--text);
+        }
+
+        .main {
+            max-width: 1480px;
+            margin: 0 auto;
+            padding: 28px;
+        }
+
+        a {
+            color: #2563eb;
+            text-decoration: none;
+        }
+
+        a:hover {
+            text-decoration: underline;
+        }
+
+        h1, h2, h3 {
+            color: #111827;
+            margin: 0 0 12px 0;
+        }
+
+        h1 {
+            font-size: 30px;
+        }
+
+        h2 {
+            font-size: 22px;
+            margin-top: 28px;
+        }
+
+        .hero, .section, .card, .mini-card, .block, .op-family {
+            background: #fff;
+            border: 1px solid var(--line);
+            border-radius: 18px;
+            box-shadow: 0 4px 20px rgba(15, 23, 42, .05);
+        }
+
+        .hero {
+            padding: 24px;
+            background: radial-gradient(circle at top right, #dbeafe, transparent 22%), white;
+        }
+
+        .subtitle {
+            color: #475569;
+            margin-top: 8px;
+            line-height: 1.6;
+        }
+
+        .meta-line {
+            margin-top: 8px;
+            color: #334155;
+        }
+
+        .cards {
+            display: grid;
+            grid-template-columns:repeat(5, minmax(160px, 1fr));
+            gap: 14px;
+            margin-top: 20px;
+        }
+
+        .card {
+            padding: 16px;
+        }
+
+        .card .value {
+            font-size: 26px;
+            font-weight: 750;
+            margin-top: 8px;
+        }
+
+        .section {
+            padding: 20px;
+            margin-top: 18px;
+        }
+
+        .subcards {
+            display: grid;
+            grid-template-columns:repeat(4, minmax(180px, 1fr));
+            gap: 12px;
+            margin-bottom: 14px;
+        }
+
+        .mini-card {
+            padding: 14px;
+        }
+
+        .mini-card .mini-value {
+            font-size: 24px;
+            font-weight: 800;
+            margin-top: 6px;
+        }
+
+        .mini-value.high {
+            color: #166534;
+        }
+
+        .mini-value.midhigh {
+            color: #15803d;
+        }
+
+        .mini-value.medium {
+            color: #b45309;
+        }
+
+        .mini-value.low {
+            color: #b91c1c;
+        }
+
+        .bar {
+            position: relative;
+            height: 28px;
+            background: #eff4f8;
+            border-radius: 999px;
+            overflow: hidden;
+            margin: 8px 0;
+            border: 1px solid #e2e8f0;
+        }
+
+        .bar div {
+            height: 100%;
+            background: #93c5fd;
+        }
+
+        .bar.memory div {
+            background: #86efac;
+        }
+
+        .bar.compute div {
+            background: #fdba74;
+        }
+
+        .bar.communication div {
+            background: #a5b4fc;
+        }
+
+        .bar.official div {
+            background: #60a5fa;
+        }
+
+        .bar.commtmpl div {
+            background: #c4b5fd;
+        }
+
+        .bar.analytic div {
+            background: #f9a8d4;
+        }
+
+        .bar span {
+            position: absolute;
+            left: 12px;
+            top: 4px;
+            font-size: 13px;
+        }
+
+        .legend {
+            color: #475569;
+            margin-top: 10px;
+            font-size: 13px;
+        }
+
+        .topo-svg {
+            width: 100%;
+            height: auto;
+            background: #fff;
+            border: 1px solid var(--line);
+            border-radius: 18px;
+        }
+
+        .flowline {
+            display: flex;
+            align-items: stretch;
+            gap: 12px;
+            overflow-x: auto;
+            padding: 6px 0 2px;
+        }
+
+        .flow-card {
+            min-width: 180px;
+            background: linear-gradient(180deg, #f8fbff 0%, #fff 100%);
+            border: 1px solid #dbe4ee;
+            border-radius: 16px;
+            padding: 14px;
+        }
+
+        .fc-title {
+            font-size: 18px;
+            font-weight: 800;
+        }
+
+        .fc-sub {
+            color: #0369a1;
+            font-weight: 700;
+            min-height: 20px;
+            margin-top: 2px;
+        }
+
+        .fc-metric {
+            margin-top: 10px;
+            font-size: 24px;
+            font-weight: 800;
+        }
+
+        .fc-note {
+            color: #475569;
+            margin-top: 8px;
+            font-size: 13px;
+        }
+
+        .flow-arrow {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 32px;
+            font-size: 28px;
+            color: #94a3b8;
+        }
+
+        .timeline {
+            position: relative;
+            margin-top: 8px;
+            padding-left: 22px;
+        }
+
+        .timeline:before {
+            content: '';
+            position: absolute;
+            left: 10px;
+            top: 8px;
+            bottom: 8px;
+            width: 2px;
+            background: #dbe4ee;
+        }
+
+        .timeline-item {
+            position: relative;
+            margin-bottom: 18px;
+        }
+
+        .timeline-dot {
+            position: absolute;
+            left: -17px;
+            top: 22px;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #38bdf8;
+            border: 2px solid white;
+            box-shadow: 0 0 0 2px #bae6fd;
+        }
+
+        details summary {
+            list-style: none;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            font-weight: 700;
+        }
+
+        details summary::-webkit-details-marker {
+            display: none;
+        }
+
+        details summary::before {
+            content: '+';
+            width: 22px;
+            height: 22px;
+            line-height: 20px;
+            text-align: center;
+            border-radius: 50%;
+            border: 1px solid #cbd5e1;
+            color: #334155;
+            flex: 0 0 22px;
+            background: #fff;
+            font-weight: 700;
+        }
+
+        details[open] summary::before {
+            content: '−';
+        }
+
+        .summary-right {
+            margin-left: auto;
+            color: #475569;
+            font-weight: 600;
+            font-size: 13px;
+        }
+
+        .sum-left {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .block {
+            padding: 10px 12px;
+            background: linear-gradient(180deg, #ffffff 0%, #fcfdff 100%);
+        }
+
+        .op-family {
+            padding: 10px 12px;
+            margin-top: 10px;
+        }
+
+        .block-meta {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin: 12px 0 8px 34px;
+        }
+
+        .chip {
+            display: inline-flex;
+            padding: 5px 10px;
+            border-radius: 999px;
+            border: 1px solid #dbe4ee;
+            background: #f8fbff;
+            color: #334155;
+            font-size: 12px;
+        }
+
+        .subgraph-wrap {
+            margin: 12px 0 10px 34px;
+            padding: 14px;
+            border: 1px dashed #cbd5e1;
+            border-radius: 16px;
+            background: #fbfdff;
+        }
+
+        .subgraph-lane + .subgraph-lane {
+            margin-top: 16px;
+        }
+
+        .lane-title {
+            font-size: 13px;
+            font-weight: 800;
+            color: #0f172a;
+            margin-bottom: 8px;
+        }
+
+        .subgraph-flow {
+            display: flex;
+            gap: 10px;
+            overflow-x: auto;
+            align-items: stretch;
+            padding-bottom: 4px;
+        }
+
+        .sg-arrow {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 22px;
+            color: #94a3b8;
+            font-size: 20px;
+        }
+
+        .comp-box {
+            min-width: 160px;
+            border-radius: 14px;
+            border: 1px solid #dbe4ee;
+            background: #fff;
+            padding: 10px;
+            box-shadow: 0 2px 10px rgba(15, 23, 42, .03);
+        }
+
+        .comp-box.norm {
+            background: #f8fafc;
+        }
+
+        .comp-box.proj {
+            background: #eff6ff;
+        }
+
+        .comp-box.index {
+            background: #f5f3ff;
+        }
+
+        .comp-box.attn {
+            background: #ecfeff;
+        }
+
+        .comp-box.memory {
+            background: #ecfdf5;
+        }
+
+        .comp-box.comm {
+            background: #fef2f2;
+        }
+
+        .comp-box.router {
+            background: #fff7ed;
+        }
+
+        .comp-box.act {
+            background: #faf5ff;
+        }
+
+        .comp-box.shared {
+            background: #fdf2f8;
+        }
+
+        .comp-box.resid {
+            background: #f8fafc;
+        }
+
+        .cb-title {
+            font-weight: 800;
+            font-size: 13px;
+        }
+
+        .cb-ms {
+            font-size: 20px;
+            font-weight: 800;
+            margin-top: 8px;
+        }
+
+        .cb-meta {
+            color: #64748b;
+            margin-top: 6px;
+            font-size: 11px;
+            line-height: 1.4;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 12px;
+            font-size: 12px;
+            background: white;
+        }
+
+        th, td {
+            border-bottom: 1px solid #e5e7eb;
+            padding: 8px;
+            text-align: right;
+            vertical-align: top;
+        }
+
+        th:nth-child(1), td:nth-child(1), th:nth-child(2), td:nth-child(2), th:nth-child(3), td:nth-child(3), th:nth-child(4), td:nth-child(4) {
+            text-align: left;
+        }
+
+        th {
+            position: sticky;
+            top: 0;
+            background: #fff;
+            z-index: 1;
+        }
+
+        code {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .bound-compute {
+            color: #9a3412;
+            font-weight: 700;
+        }
+
+        .bound-memory {
+            color: #047857;
+            font-weight: 700;
+        }
+
+        .bound-communication {
+            color: #3730a3;
+            font-weight: 700;
+        }
+
+        .viz-wrap {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .viz-tabs {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+
+        .viz-tab {
+            border: 1px solid #cbd5e1;
+            background: #fff;
+            border-radius: 999px;
+            padding: 8px 14px;
+            font-weight: 700;
+            color: #334155;
+            cursor: pointer;
+        }
+
+        .viz-tab.active {
+            background: #1d4ed8;
+            color: #fff;
+            border-color: #1d4ed8;
+        }
+
+        .viz-panel {
+            display: none;
+        }
+
+        .viz-panel.active {
+            display: block;
+        }
+
+        .viz-hint {
+            color: #64748b;
+            font-size: 13px;
+        }
+
+        .arch-svg {
+            width: 100%;
+            height: auto;
+            background: #fff;
+            border: 1px solid var(--line);
+            border-radius: 22px;
+        }
+
+        .cite-link {
+            display: inline-block;
+            font-weight: 700;
+        }
+
+        .cite-note {
+            margin-top: 4px;
+            color: #64748b;
+            font-size: 11px;
+            line-height: 1.4;
+        }
+
+        .te-wrap {
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+        }
+
+        .te-header {
+            display: flex;
+            justify-content: space-between;
+            gap: 18px;
+            align-items: flex-end;
+        }
+
+        .te-kicker {
+            color: #7c3aed;
+            font-size: 12px;
+            font-weight: 800;
+            letter-spacing: .08em;
+            text-transform: uppercase;
+        }
+
+        .te-title {
+            font-size: 26px;
+            font-weight: 850;
+            margin-top: 4px;
+        }
+
+        .te-desc {
+            max-width: 560px;
+            color: #64748b;
+            line-height: 1.6;
+        }
+
+        .te-info-grid {
+            display: grid;
+            grid-template-columns:repeat(6, minmax(110px, 1fr));
+            gap: 10px;
+        }
+
+        .te-info-chip {
+            border: 1px solid #dbe4ee;
+            border-radius: 14px;
+            background: linear-gradient(180deg, #fbfdff 0%, #fff 100%);
+            padding: 10px 12px;
+        }
+
+        .tic-k {
+            font-size: 11px;
+            color: #64748b;
+            text-transform: uppercase;
+            letter-spacing: .04em;
+        }
+
+        .tic-v {
+            font-size: 18px;
+            font-weight: 800;
+            margin-top: 4px;
+        }
+
+        .te-legend {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        .te-pill {
+            display: inline-flex;
+            align-items: center;
+            padding: 4px 10px;
+            border-radius: 999px;
+            font-size: 12px;
+            border: 1px solid #dbe4ee;
+            background: #fff;
+            color: #334155;
+            font-weight: 700;
+        }
+
+        .te-pill.norm {
+            background: #f8fafc;
+        }
+
+        .te-pill.attn {
+            background: #ecfeff;
+        }
+
+        .te-pill.proj {
+            background: #eff6ff;
+        }
+
+        .te-pill.act {
+            background: #faf5ff;
+        }
+
+        .te-pill.moe {
+            background: #eef2ff;
+        }
+
+        .te-pill.comm {
+            background: #fef2f2;
+        }
+
+        .te-pill.shared {
+            background: #fdf2f8;
+        }
+
+        .te-pill.resid {
+            background: #f1f5f9;
+        }
+
+        .te-pill.router {
+            background: #fff7ed;
+        }
+
+        .te-pill-arrow {
+            color: #94a3b8;
+            padding: 0 6px;
+            font-weight: 800;
+        }
+
+        .te-board {
+            position: relative;
+            border: 1px solid #dbe4ee;
+            border-radius: 24px;
+            padding: 20px 18px 18px;
+            background: radial-gradient(circle at top left, #eff6ff, transparent 18%), linear-gradient(180deg, #fbfdff 0%, #fff 100%);
+            overflow: hidden;
+        }
+
+        .te-rail-label {
+            position: absolute;
+            top: 12px;
+            left: 18px;
+            font-size: 11px;
+            color: #64748b;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: .04em;
+        }
+
+        .te-flow {
+            display: flex;
+            align-items: stretch;
+            gap: 12px;
+            overflow-x: auto;
+            padding-top: 20px;
+        }
+
+        .te-arrow {
+            min-width: 30px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #94a3b8;
+            font-size: 26px;
+            font-weight: 800;
+        }
+
+        .te-arrow.train {
+            min-width: 20px;
+            font-size: 22px;
+        }
+
+        .te-stage {
+            min-width: 180px;
+            padding: 16px;
+            border-radius: 18px;
+            border: 1px solid #dbe4ee;
+            background: #fff;
+            box-shadow: 0 4px 16px rgba(15, 23, 42, .04);
+        }
+
+        .te-stage.input {
+            background: #f8fafc;
+        }
+
+        .te-stage.embed {
+            background: #eff6ff;
+        }
+
+        .te-stage.output {
+            background: #eef2ff;
+        }
+
+        .te-stage-title {
+            font-size: 18px;
+            font-weight: 850;
+        }
+
+        .te-stage-sub {
+            color: #64748b;
+            line-height: 1.45;
+            font-size: 13px;
+            margin-top: 6px;
+            min-height: 38px;
+        }
+
+        .te-stage-metric {
+            margin-top: 12px;
+            font-size: 22px;
+            font-weight: 850;
+        }
+
+        .te-stack-card {
+            min-width: 430px;
+            border-radius: 22px;
+            border: 1px solid #dbe4ee;
+            background: #fff;
+            padding: 16px;
+            box-shadow: 0 8px 28px rgba(15, 23, 42, .06);
+        }
+
+        .te-stack-card.dense {
+            background: linear-gradient(180deg, #fcfdff 0%, #fff 100%);
+        }
+
+        .te-stack-card.moe {
+            background: linear-gradient(180deg, #fefcff 0%, #fff 100%);
+        }
+
+        .te-stack-head {
+            display: flex;
+            justify-content: space-between;
+            gap: 14px;
+            align-items: flex-start;
+        }
+
+        .te-stack-title {
+            font-size: 20px;
+            font-weight: 850;
+        }
+
+        .te-stack-times {
+            margin-top: 4px;
+            color: #7c3aed;
+            font-weight: 800;
+        }
+
+        .te-stack-metric {
+            font-size: 24px;
+            font-weight: 850;
+            white-space: nowrap;
+        }
+
+        .te-stack-sub {
+            color: #64748b;
+            margin-top: 4px;
+            font-size: 13px;
+        }
+
+        .te-residual-rail {
+            margin-top: 12px;
+            border: 1px dashed #cbd5e1;
+            border-radius: 999px;
+            background: #f8fafc;
+            color: #475569;
+            font-weight: 700;
+            padding: 6px 12px;
+            font-size: 12px;
+        }
+
+        .te-track {
+            margin-top: 12px;
+            border: 1px solid #e6eef6;
+            border-radius: 16px;
+            padding: 12px;
+            background: #fbfdff;
+        }
+
+        .te-track-title {
+            font-size: 13px;
+            font-weight: 850;
+        }
+
+        .te-track-metric {
+            color: #64748b;
+            margin-top: 4px;
+            font-size: 12px;
+        }
+
+        .te-pill-row {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            margin-top: 10px;
+        }
+
+        .te-stack-note {
+            margin-top: 12px;
+            color: #475569;
+            font-size: 13px;
+            line-height: 1.5;
+        }
+
+        .te-training-wrap {
+            border: 1px dashed #cbd5e1;
+            border-radius: 18px;
+            padding: 16px;
+            background: #fbfdff;
+        }
+
+        .te-training-title {
+            font-size: 18px;
+            font-weight: 850;
+        }
+
+        .te-training-meta {
+            color: #64748b;
+            margin-top: 4px;
+            font-size: 13px;
+        }
+
+        .te-training-flow {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            overflow-x: auto;
+            margin-top: 12px;
+        }
+
+        .te-train-chip {
+            min-width: 160px;
+            border-radius: 16px;
+            border: 1px solid #dbe4ee;
+            padding: 12px;
+            background: #fff;
+        }
+
+        .ttc-title {
+            font-size: 13px;
+            font-weight: 800;
+            color: #334155;
+        }
+
+        .ttc-ms {
+            margin-top: 8px;
+            font-size: 20px;
+            font-weight: 850;
+        }
+
+        @media (max-width: 1080px) {
+            .cards {
+                grid-template-columns:repeat(2, minmax(160px, 1fr));
+            }
+
+            .subcards {
+                grid-template-columns:repeat(2, minmax(180px, 1fr));
+            }
+
+            .te-info-grid {
+                grid-template-columns:repeat(3, minmax(110px, 1fr));
+            }
+        }
+    </style>
+</head>
+<body>
+<div class='main'>
+    <div class='hero'>
+        <h1>AI Infra Performance Report</h1>
+        <div class='subtitle'><b>模型：</b>DeepSeek-V4-Pro-MTP3 ｜ <b>硬件：</b>Huawei-Ascend-950DT-144GB-x8 ｜ <b>拓扑：</b>Atlas-950POD-2Node-16NPU
+            ｜ <b>并行策略：</b>TP2_PP1_DP1_EP8_CP1_MB1
+        </div>
+        <div class='meta-line'>场景=decode ｜ Batch=128 ｜ Prefill Seq=8192 ｜ Decode/KV Seq=8192 ｜ Output Tokens=1 ｜
+            Active Params≈49B ｜ Total Params≈1600B
+        </div>
+        <div class='cards'>
+            <div class='card'>
+                <div>Prefill Latency</div>
+                <div class='value'>0.000 ms</div>
+                <small>当前报告聚焦 decode</small></div>
+            <div class='card'>
+                <div>MTP-adjusted TPOT</div>
+                <div class='value'>17.625 ms</div>
+                <small>effective tokens/iteration=2.95</small></div>
+            <div class='card'>
+                <div>Decode TPS</div>
+                <div class='value'>7,262.3</div>
+                <small>tokens/s</small></div>
+            <div class='card'>
+                <div>Memory / GPU</div>
+                <div class='value'>52.0 GB</div>
+                <small>weights + latent KV + scratch</small></div>
+            <div class='card'>
+                <div>Model Blocks</div>
+                <div class='value'>3</div>
+                <small>支持展开到算子层</small></div>
+        </div>
+    </div>
+    <div class='section'><h2>总体 Bound</h2>
+        <div class="bar communication">
+            <div style="width:1.0%"></div>
+            <span>communication: 0.23 ms (0.4%)</span></div>
+        <div class="bar compute">
+            <div style="width:96.9%"></div>
+            <span>compute: 50.49 ms (96.9%)</span></div>
+        <div class="bar memory">
+            <div style="width:2.6%"></div>
+            <span>memory: 1.37 ms (2.6%)</span></div>
+        <div class='legend'>橙色=计算受限，绿色=访存受限，紫色=通信受限。</div>
+    </div>
+    <div class='section'><h2>逻辑集群拓扑图</h2>
+        <svg class="topo-svg" viewBox="0 0 1148 494" xmlns="http://www.w3.org/2000/svg">
+            <rect fill="#f8fbff" height="478" rx="20" stroke="#d8e3f0" width="1132" x="8" y="8"/>
+            <text fill="#0f172a" font-size="19" font-weight="700" x="24" y="34">逻辑集群拓扑连接图（TP/EP 并行域着色）
+            </text>
+            <text fill="#475569" font-size="12" x="24" y="56">World=16 · Nodes=2 · GPUs/Node=8 · Intra-node
+                NVLink/NVSwitch≈16000 GB/s · Interconnect≈16000 Gb/s · Rails=16
+            </text>
+            <text fill="#334155" font-size="12" font-weight="700" x="24" y="76">TP 组着色</text>
+            <rect fill="#dbeafe" height="10" rx="3" stroke="#94a3b8" width="18" x="98" y="66"/>
+            <text fill="#475569" font-size="10" x="120" y="76">TP0</text>
+            <rect fill="#ede9fe" height="10" rx="3" stroke="#94a3b8" width="18" x="156" y="66"/>
+            <text fill="#475569" font-size="10" x="178" y="76">TP1</text>
+            <text fill="#334155" font-size="12" font-weight="700" x="222" y="76">EP 组边框</text>
+            <rect fill="#ffffff" height="10" rx="3" stroke="#2563eb" stroke-width="2" width="18" x="302" y="66"/>
+            <text fill="#475569" font-size="10" x="324" y="76">EP0</text>
+            <rect fill="#ffffff" height="10" rx="3" stroke="#7c3aed" stroke-width="2" width="18" x="360" y="66"/>
+            <text fill="#475569" font-size="10" x="382" y="76">EP1</text>
+            <rect fill="#ffffff" height="10" rx="3" stroke="#059669" stroke-width="2" width="18" x="418" y="66"/>
+            <text fill="#475569" font-size="10" x="440" y="76">EP2</text>
+            <rect fill="#ffffff" height="10" rx="3" stroke="#ea580c" stroke-width="2" width="18" x="476" y="66"/>
+            <text fill="#475569" font-size="10" x="498" y="76">EP3</text>
+            <rect fill="#ffffff" height="10" rx="3" stroke="#dc2626" stroke-width="2" width="18" x="534" y="66"/>
+            <text fill="#475569" font-size="10" x="556" y="76">EP4</text>
+            <rect fill="#ffffff" height="10" rx="3" stroke="#0891b2" stroke-width="2" width="18" x="592" y="66"/>
+            <text fill="#475569" font-size="10" x="614" y="76">EP5</text>
+            <rect fill="#ffffff" height="10" rx="3" stroke="#db2777" stroke-width="2" width="18" x="650" y="66"/>
+            <text fill="#475569" font-size="10" x="672" y="76">EP6</text>
+            <rect fill="#ffffff" height="10" rx="3" stroke="#65a30d" stroke-width="2" width="18" x="708" y="66"/>
+            <text fill="#475569" font-size="10" x="730" y="76">EP7</text>
+            <rect fill="#ffffff" height="340" rx="16" stroke="#cbd5e1" width="1100" x="24" y="96"/>
+            <text fill="#0f172a" font-size="14" font-weight="700" x="40" y="120">Rack 0 / 机框 0</text>
+            <rect fill="#eef2ff" height="34" rx="10" stroke="#818cf8" width="120" x="974" y="120"/>
+            <text fill="#3730a3" font-size="12" font-weight="700" x="986" y="138">Spine / Leaf</text>
+            <text fill="#4f46e5" font-size="10" x="986" y="150">16000 Gb/s</text>
+            <rect fill="#f8fafc" height="118" rx="12" stroke="#cbd5e1" width="214" x="40" y="146"/>
+            <text fill="#0f172a" font-size="12" font-weight="700" x="48" y="162">Node 0</text>
+            <text fill="#475569" font-size="9" x="48" y="175">NVSwitch / NVLink 16000 GB/s</text>
+            <rect fill="#dcfce7" height="16" rx="7" stroke="#22c55e" width="74" x="111" y="230"/>
+            <text fill="#166534" font-size="9" x="121" y="241">NV Fabric</text>
+            <line stroke="#94a3b8" stroke-dasharray="4 3" x1="254" x2="974" y1="205.0" y2="137"/>
+            <text fill="#475569" font-size="9" x="596" y="167">16000 Gb/s</text>
+            <rect fill="#dbeafe" height="18" rx="4" stroke="#2563eb" stroke-width="2" width="43" x="48" y="184"/>
+            <text fill="#0f172a" font-size="6.5" font-weight="700" x="51" y="192">GPU0/R0</text>
+            <text fill="#334155" font-size="5.8" x="51" y="199">D0 P0 T0 E0 C0</text>
+            <rect fill="#dbeafe" height="18" rx="4" stroke="#7c3aed" stroke-width="2" width="43" x="97" y="184"/>
+            <text fill="#0f172a" font-size="6.5" font-weight="700" x="100" y="192">GPU1/R1</text>
+            <text fill="#334155" font-size="5.8" x="100" y="199">D0 P0 T0 E1 C0</text>
+            <rect fill="#dbeafe" height="18" rx="4" stroke="#059669" stroke-width="2" width="43" x="146" y="184"/>
+            <text fill="#0f172a" font-size="6.5" font-weight="700" x="149" y="192">GPU2/R2</text>
+            <text fill="#334155" font-size="5.8" x="149" y="199">D0 P0 T0 E2 C0</text>
+            <rect fill="#dbeafe" height="18" rx="4" stroke="#ea580c" stroke-width="2" width="43" x="195" y="184"/>
+            <text fill="#0f172a" font-size="6.5" font-weight="700" x="198" y="192">GPU3/R3</text>
+            <text fill="#334155" font-size="5.8" x="198" y="199">D0 P0 T0 E3 C0</text>
+            <rect fill="#dbeafe" height="18" rx="4" stroke="#dc2626" stroke-width="2" width="43" x="48" y="207"/>
+            <text fill="#0f172a" font-size="6.5" font-weight="700" x="51" y="215">GPU4/R4</text>
+            <text fill="#334155" font-size="5.8" x="51" y="222">D0 P0 T0 E4 C0</text>
+            <rect fill="#dbeafe" height="18" rx="4" stroke="#0891b2" stroke-width="2" width="43" x="97" y="207"/>
+            <text fill="#0f172a" font-size="6.5" font-weight="700" x="100" y="215">GPU5/R5</text>
+            <text fill="#334155" font-size="5.8" x="100" y="222">D0 P0 T0 E5 C0</text>
+            <rect fill="#dbeafe" height="18" rx="4" stroke="#db2777" stroke-width="2" width="43" x="146" y="207"/>
+            <text fill="#0f172a" font-size="6.5" font-weight="700" x="149" y="215">GPU6/R6</text>
+            <text fill="#334155" font-size="5.8" x="149" y="222">D0 P0 T0 E6 C0</text>
+            <rect fill="#dbeafe" height="18" rx="4" stroke="#65a30d" stroke-width="2" width="43" x="195" y="207"/>
+            <text fill="#0f172a" font-size="6.5" font-weight="700" x="198" y="215">GPU7/R7</text>
+            <text fill="#334155" font-size="5.8" x="198" y="222">D0 P0 T0 E7 C0</text>
+            <line stroke="#86efac" x1="69.5" x2="148" y1="202" y2="230"/>
+            <line stroke="#86efac" x1="118.5" x2="148" y1="202" y2="230"/>
+            <line stroke="#86efac" x1="167.5" x2="148" y1="202" y2="230"/>
+            <line stroke="#86efac" x1="216.5" x2="148" y1="202" y2="230"/>
+            <line stroke="#86efac" x1="69.5" x2="148" y1="225" y2="230"/>
+            <line stroke="#86efac" x1="118.5" x2="148" y1="225" y2="230"/>
+            <line stroke="#86efac" x1="167.5" x2="148" y1="225" y2="230"/>
+            <line stroke="#86efac" x1="216.5" x2="148" y1="225" y2="230"/>
+            <rect fill="#f8fafc" height="118" rx="12" stroke="#cbd5e1" width="214" x="266" y="146"/>
+            <text fill="#0f172a" font-size="12" font-weight="700" x="274" y="162">Node 1</text>
+            <text fill="#475569" font-size="9" x="274" y="175">NVSwitch / NVLink 16000 GB/s</text>
+            <rect fill="#dcfce7" height="16" rx="7" stroke="#22c55e" width="74" x="337" y="230"/>
+            <text fill="#166534" font-size="9" x="347" y="241">NV Fabric</text>
+            <line stroke="#94a3b8" stroke-dasharray="4 3" x1="480" x2="974" y1="205.0" y2="137"/>
+            <text fill="#475569" font-size="9" x="709" y="167">16000 Gb/s</text>
+            <rect fill="#ede9fe" height="18" rx="4" stroke="#2563eb" stroke-width="2" width="43" x="274" y="184"/>
+            <text fill="#0f172a" font-size="6.5" font-weight="700" x="277" y="192">GPU0/R8</text>
+            <text fill="#334155" font-size="5.8" x="277" y="199">D0 P0 T1 E0 C0</text>
+            <rect fill="#ede9fe" height="18" rx="4" stroke="#7c3aed" stroke-width="2" width="43" x="323" y="184"/>
+            <text fill="#0f172a" font-size="6.5" font-weight="700" x="326" y="192">GPU1/R9</text>
+            <text fill="#334155" font-size="5.8" x="326" y="199">D0 P0 T1 E1 C0</text>
+            <rect fill="#ede9fe" height="18" rx="4" stroke="#059669" stroke-width="2" width="43" x="372" y="184"/>
+            <text fill="#0f172a" font-size="6.5" font-weight="700" x="375" y="192">GPU2/R10</text>
+            <text fill="#334155" font-size="5.8" x="375" y="199">D0 P0 T1 E2 C0</text>
+            <rect fill="#ede9fe" height="18" rx="4" stroke="#ea580c" stroke-width="2" width="43" x="421" y="184"/>
+            <text fill="#0f172a" font-size="6.5" font-weight="700" x="424" y="192">GPU3/R11</text>
+            <text fill="#334155" font-size="5.8" x="424" y="199">D0 P0 T1 E3 C0</text>
+            <rect fill="#ede9fe" height="18" rx="4" stroke="#dc2626" stroke-width="2" width="43" x="274" y="207"/>
+            <text fill="#0f172a" font-size="6.5" font-weight="700" x="277" y="215">GPU4/R12</text>
+            <text fill="#334155" font-size="5.8" x="277" y="222">D0 P0 T1 E4 C0</text>
+            <rect fill="#ede9fe" height="18" rx="4" stroke="#0891b2" stroke-width="2" width="43" x="323" y="207"/>
+            <text fill="#0f172a" font-size="6.5" font-weight="700" x="326" y="215">GPU5/R13</text>
+            <text fill="#334155" font-size="5.8" x="326" y="222">D0 P0 T1 E5 C0</text>
+            <rect fill="#ede9fe" height="18" rx="4" stroke="#db2777" stroke-width="2" width="43" x="372" y="207"/>
+            <text fill="#0f172a" font-size="6.5" font-weight="700" x="375" y="215">GPU6/R14</text>
+            <text fill="#334155" font-size="5.8" x="375" y="222">D0 P0 T1 E6 C0</text>
+            <rect fill="#ede9fe" height="18" rx="4" stroke="#65a30d" stroke-width="2" width="43" x="421" y="207"/>
+            <text fill="#0f172a" font-size="6.5" font-weight="700" x="424" y="215">GPU7/R15</text>
+            <text fill="#334155" font-size="5.8" x="424" y="222">D0 P0 T1 E7 C0</text>
+            <line stroke="#86efac" x1="295.5" x2="374" y1="202" y2="230"/>
+            <line stroke="#86efac" x1="344.5" x2="374" y1="202" y2="230"/>
+            <line stroke="#86efac" x1="393.5" x2="374" y1="202" y2="230"/>
+            <line stroke="#86efac" x1="442.5" x2="374" y1="202" y2="230"/>
+            <line stroke="#86efac" x1="295.5" x2="374" y1="225" y2="230"/>
+            <line stroke="#86efac" x1="344.5" x2="374" y1="225" y2="230"/>
+            <line stroke="#86efac" x1="393.5" x2="374" y1="225" y2="230"/>
+            <line stroke="#86efac" x1="442.5" x2="374" y1="225" y2="230"/>
+        </svg>
+        <div class='legend'>本图中：GPU 背景色表示 TP 并行域，GPU 边框颜色表示 EP 并行域；节点内部展示
+            NVSwitch/NVLink，节点与机框交换网络之间展示集群互联带宽。
+        </div>
+    </div>
+    <div class='section'><h2>模型结构（v0.9.1 交互式 SVG 视图）</h2>
+        <div class='viz-wrap'>
+            <div class='viz-tabs'>
+                <button class='viz-tab active' data-target='viz-forward'>Forward 结构视图</button>
+            </div>
+            <div class='viz-panel active' id='viz-forward'>
+                <svg class='arch-svg' viewBox='0 0 1480 360' xmlns='http://www.w3.org/2000/svg'>
+                    <defs>
+                        <marker id='arrowHead' markerHeight='10' markerWidth='10' orient='auto' refX='7' refY='3'>
+                            <path d='M0,0 L0,6 L8,3 z' fill='#94a3b8'/>
+                        </marker>
+                    </defs>
+                    <rect fill='#fbfdff' height='344' rx='28' stroke='#dbe4ee' width='1464' x='8' y='8'/>
+                    <text fill='#0f172a' font-size='20' font-weight='800' x='26' y='34'>Forward / Main Path</text>
+                    <text fill='#64748b' font-size='12' font-weight='600' x='26' y='56'>SVG
+                        连线化模型结构图：展示主干流、重复层和子结构关系
+                    </text>
+                    <rect fill='#f8fafc' height='140' rx='22' stroke='#cbd5e1' stroke-width='2' width='140' x='36'
+                          y='100'/>
+                    <text fill='#0f172a' font-size='20' font-weight='800' x='52' y='130'>Input</text>
+                    <text fill='#475569' font-size='12' font-weight='600' x='52' y='154'>B×S=128×8192</text>
+                    <text fill='#0f172a' font-size='22' font-weight='850' x='52' y='220'>0.003 ms</text>
+                    <rect fill='#eff6ff' height='140' rx='22' stroke='#93c5fd' stroke-width='2' width='180' x='200'
+                          y='100'/>
+                    <text fill='#0f172a' font-size='20' font-weight='800' x='216' y='130'>Embedding</text>
+                    <text fill='#475569' font-size='12' font-weight='600' x='216' y='154'>hidden=7168 · dtype=fp8</text>
+                    <text fill='#0f172a' font-size='22' font-weight='850' x='216' y='220'>0.003 ms</text>
+                    <rect fill='#fefcff' height='225' rx='22' stroke='#d8b4fe' stroke-width='2' width='360' x='410'
+                          y='58'/>
+                    <text fill='#0f172a' font-size='20' font-weight='800' x='426' y='88'>MoE Block × 61</text>
+                    <text fill='#475569' font-size='12' font-weight='600' x='426' y='112'>routed=384 · active/token=6
+                    </text>
+                    <text fill='#0f172a' font-size='22' font-weight='850' x='426' y='263'>50.739 ms</text>
+                    <rect fill='#f8fafc' height='24' rx='12' stroke='#cbd5e1' width='72' x='426' y='136'/>
+                    <text fill='#334155' font-size='11' font-weight='700' x='436' y='152'>Norm</text>
+                    <rect fill='#ecfeff' height='24' rx='12' stroke='#67e8f9' width='92' x='506' y='136'/>
+                    <text fill='#334155' font-size='11' font-weight='700' x='516' y='152'>Attention</text>
+                    <rect fill='#f1f5f9' height='24' rx='12' stroke='#cbd5e1' width='78' x='606' y='136'/>
+                    <text fill='#334155' font-size='11' font-weight='700' x='616' y='152'>Residual</text>
+                    <rect fill='#fff7ed' height='24' rx='12' stroke='#fdba74' width='70' x='426' y='170'/>
+                    <text fill='#334155' font-size='11' font-weight='700' x='436' y='186'>Router</text>
+                    <rect fill='#fef2f2' height='24' rx='12' stroke='#fca5a5' width='78' x='504' y='170'/>
+                    <text fill='#334155' font-size='11' font-weight='700' x='514' y='186'>Dispatch</text>
+                    <rect fill='#eef2ff' height='24' rx='12' stroke='#a5b4fc' width='76' x='590' y='170'/>
+                    <text fill='#334155' font-size='11' font-weight='700' x='600' y='186'>Experts</text>
+                    <rect fill='#fef2f2' height='24' rx='12' stroke='#fca5a5' width='76' x='674' y='170'/>
+                    <text fill='#334155' font-size='11' font-weight='700' x='684' y='186'>Combine</text>
+                    <rect fill='#fdf2f8' height='24' rx='12' stroke='#f9a8d4' width='72' x='426' y='204'/>
+                    <text fill='#334155' font-size='11' font-weight='700' x='436' y='220'>Shared</text>
+                    <rect fill='#f1f5f9' height='24' rx='12' stroke='#cbd5e1' width='78' x='506' y='204'/>
+                    <text fill='#334155' font-size='11' font-weight='700' x='516' y='220'>Residual</text>
+                    <rect fill='#eef2ff' height='140' rx='22' stroke='#a5b4fc' stroke-width='2' width='210' x='800'
+                          y='100'/>
+                    <text fill='#0f172a' font-size='20' font-weight='800' x='816' y='130'>Output</text>
+                    <text fill='#475569' font-size='12' font-weight='600' x='816' y='154'>Final Norm + LM Head</text>
+                    <text fill='#0f172a' font-size='22' font-weight='850' x='816' y='220'>1.346 ms</text>
+                    <line marker-end='url(#arrowHead)' stroke='#94a3b8' stroke-width='3' x1='176' x2='200' y1='170'
+                          y2='170'/>
+                    <line marker-end='url(#arrowHead)' stroke='#94a3b8' stroke-width='3' x1='380' x2='410' y1='170'
+                          y2='170'/>
+                    <text fill='#64748b' font-size='11' text-anchor='middle' x='395' y='160'>residual stream</text>
+                    <line marker-end='url(#arrowHead)' stroke='#94a3b8' stroke-width='3' x1='770' x2='800' y1='170'
+                          y2='170'/>
+                    <text fill='#64748b' font-size='11' text-anchor='middle' x='785' y='160'>residual stream</text>
+                </svg>
+            </div>
+            <div class='viz-hint'>点击上方标签即可切换结构视图。SVG
+                图中使用连线显式表示主路径与反向梯度路径，适合培训、评审和报告演示。
+            </div>
+        </div>
+        <div class='legend'>交互式标签切换、SVG 连线化结构图，以及训练场景的 Forward / Backward 双视图。</div>
+    </div>
+    <div class='section'><h2>模型 → Block → 子结构 → 算子分层展开</h2>
+        <div class='timeline'>
+            <div class='timeline-item'>
+                <div class='timeline-dot'></div>
+                <details class='block' open>
+                    <summary><span class='sum-left'>decode.Embedding </span><span class='summary-right'>0.003 ms · Share 0.0% · compute bound</span>
+                    </summary>
+                    <div class='block-meta'><span class='chip'>重复层数: 1</span><span
+                            class='chip'>主导瓶颈: compute</span><span class='chip'>算子族数量: 1</span></div>
+                    <div class='subgraph-wrap'>
+                        <div class='subgraph-lane'>
+                            <div class='lane-title'>Embedding / Input</div>
+                            <div class='subgraph-flow'>
+                                <div class='comp-box proj'>
+                                    <div class='cb-title'>Embedding Lookup / Input Activation</div>
+                                    <div class='cb-ms'>0.003 ms</div>
+                                    <div class='cb-meta'>FLOPs 0.00 TF · HBM 1.75 MB</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <details class='op-family'>
+                        <summary><span>aten.embedding_or_input_activation</span><span class='summary-right'>0.003 ms · 100.0% · compute bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>1</td>
+                                <td>aten.embedding</td>
+                                <td><code>tokens=128, hidden=7168</code></td>
+                                <td><code>bytes≈2*T*H*dtype</code></td>
+                                <td>0.0000</td>
+                                <td>1.75 MB</td>
+                                <td>0 B</td>
+                                <td>0.0025</td>
+                                <td>0.0011</td>
+                                <td>0.0000</td>
+                                <td><b>0.0025</b></td>
+                                <td class='bound-compute'>compute</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                </details>
+            </div>
+            <div class='timeline-item'>
+                <div class='timeline-dot'></div>
+                <details class='block' open>
+                    <summary><span class='sum-left'>decode.MoEBlock × 61层</span><span class='summary-right'>50.739 ms · Share 97.4% · compute bound</span>
+                    </summary>
+                    <div class='block-meta'><span class='chip'>重复层数: 61</span><span
+                            class='chip'>主导瓶颈: compute</span><span class='chip'>算子族数量: 32</span></div>
+                    <div class='subgraph-wrap'>
+                        <div class='subgraph-lane'>
+                            <div class='lane-title'>Attention</div>
+                            <div class='subgraph-flow'>
+                                <div class='comp-box norm'>
+                                    <div class='cb-title'>RMSNorm</div>
+                                    <div class='cb-ms'>0.156 ms</div>
+                                    <div class='cb-meta'>FLOPs 0.00 TF · HBM 107.17 MB</div>
+                                </div>
+                                <div class='sg-arrow'>→</div>
+                                <div class='comp-box proj'>
+                                    <div class='cb-title'>Q Proj</div>
+                                    <div class='cb-ms'>3.903 ms</div>
+                                    <div class='cb-meta'>FLOPs 0.96 TF · HBM 3.80 GB</div>
+                                </div>
+                                <div class='sg-arrow'>→</div>
+                                <div class='comp-box proj'>
+                                    <div class='cb-title'>KV / Compressor</div>
+                                    <div class='cb-ms'>0.681 ms</div>
+                                    <div class='cb-meta'>FLOPs 0.06 TF · HBM 55.28 MB</div>
+                                </div>
+                                <div class='sg-arrow'>→</div>
+                                <div class='comp-box misc'>
+                                    <div class='cb-title'>RoPE</div>
+                                    <div class='cb-ms'>0.154 ms</div>
+                                    <div class='cb-meta'>FLOPs 0.00 TF · HBM 0 B</div>
+                                </div>
+                                <div class='sg-arrow'>→</div>
+                                <div class='comp-box index'>
+                                    <div class='cb-title'>DSA / CSA Index</div>
+                                    <div class='cb-ms'>1.368 ms</div>
+                                    <div class='cb-meta'>FLOPs 0.00 TF · HBM 0 B</div>
+                                </div>
+                                <div class='sg-arrow'>→</div>
+                                <div class='comp-box attn'>
+                                    <div class='cb-title'>Sparse / Hybrid Attention</div>
+                                    <div class='cb-ms'>2.113 ms</div>
+                                    <div class='cb-meta'>FLOPs 0.34 TF · HBM 1.68 GB</div>
+                                </div>
+                                <div class='sg-arrow'>→</div>
+                                <div class='comp-box memory'>
+                                    <div class='cb-title'>KV Append</div>
+                                    <div class='cb-ms'>0.153 ms</div>
+                                    <div class='cb-meta'>FLOPs 0.00 TF · HBM 57.66 MB</div>
+                                </div>
+                                <div class='sg-arrow'>→</div>
+                                <div class='comp-box comm'>
+                                    <div class='cb-title'>O Proj + TP AR</div>
+                                    <div class='cb-ms'>35.256 ms</div>
+                                    <div class='cb-meta'>FLOPs 9.30 TF · HBM 34.52 GB</div>
+                                </div>
+                                <div class='sg-arrow'>→</div>
+                                <div class='comp-box resid'>
+                                    <div class='cb-title'>Residual</div>
+                                    <div class='cb-ms'>0.957 ms</div>
+                                    <div class='cb-meta'>FLOPs 0.00 TF · HBM 747.25 MB</div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class='subgraph-lane'>
+                            <div class='lane-title'>MoE FFN</div>
+                            <div class='subgraph-flow'>
+                                <div class='comp-box norm'>
+                                    <div class='cb-title'>RMSNorm</div>
+                                    <div class='cb-ms'>0.156 ms</div>
+                                    <div class='cb-meta'>FLOPs 0.00 TF · HBM 107.17 MB</div>
+                                </div>
+                                <div class='sg-arrow'>→</div>
+                                <div class='comp-box router'>
+                                    <div class='cb-title'>Router</div>
+                                    <div class='cb-ms'>0.572 ms</div>
+                                    <div class='cb-meta'>FLOPs 0.00 TF · HBM 0 B</div>
+                                </div>
+                                <div class='sg-arrow'>→</div>
+                                <div class='comp-box comm'>
+                                    <div class='cb-title'>Dispatch A2A</div>
+                                    <div class='cb-ms'>0.093 ms</div>
+                                    <div class='cb-meta'>FLOPs 0.00 TF · HBM 0 B</div>
+                                </div>
+                                <div class='sg-arrow'>→</div>
+                                <div class='comp-box proj'>
+                                    <div class='cb-title'>Expert Gate-Up</div>
+                                    <div class='cb-ms'>1.205 ms</div>
+                                    <div class='cb-meta'>FLOPs 0.26 TF · HBM 1.01 GB</div>
+                                </div>
+                                <div class='sg-arrow'>→</div>
+                                <div class='comp-box act'>
+                                    <div class='cb-title'>Expert SwiGLU</div>
+                                    <div class='cb-ms'>0.153 ms</div>
+                                    <div class='cb-meta'>FLOPs 0.00 TF · HBM 25.73 MB</div>
+                                </div>
+                                <div class='sg-arrow'>→</div>
+                                <div class='comp-box proj'>
+                                    <div class='cb-title'>Expert Down</div>
+                                    <div class='cb-ms'>0.672 ms</div>
+                                    <div class='cb-meta'>FLOPs 0.13 TF · HBM 542.33 MB</div>
+                                </div>
+                                <div class='sg-arrow'>→</div>
+                                <div class='comp-box comm'>
+                                    <div class='cb-title'>Combine A2A</div>
+                                    <div class='cb-ms'>0.093 ms</div>
+                                    <div class='cb-meta'>FLOPs 0.00 TF · HBM 0 B</div>
+                                </div>
+                                <div class='sg-arrow'>→</div>
+                                <div class='comp-box shared'>
+                                    <div class='cb-title'>Shared Expert</div>
+                                    <div class='cb-ms'>2.396 ms</div>
+                                    <div class='cb-meta'>FLOPs 0.00 TF · HBM 0 B</div>
+                                </div>
+                                <div class='sg-arrow'>→</div>
+                                <div class='comp-box comm'>
+                                    <div class='cb-title'>Merge + TP AR</div>
+                                    <div class='cb-ms'>0.205 ms</div>
+                                    <div class='cb-meta'>FLOPs 0.00 TF · HBM 0 B</div>
+                                </div>
+                                <div class='sg-arrow'>→</div>
+                                <div class='comp-box resid'>
+                                    <div class='cb-title'>Residual</div>
+                                    <div class='cb-ms'>0.205 ms</div>
+                                    <div class='cb-meta'>FLOPs 0.00 TF · HBM 160.12 MB</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <details class='op-family'>
+                        <summary><span>aten.mm.grouped_o_down_proj</span><span class='summary-right'>31.640 ms · 62.4% · compute bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>61</td>
+                                <td>aten.mm</td>
+                                <td><code>A=[128,65536], W=[65536,16384], shard=tp:2</code></td>
+                                <td><code>flops=2*T*Cin*Cout/shard; bytes≈W/shard + A + Y</code></td>
+                                <td>8.3838</td>
+                                <td>31.04 GB</td>
+                                <td>0 B</td>
+                                <td>31.6402</td>
+                                <td>16.5654</td>
+                                <td>0.0000</td>
+                                <td><b>31.6402</b></td>
+                                <td class='bound-compute'>compute</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>aten.mm.grouped_o_up_proj</span><span class='summary-right'>3.596 ms · 7.1% · compute bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>61</td>
+                                <td>aten.mm</td>
+                                <td><code>A=[128,16384], W=[16384,7168], shard=tp:2</code></td>
+                                <td><code>flops=2*T*Cin*Cout/shard; bytes≈W/shard + A + Y</code></td>
+                                <td>0.9170</td>
+                                <td>3.48 GB</td>
+                                <td>0 B</td>
+                                <td>3.5965</td>
+                                <td>1.8580</td>
+                                <td>0.0000</td>
+                                <td><b>3.5965</b></td>
+                                <td class='bound-compute'>compute</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>aten.mm.q_up_proj</span><span class='summary-right'>3.104 ms · 6.1% · compute bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>61</td>
+                                <td>aten.mm</td>
+                                <td><code>A=[128,1536], W=[1536,65536], shard=tp:2</code></td>
+                                <td><code>flops=2*T*Cin*Cout/shard; bytes≈W/shard + A + Y</code></td>
+                                <td>0.7860</td>
+                                <td>3.11 GB</td>
+                                <td>0 B</td>
+                                <td>3.1045</td>
+                                <td>1.6593</td>
+                                <td>0.0000</td>
+                                <td><b>3.1045</b></td>
+                                <td class='bound-compute'>compute</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>deepseek_v4.csa_plus_swa_attention_decode</span><span class='summary-right'>1.747 ms · 3.4% · compute bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>30</td>
+                                <td>fused.csa_swa_attention</td>
+                                <td><code>mode=CSA, B=128, KV=8192, compressed=2048, sw=128, effective_KV=1152,
+                                    heads/tp=64, head_dim=512</code></td>
+                                <td><code>flops≈2*B*heads/tp*(compressed/topk + SWA_window)*head_dim;
+                                    bytes≈compressed_KV + SWA_KV</code></td>
+                                <td>0.2899</td>
+                                <td>1.33 GB</td>
+                                <td>0 B</td>
+                                <td>1.7471</td>
+                                <td>1.0896</td>
+                                <td>0.0000</td>
+                                <td><b>1.7471</b></td>
+                                <td class='bound-compute'>compute</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>aten.mm.shared_gate_up_proj</span><span class='summary-right'>1.444 ms · 2.8% · compute bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>61</td>
+                                <td>aten.mm</td>
+                                <td><code>A=[128,7168], W=[7168,6144], shard=tp:2</code></td>
+                                <td><code>flops=2*T*Cin*Cout/shard; bytes≈W/shard + A + Y</code></td>
+                                <td>0.3439</td>
+                                <td>1.33 GB</td>
+                                <td>0 B</td>
+                                <td>1.4440</td>
+                                <td>0.7074</td>
+                                <td>0.0000</td>
+                                <td><b>1.4440</b></td>
+                                <td class='bound-compute'>compute</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>deepgemm.grouped_gemm.expert_gate_up_proj</span><span class='summary-right'>1.205 ms · 2.4% · compute bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>61</td>
+                                <td>fused.grouped_gemm</td>
+                                <td><code>tokens=128, topk=6, expert_hidden=7168, expert_inter=3072, EP=8, TP=2</code>
+                                </td>
+                                <td><code>flops≈2*T*topk*H*(2I)/(TP*EP); bytes≈activated_expert_weights +
+                                    activations</code></td>
+                                <td>0.2579</td>
+                                <td>1.01 GB</td>
+                                <td>0 B</td>
+                                <td>1.2047</td>
+                                <td>0.5907</td>
+                                <td>0.0000</td>
+                                <td><b>1.2047</b></td>
+                                <td class='bound-compute'>compute</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>aten.mm.csa_indexer_q</span><span class='summary-right'>0.922 ms · 1.8% · compute bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>30</td>
+                                <td>aten.mm</td>
+                                <td><code>A=[128,7168], W=[7168,8192], shard=tp:2</code></td>
+                                <td><code>flops=2*T*Cin*Cout/shard; bytes≈W/shard + A + Y</code></td>
+                                <td>0.2255</td>
+                                <td>881.25 MB</td>
+                                <td>0 B</td>
+                                <td>0.9219</td>
+                                <td>0.4593</td>
+                                <td>0.0000</td>
+                                <td><b>0.9219</b></td>
+                                <td class='bound-compute'>compute</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>aten.mm.q_down_proj</span><span class='summary-right'>0.798 ms · 1.6% · compute bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>61</td>
+                                <td>aten.mm</td>
+                                <td><code>A=[128,7168], W=[7168,1536], shard=none:1</code></td>
+                                <td><code>flops=2*T*Cin*Cout/shard; bytes≈W/shard + A + Y</code></td>
+                                <td>0.1719</td>
+                                <td>705.31 MB</td>
+                                <td>0 B</td>
+                                <td>0.7982</td>
+                                <td>0.3676</td>
+                                <td>0.0000</td>
+                                <td><b>0.7982</b></td>
+                                <td class='bound-compute'>compute</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>aten.mm.shared_down_proj</span><span class='summary-right'>0.798 ms · 1.6% · compute bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>61</td>
+                                <td>aten.mm</td>
+                                <td><code>A=[128,3072], W=[3072,7168], shard=tp:2</code></td>
+                                <td><code>flops=2*T*Cin*Cout/shard; bytes≈W/shard + A + Y</code></td>
+                                <td>0.1719</td>
+                                <td>690.06 MB</td>
+                                <td>0 B</td>
+                                <td>0.7982</td>
+                                <td>0.3597</td>
+                                <td>0.0000</td>
+                                <td><b>0.7982</b></td>
+                                <td class='bound-compute'>compute</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>deepgemm.grouped_gemm.expert_down_proj</span><span class='summary-right'>0.672 ms · 1.3% · compute bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>61</td>
+                                <td>fused.grouped_gemm</td>
+                                <td><code>tokens=128, topk=6, expert_inter=3072, hidden=7168, EP=8, TP=2</code></td>
+                                <td><code>flops≈2*T*topk*I*H/(TP*EP); bytes≈activated_expert_weights +
+                                    activations</code></td>
+                                <td>0.1289</td>
+                                <td>542.33 MB</td>
+                                <td>0 B</td>
+                                <td>0.6725</td>
+                                <td>0.3106</td>
+                                <td>0.0000</td>
+                                <td><b>0.6725</b></td>
+                                <td class='bound-compute'>compute</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>deepseek_v4.fp4_csa_index_scores</span><span class='summary-right'>0.447 ms · 0.9% · compute bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>30</td>
+                                <td>fused.fp4_indexer_qk</td>
+                                <td><code>scores=[128,32,2048], index_dim=128, fp4_qk=True</code></td>
+                                <td><code>FP4 indexer QK: 2*T*H_index*(S/m)*D_index/TP</code></td>
+                                <td>0.0644</td>
+                                <td>255.00 MB</td>
+                                <td>0 B</td>
+                                <td>0.4466</td>
+                                <td>0.2041</td>
+                                <td>0.0000</td>
+                                <td><b>0.4466</b></td>
+                                <td class='bound-compute'>compute</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>aten.mm.router_logits</span><span class='summary-right'>0.419 ms · 0.8% · compute bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>61</td>
+                                <td>aten.mm</td>
+                                <td><code>A=[128,7168], W=[7168,384], shard=none:1</code></td>
+                                <td><code>flops=2*T*Cin*Cout/shard; bytes≈W/shard + A + Y</code></td>
+                                <td>0.0430</td>
+                                <td>216.36 MB</td>
+                                <td>0 B</td>
+                                <td>0.4195</td>
+                                <td>0.1865</td>
+                                <td>0.0000</td>
+                                <td><b>0.4195</b></td>
+                                <td class='bound-compute'>compute</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>deepseek_v4.fused_mhc_post</span><span class='summary-right'>0.410 ms · 0.8% · memory bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>61</td>
+                                <td>fused.mhc_post</td>
+                                <td><code>layer_out=[128,7168], residual_state=[128,4,7168]</code></td>
+                                <td><code>X_{l+1}=B_l X_l + C_l F_l(A_l X_l); fused inference update</code></td>
+                                <td>0.0013</td>
+                                <td>320.25 MB</td>
+                                <td>0 B</td>
+                                <td>0.1649</td>
+                                <td>0.4102</td>
+                                <td>0.0000</td>
+                                <td><b>0.4102</b></td>
+                                <td class='bound-memory'>memory</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>deepseek_v4.hca_plus_swa_attention_decode</span><span class='summary-right'>0.365 ms · 0.7% · compute bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>31</td>
+                                <td>fused.hca_swa_attention</td>
+                                <td><code>mode=HCA, B=128, KV=8192, compressed=64, sw=128, effective_KV=192,
+                                    heads/tp=64, head_dim=512</code></td>
+                                <td><code>flops≈2*B*heads/tp*(compressed/topk + SWA_window)*head_dim;
+                                    bytes≈compressed_KV + SWA_KV</code></td>
+                                <td>0.0499</td>
+                                <td>360.38 MB</td>
+                                <td>0 B</td>
+                                <td>0.3655</td>
+                                <td>0.2885</td>
+                                <td>0.0000</td>
+                                <td><b>0.3655</b></td>
+                                <td class='bound-compute'>compute</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>deepseek_v4.hca_token_level_compressor</span><span class='summary-right'>0.346 ms · 0.7% · compute bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>31</td>
+                                <td>fused.hca_token_compressor</td>
+                                <td><code>mode=HCA, T=128, H=7168, c=512, compression_ratio=128</code></td>
+                                <td><code>new token contributes to pending state; every m/m&#x27; tokens produce one
+                                    compressed KV entry</code></td>
+                                <td>0.0291</td>
+                                <td>28.09 MB</td>
+                                <td>0 B</td>
+                                <td>0.3463</td>
+                                <td>0.0360</td>
+                                <td>0.0000</td>
+                                <td><b>0.3463</b></td>
+                                <td class='bound-compute'>compute</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>deepseek_v4.fused_mhc_pre</span><span class='summary-right'>0.342 ms · 0.7% · memory bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>61</td>
+                                <td>fused.mhc_pre</td>
+                                <td><code>X=[128,4,7168] -&gt; [128,7168], n_hc=4</code></td>
+                                <td><code>A_l X_l with sigmoid-gated mHC pre-map; small Sinkhorn-controlled residual
+                                    state</code></td>
+                                <td>0.0009</td>
+                                <td>266.88 MB</td>
+                                <td>0 B</td>
+                                <td>0.1608</td>
+                                <td>0.3418</td>
+                                <td>0.0000</td>
+                                <td><b>0.3418</b></td>
+                                <td class='bound-memory'>memory</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>deepseek_v4.csa_token_level_compressor</span><span class='summary-right'>0.335 ms · 0.7% · compute bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>30</td>
+                                <td>fused.csa_token_compressor</td>
+                                <td><code>mode=CSA, T=128, H=7168, c=512, compression_ratio=4</code></td>
+                                <td><code>new token contributes to pending state; every m/m&#x27; tokens produce one
+                                    compressed KV entry</code></td>
+                                <td>0.0282</td>
+                                <td>27.19 MB</td>
+                                <td>0 B</td>
+                                <td>0.3351</td>
+                                <td>0.0348</td>
+                                <td>0.0000</td>
+                                <td><b>0.3351</b></td>
+                                <td class='bound-compute'>compute</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>aten.add.attn_residual</span><span class='summary-right'>0.205 ms · 0.4% · memory bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>61</td>
+                                <td>aten.add</td>
+                                <td><code>[128,7168] + [128,7168]</code></td>
+                                <td><code>flops=T*H; bytes≈3*T*H*dtype</code></td>
+                                <td>0.0001</td>
+                                <td>160.12 MB</td>
+                                <td>0 B</td>
+                                <td>0.1530</td>
+                                <td>0.2051</td>
+                                <td>0.0000</td>
+                                <td><b>0.2051</b></td>
+                                <td class='bound-memory'>memory</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>aten.add.shared_plus_routed_expert</span><span class='summary-right'>0.205 ms · 0.4% · memory bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>61</td>
+                                <td>aten.add</td>
+                                <td><code>2 branches of [128,7168]</code></td>
+                                <td><code>sum routed and shared expert outputs</code></td>
+                                <td>0.0001</td>
+                                <td>160.12 MB</td>
+                                <td>0 B</td>
+                                <td>0.1530</td>
+                                <td>0.2051</td>
+                                <td>0.0000</td>
+                                <td><b>0.2051</b></td>
+                                <td class='bound-memory'>memory</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>aten.add.moe_residual</span><span class='summary-right'>0.205 ms · 0.4% · memory bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>61</td>
+                                <td>aten.add</td>
+                                <td><code>[128,7168] + [128,7168]</code></td>
+                                <td><code>flops=T*H; bytes≈3*T*H*dtype</code></td>
+                                <td>0.0001</td>
+                                <td>160.12 MB</td>
+                                <td>0 B</td>
+                                <td>0.1530</td>
+                                <td>0.2051</td>
+                                <td>0.0000</td>
+                                <td><b>0.2051</b></td>
+                                <td class='bound-memory'>memory</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>aten.rms_norm.attn_input</span><span class='summary-right'>0.156 ms · 0.3% · compute bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>61</td>
+                                <td>aten.rms_norm</td>
+                                <td><code>x=[128,7168], weight=[7168]</code></td>
+                                <td><code>flops≈7*T*H; bytes≈(x+weight+y)*dtype</code></td>
+                                <td>0.0004</td>
+                                <td>107.17 MB</td>
+                                <td>0 B</td>
+                                <td>0.1558</td>
+                                <td>0.1264</td>
+                                <td>0.0000</td>
+                                <td><b>0.1558</b></td>
+                                <td class='bound-compute'>compute</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>aten.rms_norm.moe_input</span><span class='summary-right'>0.156 ms · 0.3% · compute bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>61</td>
+                                <td>aten.rms_norm</td>
+                                <td><code>x=[128,7168], weight=[7168]</code></td>
+                                <td><code>flops≈7*T*H; bytes≈(x+weight+y)*dtype</code></td>
+                                <td>0.0004</td>
+                                <td>107.17 MB</td>
+                                <td>0 B</td>
+                                <td>0.1558</td>
+                                <td>0.1264</td>
+                                <td>0.0000</td>
+                                <td><b>0.1558</b></td>
+                                <td class='bound-compute'>compute</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>aten.rotary_embedding.rope</span><span class='summary-right'>0.154 ms · 0.3% · compute bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>61</td>
+                                <td>aten.rope</td>
+                                <td><code>T=128, heads=64, rope_dim=64</code></td>
+                                <td><code>flops≈6*T*heads*rope_dim; bytes≈3*T*heads*rope_dim*dtype</code></td>
+                                <td>0.0002</td>
+                                <td>91.50 MB</td>
+                                <td>0 B</td>
+                                <td>0.1543</td>
+                                <td>0.1172</td>
+                                <td>0.0000</td>
+                                <td><b>0.1543</b></td>
+                                <td class='bound-compute'>compute</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>aten.silu_mul.shared_swiglu</span><span class='summary-right'>0.153 ms · 0.3% · compute bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>61</td>
+                                <td>aten.silu_mul</td>
+                                <td><code>gate=[128,1536], up=[128,1536]</code></td>
+                                <td><code>SwiGLU=silu(gate)*up; flops≈8*T*I; bytes≈3*T*I*dtype</code></td>
+                                <td>0.0001</td>
+                                <td>34.31 MB</td>
+                                <td>0 B</td>
+                                <td>0.1534</td>
+                                <td>0.0439</td>
+                                <td>0.0000</td>
+                                <td><b>0.1534</b></td>
+                                <td class='bound-compute'>compute</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>aten.rms_norm.q_lora</span><span class='summary-right'>0.153 ms · 0.3% · compute bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>61</td>
+                                <td>aten.rms_norm</td>
+                                <td><code>x=[128,1536], weight=[1536]</code></td>
+                                <td><code>flops≈7*T*H; bytes≈(x+weight+y)*dtype</code></td>
+                                <td>0.0001</td>
+                                <td>22.96 MB</td>
+                                <td>0 B</td>
+                                <td>0.1532</td>
+                                <td>0.0271</td>
+                                <td>0.0000</td>
+                                <td><b>0.1532</b></td>
+                                <td class='bound-compute'>compute</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>aten.silu_mul.expert_swiglu</span><span class='summary-right'>0.153 ms · 0.3% · compute bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>61</td>
+                                <td>aten.silu_mul</td>
+                                <td><code>gate=[96,1536], up=[96,1536]</code></td>
+                                <td><code>SwiGLU=silu(gate)*up; flops≈8*T*I; bytes≈3*T*I*dtype</code></td>
+                                <td>0.0001</td>
+                                <td>25.73 MB</td>
+                                <td>0 B</td>
+                                <td>0.1532</td>
+                                <td>0.0330</td>
+                                <td>0.0000</td>
+                                <td><b>0.1532</b></td>
+                                <td class='bound-compute'>compute</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>aten.sigmoid.topk.router</span><span class='summary-right'>0.153 ms · 0.3% · compute bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>61</td>
+                                <td>aten.topk</td>
+                                <td><code>scores=[128,384], topk=6, score=sqrtsoftplus</code></td>
+                                <td><code>score=sigmoid(router_logits); select top-k experts</code></td>
+                                <td>0.0000</td>
+                                <td>3.22 MB</td>
+                                <td>0 B</td>
+                                <td>0.1526</td>
+                                <td>0.0032</td>
+                                <td>0.0000</td>
+                                <td><b>0.1526</b></td>
+                                <td class='bound-compute'>compute</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>deepseek_v4.hybrid_kv_cache_update</span><span class='summary-right'>0.153 ms · 0.3% · compute bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>31</td>
+                                <td>memory.hybrid_kv_cache_update</td>
+                                <td><code>CSA/HCA state + SWA tail, compression_ratio=128, sw=128</code></td>
+                                <td><code>append state cache; classical compressed KV emitted per compression
+                                    block</code></td>
+                                <td>0.0000</td>
+                                <td>29.30 MB</td>
+                                <td>0 B</td>
+                                <td>0.0775</td>
+                                <td>0.0182</td>
+                                <td>0.0000</td>
+                                <td><b>0.0775</b></td>
+                                <td class='bound-compute'>compute</td>
+                            </tr>
+                            <tr>
+                                <td>30</td>
+                                <td>memory.hybrid_kv_cache_update</td>
+                                <td><code>CSA/HCA state + SWA tail, compression_ratio=4, sw=128</code></td>
+                                <td><code>append state cache; classical compressed KV emitted per compression
+                                    block</code></td>
+                                <td>0.0000</td>
+                                <td>28.36 MB</td>
+                                <td>0 B</td>
+                                <td>0.0750</td>
+                                <td>0.0177</td>
+                                <td>0.0000</td>
+                                <td><b>0.0750</b></td>
+                                <td class='bound-compute'>compute</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>deepep.all_to_all.dispatch</span><span class='summary-right'>0.093 ms · 0.2% · communication bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>61</td>
+                                <td>comm.all_to_all</td>
+                                <td><code>tokens=768, hidden=7168, group=EP8</code></td>
+                                <td><code>2*(EP-1)/EP * tokens * hidden * dtype_bytes * dispatch_factor</code></td>
+                                <td>0.0000</td>
+                                <td>0 B</td>
+                                <td>560.44 MB</td>
+                                <td>0.0000</td>
+                                <td>0.0000</td>
+                                <td>0.0934</td>
+                                <td><b>0.0934</b></td>
+                                <td class='bound-communication'>communication</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>deepep.all_to_all.combine</span><span class='summary-right'>0.093 ms · 0.2% · communication bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>61</td>
+                                <td>comm.all_to_all</td>
+                                <td><code>tokens=768, hidden=7168, group=EP8</code></td>
+                                <td><code>2*(EP-1)/EP * tokens * hidden * dtype_bytes * dispatch_factor</code></td>
+                                <td>0.0000</td>
+                                <td>0 B</td>
+                                <td>560.44 MB</td>
+                                <td>0.0000</td>
+                                <td>0.0000</td>
+                                <td>0.0934</td>
+                                <td><b>0.0934</b></td>
+                                <td class='bound-communication'>communication</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>aten.topk.csa_sparse_index</span><span class='summary-right'>0.075 ms · 0.1% · compute bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>30</td>
+                                <td>aten.topk</td>
+                                <td><code>compressed_scores=[128,2048], topk=1024</code></td>
+                                <td><code>select top-k compressed KV entries for CSA core attention</code></td>
+                                <td>0.0000</td>
+                                <td>22.50 MB</td>
+                                <td>0 B</td>
+                                <td>0.0753</td>
+                                <td>0.0224</td>
+                                <td>0.0000</td>
+                                <td><b>0.0753</b></td>
+                                <td class='bound-compute'>compute</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>aten.distributed.all_reduce.tp</span><span class='summary-right'>0.038 ms · 0.1% · communication bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>122</td>
+                                <td>comm.all_reduce</td>
+                                <td><code>tensor=[128,7168], group=TP2</code></td>
+                                <td><code>2*(TP-1)/TP * B * H * dtype_bytes</code></td>
+                                <td>0.0000</td>
+                                <td>0 B</td>
+                                <td>106.75 MB</td>
+                                <td>0.0000</td>
+                                <td>0.0000</td>
+                                <td>0.0384</td>
+                                <td><b>0.0384</b></td>
+                                <td class='bound-communication'>communication</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                </details>
+            </div>
+            <div class='timeline-item'>
+                <div class='timeline-dot'></div>
+                <details class='block' open>
+                    <summary><span class='sum-left'>decode.Output </span><span class='summary-right'>1.346 ms · Share 2.6% · compute bound</span>
+                    </summary>
+                    <div class='block-meta'><span class='chip'>重复层数: 1</span><span
+                            class='chip'>主导瓶颈: compute</span><span class='chip'>算子族数量: 3</span></div>
+                    <div class='subgraph-wrap'>
+                        <div class='subgraph-lane'>
+                            <div class='lane-title'>Output Head / MTP</div>
+                            <div class='subgraph-flow'>
+                                <div class='comp-box norm'>
+                                    <div class='cb-title'>Final RMSNorm</div>
+                                    <div class='cb-ms'>0.003 ms</div>
+                                    <div class='cb-meta'>FLOPs 0.00 TF · HBM 1.76 MB</div>
+                                </div>
+                                <div class='sg-arrow'>→</div>
+                                <div class='comp-box proj'>
+                                    <div class='cb-title'>LM Head / Logits</div>
+                                    <div class='cb-ms'>0.000 ms</div>
+                                    <div class='cb-meta'>FLOPs 0.00 TF · HBM 0 B</div>
+                                </div>
+                                <div class='sg-arrow'>→</div>
+                                <div class='comp-box proj'>
+                                    <div class='cb-title'>MTP Draft / Aux Head</div>
+                                    <div class='cb-ms'>1.339 ms</div>
+                                    <div class='cb-meta'>FLOPs 0.36 TF · HBM 1.32 GB</div>
+                                </div>
+                                <div class='sg-arrow'>→</div>
+                                <div class='comp-box router'>
+                                    <div class='cb-title'>MTP Verify / Accept</div>
+                                    <div class='cb-ms'>0.005 ms</div>
+                                    <div class='cb-meta'>FLOPs 0.00 TF · HBM 3.55 MB</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <details class='op-family'>
+                        <summary><span>deepseek_v4.mtp_draft_head</span><span class='summary-right'>1.339 ms · 99.5% · compute bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>1</td>
+                                <td>deepseek_v4.mtp_head</td>
+                                <td><code>A=[128,7168], W_mtp=[7168,129280], depth=3, TP=2</code></td>
+                                <td><code>MTP draft logits≈2*T*H*V*depth/TP; enables speculative multi-token
+                                    acceptance</code></td>
+                                <td>0.3558</td>
+                                <td>1.32 GB</td>
+                                <td>0 B</td>
+                                <td>1.3390</td>
+                                <td>0.7038</td>
+                                <td>0.0000</td>
+                                <td><b>1.3390</b></td>
+                                <td class='bound-compute'>compute</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>deepseek_v4.mtp_verify_acceptance</span><span class='summary-right'>0.005 ms · 0.3% · memory bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>1</td>
+                                <td>fused.mtp_verify_accept</td>
+                                <td><code>draft_tokens=384, acceptance_rate=0.65, verify_factor=0.15</code></td>
+                                <td><code>lightweight verify/accept bookkeeping for MTP draft tokens;
+                                    accepted_tokens≈1+depth*acceptance_rate</code></td>
+                                <td>0.0000</td>
+                                <td>3.55 MB</td>
+                                <td>0 B</td>
+                                <td>0.0025</td>
+                                <td>0.0045</td>
+                                <td>0.0000</td>
+                                <td><b>0.0045</b></td>
+                                <td class='bound-memory'>memory</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                    <details class='op-family'>
+                        <summary><span>aten.rms_norm.final</span><span class='summary-right'>0.003 ms · 0.2% · compute bound</span>
+                        </summary>
+                        <table class='compact'>
+                            <thead>
+                            <tr>
+                                <th>Count</th>
+                                <th>Type</th>
+                                <th>Shape</th>
+                                <th>Formula</th>
+                                <th>TFLOPs</th>
+                                <th>HBM Bytes</th>
+                                <th>Comm Bytes</th>
+                                <th>Compute ms</th>
+                                <th>Memory ms</th>
+                                <th>Comm ms</th>
+                                <th>Total ms</th>
+                                <th>Bound</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <td>1</td>
+                                <td>aten.rms_norm</td>
+                                <td><code>x=[128,7168], weight=[7168]</code></td>
+                                <td><code>flops≈7*T*H; bytes≈(x+weight+y)*dtype</code></td>
+                                <td>0.0000</td>
+                                <td>1.76 MB</td>
+                                <td>0 B</td>
+                                <td>0.0026</td>
+                                <td>0.0021</td>
+                                <td>0.0000</td>
+                                <td><b>0.0026</b></td>
+                                <td class='bound-compute'>compute</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </details>
+                </details>
+            </div>
+        </div>
+    </div>
+
+    <div class='section'><h2>校准对比（官方数据 vs 建模结果）</h2>
+        <div class='subcards'>
+            <div class='mini-card'>
+                <div>整体校准一致性</div>
+                <div class='mini-value high'>93.8%</div>
+                <small>基于官方结构、KV/FLOPs效率锚点；reference-only 项不计入误差</small></div>
+            <div class='mini-card'>
+                <div>结论</div>
+                <div class='mini-value'>高</div>
+                <small>整体一致性等级</small></div>
+        </div>
+        <table>
+            <thead>
+            <tr>
+                <th>指标</th>
+                <th>官方值</th>
+                <th>建模值</th>
+                <th>单位</th>
+                <th>绝对误差</th>
+                <th>相对误差</th>
+                <th>官方引用</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+                <td>平均 KV Cache 长度</td>
+                <td>1,048,576.00</td>
+                <td>8,192.00</td>
+                <td>tokens</td>
+                <td>1,040,384.00</td>
+                <td>99.22%</td>
+                <td><a class='cite-link'
+                       href='https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/resolve/main/DeepSeek_V4.pdf'
+                       rel='noopener noreferrer' target='_blank'>官方文档</a>
+                    <div class='cite-note'>DeepSeek-V4 技术报告</div>
+                </td>
+            </tr>
+            <tr>
+                <td>层数</td>
+                <td>61.00</td>
+                <td>61.00</td>
+                <td>layers</td>
+                <td>0.00</td>
+                <td>0.00%</td>
+                <td><a class='cite-link' href='https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro' rel='noopener noreferrer'
+                       target='_blank'>官方文档</a>
+                    <div class='cite-note'>DeepSeek-V4 官方模型卡</div>
+                </td>
+            </tr>
+            <tr>
+                <td>Routed Experts</td>
+                <td>384.00</td>
+                <td>384.00</td>
+                <td>experts</td>
+                <td>0.00</td>
+                <td>0.00%</td>
+                <td><a class='cite-link' href='https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro' rel='noopener noreferrer'
+                       target='_blank'>官方文档</a>
+                    <div class='cite-note'>DeepSeek-V4 官方模型卡</div>
+                </td>
+            </tr>
+            <tr>
+                <td>Activated Experts/Token</td>
+                <td>6.00</td>
+                <td>6.00</td>
+                <td>experts</td>
+                <td>0.00</td>
+                <td>0.00%</td>
+                <td><a class='cite-link' href='https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro' rel='noopener noreferrer'
+                       target='_blank'>官方文档</a>
+                    <div class='cite-note'>DeepSeek-V4 官方模型卡</div>
+                </td>
+            </tr>
+            <tr>
+                <td>Attention Top-K</td>
+                <td>1,024.00</td>
+                <td>1,024.00</td>
+                <td>entries</td>
+                <td>0.00</td>
+                <td>0.00%</td>
+                <td><a class='cite-link' href='https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro' rel='noopener noreferrer'
+                       target='_blank'>官方文档</a>
+                    <div class='cite-note'>DeepSeek-V4 官方模型卡</div>
+                </td>
+            </tr>
+            <tr>
+                <td>CSA Compression Ratio</td>
+                <td>4.00</td>
+                <td>4.00</td>
+                <td>m</td>
+                <td>0.00</td>
+                <td>0.00%</td>
+                <td><a class='cite-link'
+                       href='https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/resolve/main/DeepSeek_V4.pdf'
+                       rel='noopener noreferrer' target='_blank'>官方文档</a>
+                    <div class='cite-note'>DeepSeek-V4 技术报告</div>
+                </td>
+            </tr>
+            <tr>
+                <td>HCA Compression Ratio</td>
+                <td>128.00</td>
+                <td>128.00</td>
+                <td>m&#x27;</td>
+                <td>0.00</td>
+                <td>0.00%</td>
+                <td><a class='cite-link'
+                       href='https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/resolve/main/DeepSeek_V4.pdf'
+                       rel='noopener noreferrer' target='_blank'>官方文档</a>
+                    <div class='cite-note'>DeepSeek-V4 技术报告</div>
+                </td>
+            </tr>
+            <tr>
+                <td>Sliding Window</td>
+                <td>128.00</td>
+                <td>128.00</td>
+                <td>tokens</td>
+                <td>0.00</td>
+                <td>0.00%</td>
+                <td><a class='cite-link'
+                       href='https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/resolve/main/DeepSeek_V4.pdf'
+                       rel='noopener noreferrer' target='_blank'>官方文档</a>
+                    <div class='cite-note'>DeepSeek-V4 技术报告</div>
+                </td>
+            </tr>
+            <tr>
+                <td>mHC Expansion</td>
+                <td>4.00</td>
+                <td>4.00</td>
+                <td>x</td>
+                <td>0.00</td>
+                <td>0.00%</td>
+                <td><a class='cite-link'
+                       href='https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/resolve/main/DeepSeek_V4.pdf'
+                       rel='noopener noreferrer' target='_blank'>官方文档</a>
+                    <div class='cite-note'>DeepSeek-V4 技术报告</div>
+                </td>
+            </tr>
+            <tr>
+                <td>KV Cache Ratio vs DSV3.2</td>
+                <td>0.10</td>
+                <td>0.10</td>
+                <td>ratio</td>
+                <td>0.00</td>
+                <td>0.00%</td>
+                <td><a class='cite-link'
+                       href='https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/resolve/main/DeepSeek_V4.pdf'
+                       rel='noopener noreferrer' target='_blank'>官方文档</a>
+                    <div class='cite-note'>DeepSeek-V4 技术报告</div>
+                </td>
+            </tr>
+            <tr>
+                <td>Single-token FLOPs Ratio vs DSV3.2</td>
+                <td>0.27</td>
+                <td>0.27</td>
+                <td>ratio</td>
+                <td>0.00</td>
+                <td>0.00%</td>
+                <td><a class='cite-link'
+                       href='https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/resolve/main/DeepSeek_V4.pdf'
+                       rel='noopener noreferrer' target='_blank'>官方文档</a>
+                    <div class='cite-note'>DeepSeek-V4 技术报告</div>
+                </td>
+            </tr>
+            <tr>
+                <td>total_params_b</td>
+                <td>1,600.00</td>
+                <td>1,600.00</td>
+                <td>B params</td>
+                <td>0.00</td>
+                <td>0.00%</td>
+                <td><a class='cite-link' href='https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro' rel='noopener noreferrer'
+                       target='_blank'>官方文档</a>
+                    <div class='cite-note'>DeepSeek-V4 官方模型卡</div>
+                </td>
+            </tr>
+            <tr>
+                <td>active_params_b</td>
+                <td>49.00</td>
+                <td>49.00</td>
+                <td>B params/token</td>
+                <td>0.00</td>
+                <td>0.00%</td>
+                <td><a class='cite-link' href='https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro' rel='noopener noreferrer'
+                       target='_blank'>官方文档</a>
+                    <div class='cite-note'>DeepSeek-V4 官方模型卡</div>
+                </td>
+            </tr>
+            <tr>
+                <td>context_length</td>
+                <td>1,048,576.00</td>
+                <td>1,048,576.00</td>
+                <td>tokens</td>
+                <td>0.00</td>
+                <td>0.00%</td>
+                <td><a class='cite-link' href='https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro' rel='noopener noreferrer'
+                       target='_blank'>官方文档</a>
+                    <div class='cite-note'>DeepSeek-V4 官方模型卡</div>
+                </td>
+            </tr>
+            <tr>
+                <td>single_token_flops_ratio_vs_dsv32_1m</td>
+                <td>0.27</td>
+                <td>0.27</td>
+                <td>ratio</td>
+                <td>0.00</td>
+                <td>0.00%</td>
+                <td><a class='cite-link'
+                       href='https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/resolve/main/DeepSeek_V4.pdf'
+                       rel='noopener noreferrer' target='_blank'>官方文档</a>
+                    <div class='cite-note'>DeepSeek-V4 技术报告</div>
+                </td>
+            </tr>
+            <tr>
+                <td>kv_cache_ratio_vs_dsv32_1m</td>
+                <td>0.10</td>
+                <td>0.10</td>
+                <td>ratio</td>
+                <td>0.00</td>
+                <td>0.00%</td>
+                <td><a class='cite-link'
+                       href='https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/resolve/main/DeepSeek_V4.pdf'
+                       rel='noopener noreferrer' target='_blank'>官方文档</a>
+                    <div class='cite-note'>DeepSeek-V4 技术报告</div>
+                </td>
+            </tr>
+            <tr>
+                <td>atlas950_superpod_reference_inference_tps</td>
+                <td>19,600,000.00</td>
+                <td>reference-only</td>
+                <td>tokens/s at 8192 Ascend 950DT NPUs</td>
+                <td>—</td>
+                <td>reference</td>
+                <td><a class='cite-link' href='https://www.huawei.com/en/products/computing/ascend' rel='noopener noreferrer'
+                       target='_blank'>官方文档</a>
+                    <div class='cite-note'>Huawei Ascend / SuperPOD 官方资料</div>
+                </td>
+            </tr>
+            <tr>
+                <td>mtp_depth</td>
+                <td>scenario_override</td>
+                <td>3.00</td>
+                <td>draft tokens</td>
+                <td>—</td>
+                <td>reference</td>
+                <td><a class='cite-link'
+                       href='https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/resolve/main/DeepSeek_V4.pdf'
+                       rel='noopener noreferrer' target='_blank'>官方文档</a>
+                    <div class='cite-note'>DeepSeek-V4 技术报告</div>
+                </td>
+            </tr>
+            </tbody>
+        </table>
+        <h3 style='margin-top:18px;'>算子级校准覆盖与置信度分析</h3>
+        <div class='subcards'>
+            <div class='mini-card'>
+                <div>时延加权置信度</div>
+                <div class='mini-value high'>92.7%</div>
+                <small>高</small></div>
+            <div class='mini-card'>
+                <div>官方实现覆盖率</div>
+                <div class='mini-value'>6.0%</div>
+                <small>按时延占比统计</small></div>
+            <div class='mini-card'>
+                <div>Source-backed 覆盖率</div>
+                <div class='mini-value'>98.8%</div>
+                <small>具备明确来源说明</small></div>
+            <div class='mini-card'>
+                <div>高置信覆盖率</div>
+                <div class='mini-value'>88.7%</div>
+                <small>confidence=high</small></div>
+        </div>
+        <div class="bar official">
+            <div style="width:6.0%"></div>
+            <span>官方实现/官方资料: 6.0%</span></div>
+        <div class="bar commtmpl">
+            <div style="width:1.0%"></div>
+            <span>通信模板/NCCL近似: 0.1%</span></div>
+        <div class="bar analytic">
+            <div style="width:93.9%"></div>
+            <span>解析公式/经验模板: 93.9%</span></div>
+        <table>
+            <thead>
+            <tr>
+                <th>算子族</th>
+                <th>总时延</th>
+                <th>占比</th>
+                <th>主导瓶颈</th>
+                <th>校准依据</th>
+                <th>置信度</th>
+            </tr>
+            </thead>
+            <tbody>
+            <tr>
+                <td>aten.mm.grouped_o_down_proj</td>
+                <td>31.640 ms</td>
+                <td>60.7%</td>
+                <td>compute</td>
+                <td>解析公式/经验模板</td>
+                <td>95.0% (高)</td>
+            </tr>
+            <tr>
+                <td>aten.mm.grouped_o_up_proj</td>
+                <td>3.596 ms</td>
+                <td>6.9%</td>
+                <td>compute</td>
+                <td>解析公式/经验模板</td>
+                <td>95.0% (高)</td>
+            </tr>
+            <tr>
+                <td>aten.mm.q_up_proj</td>
+                <td>3.104 ms</td>
+                <td>6.0%</td>
+                <td>compute</td>
+                <td>解析公式/经验模板</td>
+                <td>95.0% (高)</td>
+            </tr>
+            <tr>
+                <td>deepseek_v4.csa_plus_swa_attention_decode</td>
+                <td>1.747 ms</td>
+                <td>3.4%</td>
+                <td>compute</td>
+                <td>解析公式/经验模板</td>
+                <td>95.0% (高)</td>
+            </tr>
+            <tr>
+                <td>aten.mm.shared_gate_up_proj</td>
+                <td>1.444 ms</td>
+                <td>2.8%</td>
+                <td>compute</td>
+                <td>解析公式/经验模板</td>
+                <td>95.0% (高)</td>
+            </tr>
+            <tr>
+                <td>deepseek_v4.mtp_draft_head</td>
+                <td>1.339 ms</td>
+                <td>2.6%</td>
+                <td>compute</td>
+                <td>解析公式/经验模板</td>
+                <td>75.0% (中)</td>
+            </tr>
+            <tr>
+                <td>deepgemm.grouped_gemm.expert_gate_up_proj</td>
+                <td>1.205 ms</td>
+                <td>2.3%</td>
+                <td>compute</td>
+                <td>官方实现/官方资料</td>
+                <td>75.0% (中)</td>
+            </tr>
+            <tr>
+                <td>aten.mm.csa_indexer_q</td>
+                <td>0.922 ms</td>
+                <td>1.8%</td>
+                <td>compute</td>
+                <td>解析公式/经验模板</td>
+                <td>95.0% (高)</td>
+            </tr>
+            <tr>
+                <td>aten.mm.q_down_proj</td>
+                <td>0.798 ms</td>
+                <td>1.5%</td>
+                <td>compute</td>
+                <td>解析公式/经验模板</td>
+                <td>95.0% (高)</td>
+            </tr>
+            <tr>
+                <td>aten.mm.shared_down_proj</td>
+                <td>0.798 ms</td>
+                <td>1.5%</td>
+                <td>compute</td>
+                <td>解析公式/经验模板</td>
+                <td>95.0% (高)</td>
+            </tr>
+            <tr>
+                <td>deepgemm.grouped_gemm.expert_down_proj</td>
+                <td>0.672 ms</td>
+                <td>1.3%</td>
+                <td>compute</td>
+                <td>官方实现/官方资料</td>
+                <td>75.0% (中)</td>
+            </tr>
+            <tr>
+                <td>deepseek_v4.fp4_csa_index_scores</td>
+                <td>0.447 ms</td>
+                <td>0.9%</td>
+                <td>compute</td>
+                <td>解析公式/经验模板</td>
+                <td>95.0% (高)</td>
+            </tr>
+            </tbody>
+        </table>
+        <div class='legend'>说明：算子级校准采用“官方配置/实现资料 + 整体吞吐锚点”的组合方式；报告显式给出覆盖率与时延加权置信度，避免把缺乏
+            profiler 真值的算子误表达为高精度结论。
+        </div>
+    </div>
+    <div class='section'><h2>官方引用与校准来源</h2>
+        <ul>
+            <li><a href='https://api-docs.deepseek.com/news/news260424'>DeepSeek V4 Preview Release</a> — V4-Pro 1.6T
+                total / 49B active; V4-Flash 284B total / 13B active; 1M context across official services.
+            </li>
+            <li><a href='https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro'>DeepSeek-V4-Pro Hugging Face model card</a>
+                — Hybrid CSA/HCA attention, 27% single-token FLOPs and 10% KV cache vs V3.2 at 1M; FP4+FP8 mixed
+                deployment.
+            </li>
+            <li><a href='https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/config.json'>DeepSeek-V4-Pro
+                config.json</a> — 61 layers, hidden=7168, head_dim=512, index_topk=1024, 384 routed experts, 6 activated
+                experts, o_lora_rank=1024, o_groups=16.
+            </li>
+            <li><a href='https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/resolve/main/DeepSeek_V4.pdf'>DeepSeek-V4
+                technical report</a> — Model setup and inference/KV-cache efficiency details.
+            </li>
+            <li><a href='https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/resolve/main/DeepSeek_V4.pdf'>DeepSeek-V4
+                technical report - training setup</a> — V4 uses Muon+AdamW, 32T/33T pretraining tokens, sequence length
+                schedule 4K→16K→64K→1M, sparse attention warmup, MTP/balance loss settings.
+            </li>
+            <li>source</li>
+            <li><a href='https://www.huawei.com/en/news/2025/9/hc-xu-keynote-speech'>Huawei SuperPoD Interconnect
+                keynote</a> — Official Ascend 950DT and Atlas 950 SuperPoD specifications and reference throughput.
+            </li>
+            <li>
+                <a href='https://www.reuters.com/world/china/deepseek-v4-chinese-ai-model-adapted-huawei-chips-2026-04-24/'>Reuters:
+                    DeepSeek-V4 adapted for Huawei chips</a> — Huawei said Ascend 950-based supernode clusters support
+                DeepSeek-V4.
+            </li>
+        </ul>
+    </div>
+    <div class='section'><h2>告警与说明</h2>
+        <ul>
+            <li>DeepSeek-V4 decode model uses public preview/technical-report structure; model-specific production TPS
+                is not yet published, so calibration separates structure/efficiency anchors from absolute serving
+                throughput.
+            </li>
+            <li>MTP inference is enabled: depth=3, acceptance_rate=0.65, effective_tokens_per_decode_iteration=2.95.
+                TPOT/TPS are MTP-adjusted; raw decode iteration latency is kept in
+                report_context.inference.decode_iteration_ms.
+            </li>
+            <li>Decode-only report: prefill stage intentionally omitted for this modeling iteration.</li>
+        </ul>
+    </div>
+</div>
+<script>
+    document.addEventListener('DOMContentLoaded', function () {
+        document.querySelectorAll('.viz-tab').forEach(function (btn) {
+            btn.addEventListener('click', function () {
+                var wrap = btn.closest('.viz-wrap');
+                wrap.querySelectorAll('.viz-tab').forEach(function (b) {
+                    b.classList.remove('active');
+                });
+                wrap.querySelectorAll('.viz-panel').forEach(function (p) {
+                    p.classList.remove('active');
+                });
+                btn.classList.add('active');
+                var target = wrap.querySelector('#' + btn.dataset.target);
+                if (target) {
+                    target.classList.add('active');
+                }
+            });
+        });
+    });
+</script>
+</body>
+</html>

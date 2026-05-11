@@ -93,6 +93,27 @@ class E2ESummary:
     # ── memory budget (optional) ──────────────────────────────────────────────
     memory_budget: "MemoryBudget | None" = None    # memory breakdown estimate
 
+    # ── Phase 1: ReportContext (optional) ─────────────────────────────────────
+    report_context: "ReportContext | None" = None   # full hierarchical report data
+
+    # ── MTP-aware metrics ─────────────────────────────────────────────────────
+    mtp_depth:           int   = 1
+    mtp_acceptance_rate: float = 0.0
+    mtp_effective_tokens: float = 1.0
+    effective_tpot_ms:   float | None = None
+    effective_tps:       float | None = None
+
+    # ── Memory per GPU ────────────────────────────────────────────────────────
+    memory_per_gpu_gb: float = 0.0
+
+    # ── Bound decomposition ───────────────────────────────────────────────────
+    bound_compute_pct: float = 0.0
+    bound_memory_pct: float = 0.0
+    bound_comm_pct: float = 0.0
+
+    # ── Model blocks ──────────────────────────────────────────────────────────
+    model_blocks: int = 0
+
     # ── string representation ─────────────────────────────────────────────────
 
     def __str__(self) -> str:
@@ -161,6 +182,10 @@ def build_summary(
     parallel_desc: str = "single",
     top_n:         int = 10,
     memory_budget: "MemoryBudget | None" = None,
+    # ── Phase 1 additions ──────────────────────────────────────────────────
+    build_report:  bool = False,
+    ctx:           "TransformContext | None" = None,
+    profile:       "Any | None" = None,
 ) -> E2ESummary:
     """Build an E2ESummary from simulation outputs.
 
@@ -181,6 +206,12 @@ def build_summary(
         Human-readable parallel config string, e.g. ``"TP8-EP8"``.
     top_n
         How many bottleneck ops to include in the report.
+    build_report
+        If True, build full hierarchical ReportContext via report_builder.
+    ctx
+        TransformContext (required if build_report=True).
+    profile
+        ModelProfile with structure info (optional, for report metadata).
     """
     from python.zrt.ir.types import DType
     from python.zrt.ir.hierarchy import GraphHierarchy
@@ -256,6 +287,48 @@ def build_summary(
         suffix  = f" [{node.scope.rsplit('.', 1)[-1]}]" if (node and node.scope) else ""
         top_bottleneck_ops.append((f"{op_type}{suffix}", r.latency_us))
 
+    # ── Phase 1: bound decomposition ────────────────────────────────────────
+    compute_bound_us = 0.0
+    memory_bound_us = 0.0
+    comm_bound_us = 0.0
+    for r in sim_results.values():
+        node = graph.nodes.get(r.op_node_id)
+        if node and node.category == "communication":
+            comm_bound_us += r.latency_us
+        elif r.bound == "memory":
+            memory_bound_us += r.latency_us
+        else:
+            compute_bound_us += r.latency_us
+    total_bound_us = compute_bound_us + memory_bound_us + comm_bound_us or 1.0
+    bound_compute_pct = compute_bound_us / total_bound_us * 100.0
+    bound_memory_pct = memory_bound_us / total_bound_us * 100.0
+    bound_comm_pct   = comm_bound_us / total_bound_us * 100.0
+
+    # ── Phase 1: model blocks count ─────────────────────────────────────────
+    model_blocks = 0
+    for hn in hier.at_depth(3):
+        if hn.name.isdigit():
+            model_blocks += 1
+
+    # ── Phase 1: build ReportContext (optional) ─────────────────────────────
+    report_context = None
+    if build_report and ctx is not None:
+        from python.zrt.report.report_builder import build_report_context
+        report_context = build_report_context(
+            model=model,
+            hardware=hardware,
+            phase=phase,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            graph=graph,
+            sim_results=sim_results,
+            timeline=timeline,
+            hw_spec=hw_spec,
+            ctx=ctx,
+            profile=profile,
+            memory_budget=memory_budget,
+        )
+
     return E2ESummary(
         model          = model,
         hardware       = hardware,
@@ -282,6 +355,12 @@ def build_summary(
         by_layer       = by_layer,
         top_bottleneck_ops = top_bottleneck_ops,
         memory_budget  = memory_budget,
+        # ── Phase 1 fields ─────────────────────────────────────────────────
+        report_context  = report_context,
+        bound_compute_pct = bound_compute_pct,
+        bound_memory_pct  = bound_memory_pct,
+        bound_comm_pct    = bound_comm_pct,
+        model_blocks      = model_blocks,
     )
 
 
@@ -354,6 +433,16 @@ class TrainingSummary:
 
     # ── chrome trace (optional) ───────────────────────────────────────────────
     chrome_trace: dict | None = None
+
+    # ── optimizer (optional, per §6.3 of muon_optimizer_design.md) ────────────
+    optimizer_type: str = "adam"              # "adam" or "muon"
+    muon_param_fraction: float = 0.0          # 0.0 for Adam, 0.85 for Muon default
+    opt_state_gb: float = 0.0                 # optimizer state memory in GB
+    opt_state_savings_gb: float = 0.0         # savings vs pure Adam
+    optimizer_step_ms: float = 0.0            # optimizer step time in ms
+    muon_ag_rs_ms: float = 0.0                # Muon AG+RS communication time
+    muon_ns_tflops: float = 0.0               # NS iteration FLOPs in TFLOPs
+    optimizer_time_fraction: float = 0.0     # optimizer_step_ms / total_step_ms
 
     # ── string representation ─────────────────────────────────────────────────
 

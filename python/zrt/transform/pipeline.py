@@ -54,8 +54,8 @@ def build_pipeline() -> TransformPipeline:
     """Build the unified transform pipeline for both inference and training.
 
     Pass selection is fully condition-driven:
-    - Training passes (ZeRO, TrainFlops, TrainingMemory, TrainingPipeline) only
-      run when ctx.training is not None.
+    - Training passes (Recompute, Optimizer, ZeRO, TrainFlops, TrainingMemory, TrainingPipeline)
+      only run when ctx.training is not None.
     - DP / CP passes only run when the corresponding degree > 1 (and training for DP).
     - CommInsert fires when TP, EP, or CP > 1.
     """
@@ -74,6 +74,9 @@ def build_pipeline() -> TransformPipeline:
         TrainingFlopsPass, TrainingMemoryPass, TrainingPipelinePass,
     )
     from python.zrt.transform.training.zero_fsdp import ZeroFSDPPass
+    from python.zrt.transform.training.recompute import RecomputePass
+    from python.zrt.transform.training.optimizer import OptimizerPass
+    from python.zrt.transform.training.offload import OffloadPass
 
     is_train = lambda c: c.is_training
 
@@ -105,7 +108,14 @@ def build_pipeline() -> TransformPipeline:
              condition=lambda c: "shared_expert_external" in c.optim_flags)
     pipe.add("optim", MTPPass(),
              condition=lambda c: "mtp" in c.optim_flags)
-    pipe.add("optim", ZeroFSDPPass(),        condition=is_train)
+    # RecomputePass must run before ZeroFSDPPass (ZeRO needs recompute annotations)
+    pipe.add("optim", RecomputePass(),        condition=is_train)
+    pipe.add("optim", ZeroFSDPPass(),         condition=is_train)
+    # OptimizerPass adds optimizer step node after all backward ops
+    pipe.add("optim", OptimizerPass(),        condition=is_train)
+    # OffloadPass inserts CPU-GPU transfer nodes for memory offloading
+    pipe.add("optim", OffloadPass(),
+             condition=lambda c: c.is_training and c.training.offload is not None and c.training.offload.pct > 0)
 
     # ── Stage 4: Analyze ──────────────────────────────────────────────────────
     pipe.add("analyze", FlopsPass())

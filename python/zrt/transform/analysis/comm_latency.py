@@ -107,8 +107,10 @@ class CommLatencyPass(GraphPass):
             collective = node.attrs.get("collective", "all_reduce")
             group_size = node.attrs.get("group_size", 1)
 
-            # Compute total data bytes from inputs
-            data_bytes = sum(t.mem_bytes for t in node.inputs)
+            # Compute total data bytes: prefer explicit msg_bytes attr, else tensor sizes
+            data_bytes = node.attrs.get("msg_bytes", 0)
+            if data_bytes == 0:
+                data_bytes = sum(t.mem_bytes for t in node.inputs)
             if data_bytes == 0:
                 data_bytes = sum(t.mem_bytes for t in node.outputs)
             if data_bytes == 0:
@@ -124,7 +126,8 @@ class CommLatencyPass(GraphPass):
             else:
                 link = hw_spec.interconnect.intra_node
 
-            # Compute bandwidth in bytes/second
+            # bandwidth_gbps is aggregate GB/s; divide by 8 to convert to per-GPU
+            # B/s (matching ring-algorithm effective per-GPU bandwidth)
             bandwidth_bps = link.bandwidth_gbps * 1e9 / 8.0
 
             # Estimate latency

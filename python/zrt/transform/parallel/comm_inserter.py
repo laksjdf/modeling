@@ -123,6 +123,34 @@ class CommInserterPass(GraphPass):
         if not ep_nodes:
             return
 
+        # Message-size parameters from graph metadata and training config
+        seq_len = g.metadata.get("seq_len", 2048)
+        hidden = g.metadata.get("hidden", 4096)
+        dtype_bytes = 2  # BF16
+        micro_batch = ctx.training.micro_batch if ctx.training else 1
+        topk = ctx.profile.moe_active if ctx.profile else 8
+
+        # EP dispatch/combine: A2A distributes routed tokens across EP ranks
+        # Each rank sends/receives 1/EP of the total routed data
+        # Message size = batch * seq_len * hidden * topk / EP * dtype_bytes
+        ep_msg_bytes = micro_batch * seq_len * hidden * topk * dtype_bytes // ep
+
+        # Import TensorMeta for creating correct tensor shapes
+        from python.zrt.ir.types import TensorMeta, DType
+
+        # Create tensor metadata with correct message size
+        # Shape: [batch, seq_len, hidden] for dispatch/combine
+        dispatch_tensor = TensorMeta.from_shape_dtype(
+            "ep_dispatch_hidden",
+            shape=(micro_batch, seq_len, hidden),
+            dtype=DType.BF16,
+        )
+        combine_tensor = TensorMeta.from_shape_dtype(
+            "ep_combine_hidden",
+            shape=(micro_batch, seq_len, hidden),
+            dtype=DType.BF16,
+        )
+
         # Group by scope prefix (everything up to "experts")
         # Insert one dispatch A2A before the first expert node in the block
         # and one combine A2A after the last expert node in the block.
@@ -146,10 +174,10 @@ class CommInserterPass(GraphPass):
                 dispatch = OpNode(
                     id=dispatch_id,
                     op_type="comm.all_to_all",
-                    inputs=copy.deepcopy(first.inputs[:1]),
-                    outputs=copy.deepcopy(first.inputs[:1]),
+                    inputs=[dispatch_tensor],
+                    outputs=[dispatch_tensor],
                     attrs={"group_size": ep, "collective": "all_to_all",
-                           "role": "dispatch"},
+                           "role": "dispatch", "msg_bytes": ep_msg_bytes},
                     scope=first.scope,
                     layer=first.layer,
                     category="communication",
@@ -163,15 +191,16 @@ class CommInserterPass(GraphPass):
                 combine = OpNode(
                     id=combine_id,
                     op_type="comm.all_to_all",
-                    inputs=copy.deepcopy(last.outputs[:1]),
-                    outputs=copy.deepcopy(last.outputs[:1]),
+                    inputs=[combine_tensor],
+                    outputs=[combine_tensor],
                     attrs={"group_size": ep, "collective": "all_to_all",
-                           "role": "combine"},
+                           "role": "combine", "msg_bytes": ep_msg_bytes},
                     scope=last.scope,
                     layer=last.layer,
                     category="communication",
                 )
                 combine.annotations["inserted_by"] = "ep_pass"
+                g.add_node(combine)
                 _rewire(g, last.id, combine)
 
             for n in block:
@@ -244,7 +273,6 @@ class CommInserterPass(GraphPass):
                     _rewire(g, node.id, post_comm)
 
             elif cp_kind == "ring":
-                # Ring: N rounds of P2P, each overlapped with an FA tile
                 p2p_rounds = cp_split.get("p2p_rounds", cp)
                 for i in range(p2p_rounds):
                     p2p_id = f"comm_p2p_cp_ring_{node.id}_round_{i}"
@@ -257,6 +285,7 @@ class CommInserterPass(GraphPass):
                             attrs={"group_size": cp, "collective": "send_recv",
                                    "role": "cp_ring", "round": i,
                                    "message_size_bytes": ring_msg_bytes,
+                                   "cp_rounds": p2p_rounds,
                                    "scope": node.scope, "layer": node.layer},
                             scope=node.scope,
                             layer=node.layer,

@@ -13,20 +13,20 @@ class OffloadPass(GraphPass):
 
     def run(self, graph: OpGraph, ctx: TransformContext) -> OpGraph:
         """Run OffloadPass on the graph.
-        
+
         Args:
             graph: Input OpGraph
             ctx: TransformContext with training config
-            
+
         Returns:
             New OpGraph with offload communication nodes
         """
         g = graph.clone()
         if not ctx.training:
             return g
-        
+
         offload = ctx.training.offload
-        if offload.pct <= 0:
+        if offload is None or offload.pct <= 0:
             return g
         
         # Insert offload nodes based on offload policy

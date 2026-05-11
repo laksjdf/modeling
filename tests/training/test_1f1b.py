@@ -1,20 +1,23 @@
 """Test 1F1B pipeline schedule — bubble ratio matches Megatron paper."""
 
 import pytest
-from zrt.training.compose.pipeline import OneF1BComposer, pipeline_step_time
+from zrt.training.compose.schedules import OneF1BComposer, pipeline_step_time
 from zrt.training.compose.stage import StageTime
 from zrt.training.ir.builders import build_graph
-from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import ModelSpec, LayerKind
 from zrt.training.spec.strategy import Strategy
-from zrt.training.spec.system import SystemSpec, GPU, NetTier
+from zrt.hardware.spec import InterconnectSpec, LinkSpec
+from zrt.training.spec.system import SystemSpec, GPU
 
 
 def _make_system():
     return SystemSpec(
         gpu=GPU(name="h100", flops_bf16=989, flops_fp8=1979, hbm_gb=80, hbm_bw_gbps=3350),
         host_mem_gb=256,
-        nets=[NetTier("intra_node", 900, 1.0, "nvswitch")],
+        interconnect=InterconnectSpec(
+            intra_node=LinkSpec(type="NVLink", bandwidth_gbps=900, latency_us=1.0, topology="all_to_all", num_devices=8),
+            inter_node=LinkSpec(type="IB", bandwidth_gbps=400, latency_us=5.0, topology="fat_tree"),
+        ),
         nodes=1, gpus_per_node=8,
     )
 
@@ -44,7 +47,7 @@ def test_single_stage_dp_allreduce_overlaps_backward_when_enabled():
     result = OneF1BComposer().compose(stage, M=4, pp=1, dp_ar_time=3.0, strategy=strategy)
 
     assert result.step_time == 12.0
-    assert result.dp_ar_exposed == 0.0
+    assert result.dp_exposed == 0.0
 
 
 def test_single_stage_dp_allreduce_exposed_when_overlap_disabled():
@@ -57,7 +60,7 @@ def test_single_stage_dp_allreduce_exposed_when_overlap_disabled():
     result = OneF1BComposer().compose(stage, M=4, pp=1, dp_ar_time=3.0, strategy=strategy)
 
     assert result.step_time == 15.0
-    assert result.dp_ar_exposed == 3.0
+    assert result.dp_exposed == 3.0
 
 
 def test_pp2_bubble_ratio():
@@ -89,7 +92,10 @@ def test_step_time_increases_with_pp():
     system = SystemSpec(
         gpu=GPU(name="h100", flops_bf16=989, flops_fp8=1979, hbm_gb=80, hbm_bw_gbps=3350),
         host_mem_gb=256,
-        nets=[NetTier("intra_node", 900, 1.0, "nvswitch")],
+        interconnect=InterconnectSpec(
+            intra_node=LinkSpec(type="NVLink", bandwidth_gbps=900, latency_us=1.0, topology="all_to_all", num_devices=8),
+            inter_node=LinkSpec(type="IB", bandwidth_gbps=400, latency_us=5.0, topology="fat_tree"),
+        ),
         nodes=2, gpus_per_node=8,
     )
 
@@ -121,4 +127,4 @@ def test_mfu_positive_and_bounded():
     graph = build_graph(model, strategy)
 
     result = pipeline_step_time(graph, model, system, strategy)
-    assert 0 < result.mfu <= 1.0
+    assert 0 < result.mfu < 1.0

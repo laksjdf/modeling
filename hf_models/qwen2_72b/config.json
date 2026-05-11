@@ -19,7 +19,7 @@
   "rope_theta": 1000000.0,
   "sliding_window": 131072,
   "tie_word_embeddings": false,
-  "torch_dtype": "bfloat16",
+  "dtype": "bfloat16",
   "transformers_version": "4.40.1",
   "use_cache": true,
   "use_sliding_window": false,

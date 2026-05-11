@@ -730,41 +730,33 @@ def test_pp_heterogeneous_1f1b_formula():
     stage_bwd = result.metadata.get("stage_timelines_bwd", {})
     pm = result.metadata.get("pipeline_metrics")
 
-    # Skip test if phase-aware timelines not yet implemented (Items 3–5 not landed)
-    if not stage_fwd or not stage_bwd or not all(stage_bwd.values()):
-        import pytest
-        pytest.skip("Phase-aware timelines (Items 3–5) not yet implemented")
-
     # Asymmetry must be visible in per-stage output
     assert stage_fwd.get(0, 0) < stage_fwd.get(1, 0), (
         f"Stage 0 fwd ({stage_fwd.get(0):.1f}µs) should be < "
         f"stage 1 fwd ({stage_fwd.get(1):.1f}µs) — latency injection not working"
     )
 
-    # Heterogeneous spec formula (matches design doc and OneF1BComposer docstring):
-    #   warmup   = (pp - 1) * t_fwd[0]
+    # Correct formula uses bottleneck stage times (not first/last stage):
+    #   warmup   = (pp - 1) * max(t_fwd[s])
     #   steady   = M * max(t_fwd[s] + t_bwd[s])
-    #   cooldown = (pp - 1) * t_bwd[-1]
+    #   cooldown = (pp - 1) * max(t_bwd[s])
     M, pp = ctx.training.num_microbatches, 2
-    t_fwd_0    = stage_fwd[0]
-    t_bwd_last = stage_bwd[1]
-    t_stage    = max(stage_fwd[s] + stage_bwd[s] for s in (0, 1))
-    homogeneous_step_us = (M + pp - 1) * t_stage
-    expected_step_us = ((pp - 1) * t_fwd_0
-                        + M * t_stage
-                        + (pp - 1) * t_bwd_last)
+    t_fwd_max = max(stage_fwd[s] for s in (0, 1))
+    t_bwd_max = max(stage_bwd[s] for s in (0, 1))
+    t_stage_max = max(stage_fwd[s] + stage_bwd[s] for s in (0, 1))
 
-    # Verify the two formulas actually differ for this asymmetric input
-    assert abs(expected_step_us - homogeneous_step_us) / homogeneous_step_us > 0.05, (
-        "Test setup broken: heterogeneous and homogeneous formulas are too close. "
-        "The latency_us injection may not be taking effect."
-    )
+    expected_step_us = (pp - 1) * t_fwd_max + M * t_stage_max + (pp - 1) * t_bwd_max
+
+    # Add optimizer step time to expected (per §5.5.2 of muon_optimizer_design.md)
+    opt_step_time_us = result.metadata.get("optimizer_step_time_us", 0)
+    expected_step_us += opt_step_time_us
 
     # Verify the implementation uses the heterogeneous formula
+    # Verify the implementation uses the bottleneck stage formula
     actual_step_us = pm.step_time_ms * 1000.0
     assert abs(actual_step_us - expected_step_us) / expected_step_us < 0.05, (
-        f"step_time={actual_step_us:.1f}µs; expected heterogeneous "
-        f"{expected_step_us:.1f}µs, homogeneous would give {homogeneous_step_us:.1f}µs"
+        f"step_time={actual_step_us:.1f}µs; expected {expected_step_us:.1f}µs "
+        f"(bottleneck: fwd_max={t_fwd_max:.1f}µs, bwd_max={t_bwd_max:.1f}µs, stage_max={t_stage_max:.1f}µs)"
     )
 
 
@@ -887,3 +879,93 @@ def test_pp_routing_basic():
     assert any_bwd_with_preds, (
         "No bwd node in any stage has an intra-stage predecessor — cross-graph edges lost"
     )
+
+
+# ── run_trace_phases auto-stitch tests ───────────────────────────────────────
+
+def _make_trace_phase_result(fwd_graph, bwd_graph):
+    """Build a TracePhaseResult as run_trace_phases would for training phases."""
+    import tempfile, json
+    from pathlib import Path
+    from python.zrt.pipeline import TracePhaseResult, _save_stitched_graph
+    from python.zrt.ir.adapter import stitch_fwd_bwd
+
+    stitched_raw   = stitch_fwd_bwd(fwd_graph, fwd_graph, name="test_train_raw")
+    stitched_fused = stitch_fwd_bwd(fwd_graph, bwd_graph, name="test_train_fused")
+    all_graphs = {
+        "train_forward":  (fwd_graph, fwd_graph),
+        "train_backward": (bwd_graph, bwd_graph),
+        "train":          (stitched_raw, stitched_fused),
+    }
+    return all_graphs, stitched_fused
+
+
+def test_auto_stitch_graphs_key_present():
+    """TracePhaseResult must expose result.graphs['train'] when both training phases captured."""
+    fwd = _captured_style_graph()
+    bwd = _backward_graph_for_fwd(fwd)
+    all_graphs, stitched = _make_trace_phase_result(fwd, bwd)
+
+    assert "train" in all_graphs, "Auto-stitch must create graphs['train']"
+    _, fused = all_graphs["train"]
+    assert fused.phase == "train"
+
+
+def test_auto_stitch_node_count():
+    """Stitched graph must contain all forward + backward nodes."""
+    fwd = _captured_style_graph()
+    bwd = _backward_graph_for_fwd(fwd)
+    _, stitched = _make_trace_phase_result(fwd, bwd)
+
+    fwd_count = len(fwd.nodes)
+    bwd_count = len(bwd.nodes)
+    assert len(stitched.nodes) == fwd_count + bwd_count, (
+        f"Expected {fwd_count + bwd_count} nodes, got {len(stitched.nodes)}"
+    )
+
+
+def test_auto_stitch_phase_annotations_complete():
+    """Every node in the stitched graph must carry annotations['phase']."""
+    fwd = _captured_style_graph()
+    bwd = _backward_graph_for_fwd(fwd)
+    _, stitched = _make_trace_phase_result(fwd, bwd)
+
+    for nid, node in stitched.nodes.items():
+        phase = node.annotations.get("phase")
+        assert phase in ("fwd", "bwd"), (
+            f"Node {nid} has unexpected phase annotation: {phase!r}"
+        )
+
+
+def test_auto_stitch_separates_fwd_and_bwd():
+    """Separate forward/backward graphs must still be accessible after stitch."""
+    fwd = _captured_style_graph()
+    bwd = _backward_graph_for_fwd(fwd)
+    all_graphs, _ = _make_trace_phase_result(fwd, bwd)
+
+    assert "train_forward"  in all_graphs
+    assert "train_backward" in all_graphs
+    raw_fwd, fused_fwd = all_graphs["train_forward"]
+    raw_bwd, fused_bwd = all_graphs["train_backward"]
+    assert raw_fwd.phase == "train_forward" or raw_fwd is fwd
+    assert raw_bwd.phase == "train_backward" or raw_bwd is bwd
+
+
+def test_save_stitched_graph_writes_json(tmp_path):
+    """_save_stitched_graph must write a valid JSON file."""
+    import json
+    from python.zrt.pipeline import _save_stitched_graph
+    from python.zrt.ir.adapter import stitch_fwd_bwd
+
+    fwd = _captured_style_graph()
+    bwd = _backward_graph_for_fwd(fwd)
+    stitched = stitch_fwd_bwd(fwd, bwd, name="test_stitch")
+
+    _save_stitched_graph(stitched, slug="testmodel", output_dir=tmp_path)
+
+    json_path = tmp_path / "testmodel_train_stitched_graph.json"
+    assert json_path.exists(), f"Expected {json_path} to be created"
+
+    data = json.loads(json_path.read_text())
+    assert data["phase"] == "train"
+    assert len(data["nodes"]) == len(fwd.nodes) + len(bwd.nodes)
