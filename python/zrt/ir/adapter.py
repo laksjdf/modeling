@@ -150,6 +150,8 @@ def records_to_opgraph(
             src_file=rec.get("src_file", ""),
             src_line=rec.get("src_line", 0),
             src_code=rec.get("src_code", ""),
+            name=rec.get("leaf_attr", ""),
+            call_id=int(rec.get("call_id", 0) or 0),
         )
         graph.add_node(node)
 

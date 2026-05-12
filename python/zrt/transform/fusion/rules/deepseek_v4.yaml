@@ -1,0 +1,581 @@
+# DeepSeek-V4 fusion rules
+# Schema: see docs/fusion_v2_rich_rules_zh.md §3.1
+# Source-of-truth model file: hf_models/deepseek_v4/inference/model.py
+#   (line numbers in comments below refer to that file)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. RMSNorm  (line 183)
+#    forward: x.pow(2).mean(-1, keepdim).add(eps).rsqrt().mul(x).mul(weight)
+# ─────────────────────────────────────────────────────────────────────────────
+- target_class: RMSNorm
+  op_type: rms_norm
+  name: dsv4_rms_norm
+  description: "DSV4 custom RMSNorm — pow / mean / add(eps) / rsqrt / mul / mul"
+  default_phases: [inference, training]
+  priority: 30
+  match:
+    kind: ordered_regex
+    op_regexes:
+      - 'aten\.pow\.Tensor_Scalar'
+      - 'aten\.mean\.dim'
+      - 'aten\.add\.(Tensor|Scalar)'
+      - 'aten\.rsqrt\.default'
+      - 'aten\.mul\.Tensor'
+      - 'aten\.mul\.Tensor'
+    min_ops: 5
+    max_ops: 16
+  # ``(self.weight * x).to(dtype)`` dispatches to ``aten.mul.Tensor(weight, x)``:
+  # weight at slot 0, activation at slot 1.
+  io_roles:
+    - {role: activation, source_kind: input,  source_op_index: 0,  source_arg_index: 0,  shape_role: "[B,S,H]"}
+    - {role: weight,     source_kind: input,  source_op_index: -1, source_arg_index: 0,  shape_role: "[H]"}
+    - {role: output,     source_kind: output, source_op_index: -1, source_arg_index: -1, shape_role: "[B,S,H]"}
+  shape_derivation:
+    batch_size: "activation.shape[0]"
+    seq_len:    "activation.shape[1]"
+    hidden_in:  "activation.shape[-1]"
+    hidden_out: "activation.shape[-1]"
+  flops_formula:  "4 * batch_size * seq_len * hidden_in"
+  memory_formula: "activation.bytes + weight.bytes + output.bytes"
+  annotations:
+    layer_norm_kind: rms
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. ParallelEmbedding  (line 83)
+#    forward: gather + (optional) mask + all_reduce when world_size > 1
+# ─────────────────────────────────────────────────────────────────────────────
+- target_class: ParallelEmbedding
+  op_type: parallel_embedding
+  name: parallel_embedding
+  description: "ParallelEmbedding gather + optional all_reduce"
+  default_phases: [inference, training]
+  priority: 40
+  match:
+    kind: class_only
+  # ``F.embedding(input_ids, self.weight)`` dispatches to
+  # ``aten.embedding.default(weight, input_ids, ...)`` — weight at slot 0,
+  # input_ids at slot 1 (PyTorch's `_embedding_renorm_` argument order).
+  io_roles:
+    - {role: weight,     source_kind: input,  source_op_index: 0,  source_arg_index: 0,  shape_role: "[V,H]"}
+    - {role: input_ids,  source_kind: input,  source_op_index: 0,  source_arg_index: 1,  shape_role: "[B,S]"}
+    - {role: output,     source_kind: output, source_op_index: -1, source_arg_index: -1, shape_role: "[B,S,H]"}
+  shape_derivation:
+    batch_size: "output.shape[0]"
+    seq_len:    "output.shape[1]"
+    hidden_out: "output.shape[-1]"
+    vocab_size: "weight.shape[0]"
+  # Embedding gather is ~0 FLOPs; all_reduce overhead is accounted by comm pass.
+  flops_formula:  "0"
+  memory_formula: "input_ids.bytes + weight.bytes + output.bytes"
+  annotations:
+    embedding_kind: parallel
+    comm: all_reduce_optional
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. Linear (generic, line 123 — base class for parallel variants)
+#    linear() (line 108) dispatches: fp4_gemm | fp8_gemm | F.linear
+#    Use dag_signature to tolerate FP8/FP4 op-permutation variance.
+# ─────────────────────────────────────────────────────────────────────────────
+- target_class: Linear
+  op_type: linear
+  name: linear
+  description: "Generic Linear (fp4 / fp8 / bf16 GEMM); dag_signature tolerates op-permutation"
+  default_phases: [inference, training]
+  priority: 18
+  match:
+    kind: dag_signature
+    op_multiset:
+      - ['aten\.(mm|matmul|linear|addmm)\..*', 1]
+    min_ops: 1
+    max_ops: 32
+  io_roles:
+    - {role: activation, source_kind: input,  source_op_index: 0,  source_arg_index: 0,  shape_role: "[B,S,Hin]"}
+    - {role: weight,     source_kind: input,  source_op_index: -1, source_arg_index: 1,  shape_role: "[Hout,Hin]"}
+    - {role: output,     source_kind: output, source_op_index: -1, source_arg_index: -1, shape_role: "[B,S,Hout]"}
+  shape_derivation:
+    # Use total-tokens × Hin model so 2-D and 3-D activations both work.
+    batch_size: "1"
+    seq_len:    "max(1, activation.numel // activation.shape[-1])"
+    hidden_in:  "activation.shape[-1]"
+    hidden_out: "output.shape[-1]"
+    extra:
+      - [num_tokens, "seq_len"]
+  flops_formula:  "2 * num_tokens * hidden_in * hidden_out"
+  memory_formula: "activation.bytes + weight.bytes + output.bytes"
+  annotations:
+    quant: auto
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. ColumnParallelLinear  (line 155)
+#    Subclass of Linear; output sharded along hidden_out (column).
+# ─────────────────────────────────────────────────────────────────────────────
+- target_class: ColumnParallelLinear
+  op_type: column_parallel_linear
+  name: column_parallel_linear
+  description: "ColumnParallelLinear: output sharded along hidden_out"
+  default_phases: [inference, training]
+  priority: 25
+  match:
+    kind: class_only
+  io_roles:
+    - {role: activation, source_kind: input,  source_op_index: 0,  source_arg_index: 0,  shape_role: "[B,S,Hin]"}
+    - {role: weight,     source_kind: input,  source_op_index: -1, source_arg_index: 1,  shape_role: "[Hout_local,Hin]"}
+    - {role: output,     source_kind: output, source_op_index: -1, source_arg_index: -1, shape_role: "[B,S,Hout_local]"}
+  shape_derivation:
+    batch_size: "1"
+    seq_len:    "max(1, activation.numel // activation.shape[-1])"
+    hidden_in:  "activation.shape[-1]"
+    hidden_out: "output.shape[-1]"
+    extra:
+      - [num_tokens, "seq_len"]
+  flops_formula:  "2 * num_tokens * hidden_in * hidden_out"
+  memory_formula: "activation.bytes + weight.bytes + output.bytes"
+  annotations:
+    parallel: column
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. RowParallelLinear  (line 166)
+#    Subclass of Linear; output gathered via all_reduce.
+# ─────────────────────────────────────────────────────────────────────────────
+- target_class: RowParallelLinear
+  op_type: row_parallel_linear
+  name: row_parallel_linear
+  description: "RowParallelLinear: output gathered via all_reduce"
+  default_phases: [inference, training]
+  priority: 25
+  match:
+    kind: class_only
+  io_roles:
+    - {role: activation, source_kind: input,  source_op_index: 0,  source_arg_index: 0,  shape_role: "[B,S,Hin_local]"}
+    - {role: weight,     source_kind: input,  source_op_index: -1, source_arg_index: 1,  shape_role: "[Hout,Hin_local]"}
+    - {role: output,     source_kind: output, source_op_index: -1, source_arg_index: -1, shape_role: "[B,S,Hout]"}
+  shape_derivation:
+    batch_size: "1"
+    seq_len:    "max(1, activation.numel // activation.shape[-1])"
+    hidden_in:  "activation.shape[-1]"
+    hidden_out: "output.shape[-1]"
+    extra:
+      - [num_tokens, "seq_len"]
+  flops_formula:  "2 * num_tokens * hidden_in * hidden_out"
+  memory_formula: "activation.bytes + weight.bytes + output.bytes"
+  annotations:
+    parallel: row
+    comm: all_reduce
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. apply_rotary_emb  (line 232, top-level free function)
+#    Top-level fn — match by aten DAG signature inside *any* module scope.
+#    Uses view_as_complex / mul / view_as_real / flatten / copy_.
+# ─────────────────────────────────────────────────────────────────────────────
+- target_class: apply_rotary_emb
+  op_type: rotary_emb
+  name: rotary_emb
+  description: "RoPE complex multiply (view_as_complex / mul / view_as_real)"
+  default_phases: [inference, training]
+  priority: 22
+  match:
+    kind: dag_signature
+    op_multiset:
+      - ['aten\.view_as_complex\.default',                    1]
+      - ['aten\.mul\.Tensor',                                 1]
+      - ['aten\.view_as_real\.default',                       1]
+      - ['aten\.copy_\.default|aten\.flatten\.using_ints',    1]
+    min_ops: 3
+    max_ops: 16
+  io_roles:
+    - {role: activation, source_kind: input,  source_op_index: 0,  source_arg_index: 0,  shape_role: "[B,S,N,D]"}
+    - {role: freqs_cis,  source_kind: input,  source_op_index: 0,  source_arg_index: 1,  shape_role: "[S,D/2]"}
+    - {role: output,     source_kind: output, source_op_index: -1, source_arg_index: -1, shape_role: "[B,S,N,D]"}
+  shape_derivation:
+    batch_size: "activation.shape[0]"
+    seq_len:    "activation.shape[1]"
+    head_dim:   "activation.shape[-1]"
+    extra:
+      # Num heads from total elements / (B*S*D); falls back to 1 in 3-D case.
+      - [num_heads_proxy, "max(1, activation.numel // (batch_size * seq_len * head_dim))"]
+  # Complex multiply on N*D/2 pairs: ~6 FLOPs per pair (2 mul + 1 add real, mirror imag).
+  flops_formula:  "6 * batch_size * seq_len * num_heads_proxy * head_dim"
+  memory_formula: "activation.bytes + freqs_cis.bytes + output.bytes"
+  annotations:
+    rope_kind: complex_mul
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. Compressor  (line 279)
+#    KV compression: wkv + wgate Linear + softmax weighted-sum + RoPE on rope head.
+# ─────────────────────────────────────────────────────────────────────────────
+- target_class: Compressor
+  op_type: kv_compressor
+  name: kv_compressor
+  description: "DSV4 KV Compressor — has kv_state buffer write; class_only match"
+  default_phases: [inference, training]
+  priority: 35
+  match:
+    kind: class_only
+  io_roles:
+    - {role: activation, source_kind: input,  source_op_index: 0,  source_arg_index: 0,  shape_role: "[B,S,H]"}
+    - {role: output,     source_kind: output, source_op_index: -1, source_arg_index: -1, shape_role: "[B,S/R,D]"}
+  shape_derivation:
+    batch_size: "activation.shape[0]"
+    seq_len:    "activation.shape[1]"
+    hidden_in:  "activation.shape[-1]"
+    head_dim:   "output.shape[-1]"
+    extra:
+      - [compress_ratio, "max(1, activation.shape[1] // max(1, output.shape[1]))"]
+  # 2 GEMMs (wkv + wgate) over [B,S,H]*[H,D] + softmax weighted-sum over compressed seq.
+  flops_formula: "4 * batch_size * seq_len * hidden_in * head_dim + 8 * batch_size * (seq_len // compress_ratio) * head_dim"
+  memory_formula: "activation.bytes + output.bytes * 2"
+  annotations:
+    component: kv_compressor
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. Indexer  (line 380)
+#    Sparse attention indexer: ColumnParallelLinear (wq_b + weights_proj)
+#    + Compressor + RoPE + einsum + relu + sum + all_reduce + topk.
+# ─────────────────────────────────────────────────────────────────────────────
+- target_class: Indexer
+  op_type: sparse_indexer
+  name: sparse_indexer
+  description: "DSV4 sparse-attention Indexer (Compressor + RoPE + einsum + relu + sum + all_reduce + topk)"
+  default_phases: [inference, training]
+  priority: 35
+  match:
+    kind: class_only
+  io_roles:
+    - {role: activation, source_kind: input,  source_op_index: 0,  source_arg_index: 0,  shape_role: "[B,S,H]"}
+    - {role: output,     source_kind: output, source_op_index: -1, source_arg_index: -1, shape_role: "[B,S,topk]"}
+  shape_derivation:
+    batch_size: "activation.shape[0]"
+    seq_len:    "activation.shape[1]"
+    hidden_in:  "activation.shape[-1]"
+    extra:
+      - [index_topk, "max(1, output.shape[-1])"]
+  # Dominated by einsum 'bshd,btd->bsht' (~ 2*B*S*H_idx*D*S) plus q-projection (~2*B*S*H*H).
+  # We approximate index_n_heads * head_dim ≈ hidden_in for the einsum cost.
+  flops_formula: "2 * batch_size * seq_len * hidden_in * hidden_in + 2 * batch_size * seq_len * seq_len * index_topk"
+  memory_formula: "activation.bytes + output.bytes"
+  annotations:
+    component: sparse_indexer
+    comm: all_reduce_optional
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. Attention  (line 436) — Multi-head Latent Attention with sparse_attn kernel
+#    Linear(wq_a) + RMSNorm(q_norm) + Linear(wq_b) + apply_rotary_emb
+#    + Compressor + Indexer + sparse_attn + einsum(bsgd,grd->bsgr)
+#    + RowParallelLinear(wo_a) + RMSNorm(kv_norm) + linear(wo_b).
+# ─────────────────────────────────────────────────────────────────────────────
+- target_class: Attention
+  op_type: mla_sparse_attn
+  name: mla_sparse_attn
+  description: "DSV4 Multi-head Latent Attention with sparse_attn kernel (class_only — only fires on full forward)"
+  default_phases: [inference, training]
+  priority: 40
+  match:
+    kind: class_only
+  io_roles:
+    - {role: activation, source_kind: input,  source_op_index: 0,  source_arg_index: 0,  shape_role: "[B,S,H]"}
+    - {role: output,     source_kind: output, source_op_index: -1, source_arg_index: -1, shape_role: "[B,S,H]"}
+  shape_derivation:
+    batch_size: "activation.shape[0]"
+    seq_len:    "activation.shape[1]"
+    hidden_in:  "activation.shape[-1]"
+    hidden_out: "output.shape[-1]"
+    extra:
+      # Empirical: q/kv head_dim ≈ 64, n_heads ≈ 64.  Use hidden_in/64 as proxy.
+      - [n_heads_proxy, "max(1, hidden_in // 64)"]
+      - [head_dim_proxy, "64"]
+      - [topk_kv_proxy, "max(1, seq_len // 4)"]
+  # q-proj + kv-proj (~2 * 2 * B*S*H*H) + sparse_attn (2 * B * S * n_heads * head_dim * topk_kv)
+  # + o-proj (2 * B*S*H*H).  Coarse but monotonic in B/S/H.
+  flops_formula: "6 * batch_size * seq_len * hidden_in * hidden_out + 2 * batch_size * seq_len * n_heads_proxy * head_dim_proxy * topk_kv_proxy"
+  memory_formula: "activation.bytes + output.bytes * 2"
+  annotations:
+    attention_kind: mla
+    sparse: true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. Gate  (line 546)  — MoE router.
+#     linear(x, weight) + softmax|sigmoid|sqrt(softplus) + topk + gather.
+# ─────────────────────────────────────────────────────────────────────────────
+- target_class: Gate
+  op_type: moe_gate
+  name: moe_gate
+  description: "MoE router: linear + softmax|sigmoid + topk + gather"
+  default_phases: [inference, training]
+  priority: 30
+  match:
+    kind: class_only
+  io_roles:
+    - {role: activation,     source_kind: input,  source_op_index: 0,  source_arg_index: 0,  shape_role: "[T,H]"}
+    - {role: router_weight,  source_kind: input,  source_op_index: 0,  source_arg_index: 1,  shape_role: "[E,H]"}
+    - {role: output,         source_kind: output, source_op_index: -1, source_arg_index: -1, shape_role: "[T,K]"}
+  shape_derivation:
+    batch_size: "activation.shape[0]"
+    seq_len:    "1"
+    hidden_in:  "activation.shape[-1]"
+    num_experts: "router_weight.shape[0]"
+    topk:        "output.shape[-1]"
+    extra:
+      - [num_tokens, "activation.shape[0]"]
+  # Routing GEMM: 2 * T * H * E.  Topk: T * E * log2(E).
+  flops_formula: "2 * num_tokens * hidden_in * num_experts + num_tokens * num_experts * max(1, log2(max(2, num_experts)))"
+  memory_formula: "activation.bytes + router_weight.bytes + output.bytes"
+  annotations:
+    component: moe_gate
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 11. Expert  (line 587)  — single-expert SwiGLU FFN.
+#     gate = linear(x, w1); up = linear(x, w3); silu(gate)*up; out = linear(., w2).
+#     Optional clamp(min=-limit, max=limit) when swiglu_limit > 0.
+# ─────────────────────────────────────────────────────────────────────────────
+- target_class: Expert
+  op_type: moe_expert_swiglu
+  name: moe_expert_swiglu
+  description: "Single MoE expert: SwiGLU FFN (3 GEMMs + silu + mul)"
+  default_phases: [inference, training]
+  priority: 28
+  match:
+    kind: ordered_regex
+    op_regexes:
+      - 'aten\.(mm|matmul|linear|addmm)\..*'    # w1 gate
+      - 'aten\.(mm|matmul|linear|addmm)\..*'    # w3 up
+      - 'aten\.silu\.default'
+      - 'aten\.mul\.Tensor'
+      - 'aten\.(mm|matmul|linear|addmm)\..*'    # w2 down
+    min_ops: 5
+    max_ops: 32
+  io_roles:
+    - {role: activation, source_kind: input,  source_op_index: 0,  source_arg_index: 0,  shape_role: "[T,H]"}
+    - {role: weight,     source_kind: input,  source_op_index: 0,  source_arg_index: 1,  shape_role: "[Hinter,H]"}
+    - {role: output,     source_kind: output, source_op_index: -1, source_arg_index: -1, shape_role: "[T,H]"}
+  shape_derivation:
+    batch_size: "activation.shape[0]"
+    seq_len:    "1"
+    hidden_in:  "activation.shape[-1]"
+    intermediate_dim: "weight.shape[0]"
+    extra:
+      - [num_tokens, "activation.shape[0]"]
+  # 3 GEMMs over [T,H] * [H,Hinter] (w1, w3 forward) + [T,Hinter] * [Hinter,H] (w2)
+  # plus silu point-wise (~2 * T * Hinter).
+  flops_formula: "6 * num_tokens * hidden_in * intermediate_dim + 2 * num_tokens * intermediate_dim"
+  memory_formula: "activation.bytes + weight.bytes * 3 + output.bytes"
+  annotations:
+    activation: swiglu
+    component: moe_expert
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 12. MoE  (line 609)  — full dispatch: Gate + bincount + N×Expert + all_reduce
+#     + shared_experts.
+# ─────────────────────────────────────────────────────────────────────────────
+- target_class: MoE
+  op_type: moe_dispatch
+  name: moe_dispatch
+  description: "Full MoE dispatch: Gate + bincount + N x Expert + all_reduce + shared_experts"
+  default_phases: [inference, training]
+  priority: 38
+  match:
+    kind: class_only
+  io_roles:
+    - {role: activation, source_kind: input,  source_op_index: 0,  source_arg_index: 0,  shape_role: "[B,S,H]"}
+    - {role: output,     source_kind: output, source_op_index: -1, source_arg_index: -1, shape_role: "[B,S,H]"}
+  shape_derivation:
+    batch_size: "activation.shape[0]"
+    seq_len:    "activation.shape[1]"
+    hidden_in:  "activation.shape[-1]"
+    hidden_out: "output.shape[-1]"
+    extra:
+      - [num_tokens, "batch_size * seq_len"]
+      # Activated experts ≈ 2 (n_activated_experts default), inter_dim proxy = hidden / 4.
+      - [activated_proxy, "2"]
+      - [inter_proxy, "max(1, hidden_in // 4)"]
+  # Approx: routing GEMM (2 * T * H * E ≈ 2 * T * H * 8) + activated experts each contribute
+  # 6 * T * H * inter (treated by the Expert rule when expanded; here we coarse-sum).
+  flops_formula: "6 * num_tokens * hidden_in * inter_proxy * activated_proxy + 16 * num_tokens * hidden_in"
+  memory_formula: "activation.bytes + output.bytes * 2"
+  annotations:
+    component: moe_dispatch
+    comm: all_reduce
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 13. Block.hc_pre  (line 673) — Sinkhorn-routed pre-norm + linear-routing block.
+#     Strategy: a 2nd rule (hc_pre_attn_raw) matches the 11-op raw signature
+#     (pow|square + mean + add + rsqrt + mm + ...) at high priority so it wins
+#     over the dag_signature ``linear`` rule on pass 1.  The post-rms_coef form
+#     below (8 ops) is a backup for cases where rms_coef fired first.
+# ─────────────────────────────────────────────────────────────────────────────
+- target_class: "*"
+  op_type: hc_pre
+  name: hc_pre_attn_raw
+  description: "Hyper-Connections pre-attention raw 11-op form (pow|square + mean + add + rsqrt + mm + mul + softmax + sigmoid + softmax + mul + sum)"
+  default_phases: [inference, training]
+  priority: 35
+  match:
+    kind: ordered_regex
+    op_regexes:
+      - 'aten\.(pow\.Tensor_Scalar|square\.default)'
+      - 'aten\.mean\.dim'
+      - 'aten\.(add|add_)\.(Tensor|Scalar)'
+      - 'aten\.rsqrt\.default'
+      - 'aten\.mm\.default'
+      - 'aten\.mul\.Tensor'
+      - 'aten\._softmax\.default'
+      - 'aten\.sigmoid\.default'
+      - 'aten\._softmax\.default'
+      - 'aten\.mul\.Tensor'
+      - 'aten\.sum\.dim_IntList'
+    min_ops: 11
+    max_ops: 11
+  io_roles:
+    - {role: activation, source_kind: input,  source_op_index: 0,  source_arg_index: 0,  shape_role: "[B,S,H]"}
+    - {role: output,     source_kind: output, source_op_index: -1, source_arg_index: -1, shape_role: "[B,S,Hc]"}
+  shape_derivation:
+    batch_size: "activation.shape[0]"
+    seq_len:    "activation.shape[1]"
+    hidden_in:  "activation.shape[-1]"
+    hidden_out: "output.shape[-1]"
+    extra:
+      - [hc_dim, "output.shape[-1]"]
+  flops_formula: "4 * batch_size * seq_len * hidden_in + 2 * batch_size * seq_len * hidden_in * hc_dim"
+  memory_formula: "activation.bytes + output.bytes"
+  annotations:
+    scope_suffix: hc_pre
+    component: block_hc_pre
+
+- target_class: "*"
+  op_type: hc_pre
+  name: hc_pre_attn
+  description: "Hyper-Connections pre-attention: rms_coef + linear-routing + Sinkhorn iter (matched after pass-1 rms_coef fusion)"
+  default_phases: [inference, training]
+  priority: 30
+  match:
+    kind: ordered_regex
+    op_regexes:
+      - 'rms_coef'                              # ← from pass-1 fusion
+      - 'aten\.mm\.default'
+      - 'aten\.mul\.Tensor'
+      - 'aten\._softmax\.default'
+      - 'aten\.sigmoid\.default'
+      - 'aten\._softmax\.default'
+      - 'aten\.mul\.Tensor'
+      - 'aten\.sum\.dim_IntList'
+    min_ops: 8
+    max_ops: 8
+  io_roles:
+    - {role: activation, source_kind: input,  source_op_index: 0,  source_arg_index: 0,  shape_role: "[B,S,H]"}
+    - {role: output,     source_kind: output, source_op_index: -1, source_arg_index: -1, shape_role: "[B,S,Hc]"}
+  shape_derivation:
+    batch_size: "activation.shape[0]"
+    seq_len:    "activation.shape[1]"
+    hidden_in:  "activation.shape[-1]"
+    hidden_out: "output.shape[-1]"
+    extra:
+      - [hc_dim, "output.shape[-1]"]
+  # 4 RMSNorm-ish FLOPs + linear hc_mult * H * Hc.  Sinkhorn iterations ignored (small).
+  flops_formula: "4 * batch_size * seq_len * hidden_in + 2 * batch_size * seq_len * hidden_in * hc_dim"
+  memory_formula: "activation.bytes + output.bytes"
+  annotations:
+    scope_suffix: hc_pre
+    component: block_hc_pre
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 14. Block.hc_post  (line 683) — small residual mixer.
+#     Just unsqueeze + sum + type_as.  No rsqrt / no linear → distinguishes from hc_pre.
+# ─────────────────────────────────────────────────────────────────────────────
+- target_class: "*"
+  op_type: hc_post
+  name: hc_post_attn
+  description: "Hyper-Connections post-attention: small residual mixer (mul + mul + sum + add)"
+  default_phases: [inference, training]
+  priority: 30
+  match:
+    kind: ordered_regex
+    op_regexes:
+      - 'aten\.mul\.Tensor'
+      - 'aten\.mul\.Tensor'
+      - 'aten\.sum\.dim_IntList'
+      - 'aten\.add\.Tensor'
+    min_ops: 4
+    max_ops: 4
+  io_roles:
+    - {role: activation, source_kind: input,  source_op_index: 0,  source_arg_index: 0,  shape_role: "[B,S,Hc,H]"}
+    - {role: output,     source_kind: output, source_op_index: -1, source_arg_index: -1, shape_role: "[B,S,H]"}
+  shape_derivation:
+    batch_size: "activation.shape[0]"
+    seq_len:    "activation.shape[1]"
+    hidden_out: "output.shape[-1]"
+    extra:
+      # hc_dim ≈ activation.numel / (B*S*Hout); falls back to 1 if shapes collapse.
+      - [hc_dim, "max(1, activation.numel // (batch_size * seq_len * hidden_out))"]
+  # Weighted sum over hc_dim residuals.
+  flops_formula: "2 * batch_size * seq_len * hidden_out * hc_dim"
+  memory_formula: "activation.bytes + output.bytes"
+  annotations:
+    scope_suffix: hc_post
+    component: block_hc_post
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 15. ParallelHead.hc_head  (line 728) — RMSNorm-ish + linear + sigmoid + sum.
+#     Note: the inline ``hc_head`` method is wrapped by an ``HCHead`` capture
+#     module (see graph/patches.py::_attach_hc_module_to_head), so the bucket's
+#     module_class is ``HCHead`` — not ``ParallelHead``.
+# ─────────────────────────────────────────────────────────────────────────────
+- target_class: HCHead
+  op_type: hc_head
+  name: hc_head
+  description: "HCHead capture wrapper around ParallelHead.hc_head: RMSNorm-ish + linear + sigmoid + sum"
+  default_phases: [inference, training]
+  priority: 30
+  match:
+    kind: class_only
+  io_roles:
+    - {role: activation, source_kind: input,  source_op_index: 0,  source_arg_index: 0,  shape_role: "[B,S,H]"}
+    - {role: output,     source_kind: output, source_op_index: -1, source_arg_index: -1, shape_role: "[B,S,Hc]"}
+  shape_derivation:
+    batch_size: "activation.shape[0]"
+    seq_len:    "activation.shape[1]"
+    hidden_in:  "activation.shape[-1]"
+    hidden_out: "output.shape[-1]"
+    extra:
+      - [hc_dim, "output.shape[-1]"]
+  # 4 RMSNorm + 2 * H * Hc routing linear + sigmoid (~T*Hc).
+  flops_formula: "4 * batch_size * seq_len * hidden_in + 2 * batch_size * seq_len * hidden_in * hc_dim + batch_size * seq_len * hc_dim"
+  memory_formula: "activation.bytes + output.bytes"
+  annotations:
+    component: parallel_head_hc
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 16. sparse_attn  (top-level kernel function imported in model.py, called in
+#     Attention.forward at L528/L533).  Match by aten signature (gather/bmm/softmax/bmm).
+# ─────────────────────────────────────────────────────────────────────────────
+- target_class: "*"
+  op_type: sparse_attention_kernel
+  name: sparse_attention_kernel
+  description: "Top-level sparse_attn kernel called inside Attention.forward; matched as a contiguous bmm→mul→softmax→bmm→bmm subsequence by the sliding-window scanner. target_class wildcard because sparse_attn is a free function — its ops live inside the parent Attention module's bucket alongside other ops, so we cannot match the bucket as a whole."
+  default_phases: [inference, training]
+  priority: 32
+  match:
+    kind: ordered_regex
+    op_regexes:
+      - 'aten\.(bmm|matmul)\..*'         # Q @ K^T
+      - 'aten\.mul\.Tensor'              # softmax_scale
+      - 'aten\._softmax\.default|aten\.softmax\..*'
+      - 'aten\.(bmm|matmul)\..*'         # attn_sink @ V (or first half of output)
+      - 'aten\.(bmm|matmul)\..*'         # attn @ V
+    min_ops: 5
+    max_ops: 5
+  io_roles:
+    - {role: activation, source_kind: input,  source_op_index: 0,  source_arg_index: 0,  shape_role: "[B,S,N,D]"}
+    - {role: output,     source_kind: output, source_op_index: -1, source_arg_index: -1, shape_role: "[B,S,N,D]"}
+  shape_derivation:
+    batch_size: "activation.shape[0]"
+    seq_len:    "activation.shape[1]"
+    head_dim:   "activation.shape[-1]"
+    extra:
+      - [num_heads_proxy, "max(1, activation.numel // (batch_size * seq_len * head_dim))"]
+      - [topk_kv_proxy,   "max(1, seq_len // 4)"]
+  # Sparse attention: 2 * B * S * heads * head_dim * topk_kv (Q*K) +
+  # 2 * B * S * heads * head_dim * topk_kv (attn*V).
+  flops_formula: "4 * batch_size * seq_len * num_heads_proxy * head_dim * topk_kv_proxy"
+  memory_formula: "activation.bytes + output.bytes * 2"
+  annotations:
+    attention_kind: sparse
+    kernel: top_k_attention

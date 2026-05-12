@@ -147,6 +147,10 @@ class TrainingReport:
     effective_params: int = 0        # P_eff used for MoE-aware accounting
     flops_per_token: float = 0.0     # Actual FLOPs consumed per token
 
+    # Fused-operator summary (graph-native runs only).
+    # Maps fused op_type → {count, sample_names, total_flops_pct, dtype, module_class}.
+    fused_ops_summary: dict = field(default_factory=dict)
+
     def __post_init__(self) -> None:
         """Sync total_flops with training_flops for unified contract.
 
@@ -232,6 +236,8 @@ class TrainingReport:
             result["bwd_compute_ms"] = self.bwd_compute_ms
         if self.warnings:
             result["warnings"] = self.warnings
+        if self.fused_ops_summary:
+            result["fused_ops_summary"] = self.fused_ops_summary
 
         # Config summary (handle both str and dict)
         if isinstance(self.config_summary, str):
@@ -242,66 +248,136 @@ class TrainingReport:
         return result
 
     def summary(self) -> str:
-        """Return a human-readable summary (Stack B format)."""
-        # For Stack A reports with dict config_summary, convert to string
+        """Return a compact, human-readable training report.
+
+        Layout (one block, ~10 metric lines + a fused-operator table):
+
+            Training Report — <config>
+            ==========================
+            Step:     1097.8 ms  (per-stage 32.9 ms)
+            Util:     MFU 15.83%   HFU 15.83%
+            FLOPs:    Total 5.31T  =  Fwd 2.36T + Bwd 2.96T
+            Memory:   8.08 GB/GPU  (W 0.83 + G 0.83 + Opt 4.98 + Act 1.45)
+            Pipeline: 1+32+1 microbatches, bubble 3.0%
+            Params:   6.63 B
+
+            Fused operators (top 12 by count):
+              op_type                  count    module_class           dtype     ΣFLOPs    sample names
+              rms_norm                    30    RMSNorm                bf16      ...       attn_norm, q_norm, kv_norm
+              ...
+        """
         config_str = self.config_summary
         if isinstance(self.config_summary, dict):
             config_str = ", ".join(f"{k}={v}" for k, v in self.config_summary.items())
 
-        def _fmt_util(x: float) -> str:
-            # Avoid round-down-to-zero on uncalibrated / very-low utilisation:
-            # show full precision below 0.1%, percentage otherwise.
+        def _util(x: float) -> str:
             if x >= 1e-3:
                 return f"{x:.2%}"
             if x > 0:
-                return f"{x:.4%}  ({x*1e6:.1f} ppm)"
+                return f"{x:.4%} ({x*1e6:.1f}ppm)"
             return "0.00%"
 
-        lines = [
-            "Training Estimation Report",
-            "=" * 40,
-            f"Config: {config_str}",
-            "",
-            "Timing:",
-            f"  Step time: {self.step_time_ms:.2f} ms",
-            f"  Per-stage: {self.per_stage_ms:.2f} ms" if self.per_stage_ms > 0 else "",
-            "",
-            "Efficiency:",
-            f"  MFU: {_fmt_util(self.mfu)}",
-            f"  HFU: {_fmt_util(self.hfu)}",
-            "",
-            "FLOPs:",
-        ]
+        def _fmt_t(flops: float) -> str:
+            """Format FLOPs as G / T scale, no decimal noise."""
+            if flops >= 1e12:
+                return f"{flops/1e12:.2f}T"
+            if flops >= 1e9:
+                return f"{flops/1e9:.2f}G"
+            if flops >= 1e6:
+                return f"{flops/1e6:.2f}M"
+            if flops > 0:
+                return f"{flops/1e3:.2f}K"
+            return "—"
 
-        if self.training_flops > 0:
-            lines.append(f"  Training: {self.training_flops/1e12:.2f} TFLOPs")
-        if self.forward_flops > 0:
-            lines.append(f"  Forward: {self.forward_flops/1e12:.2f} TFLOPs")
-        if self.backward_flops > 0:
-            lines.append(f"  Backward: {self.backward_flops/1e12:.2f} TFLOPs")
+        title = f"Training Report — {config_str}"
+        lines: list[str] = [title, "=" * len(title)]
 
-        lines.extend([
-            "",
-            "Memory (per GPU):",
-        ])
+        # ── Step ──
+        if self.per_stage_ms > 0:
+            lines.append(f"Step:     {self.step_time_ms:.1f} ms  (per-stage {self.per_stage_ms:.1f} ms)")
+        else:
+            lines.append(f"Step:     {self.step_time_ms:.1f} ms")
 
+        # ── Util ──
+        lines.append(f"Util:     MFU {_util(self.mfu)}   HFU {_util(self.hfu)}")
+
+        # ── FLOPs ──
+        if self.training_flops > 0 or self.total_flops > 0:
+            tot = self.training_flops or self.total_flops
+            parts = []
+            if self.forward_flops > 0:
+                parts.append(f"Fwd {_fmt_t(self.forward_flops)}")
+            if self.backward_flops > 0:
+                parts.append(f"Bwd {_fmt_t(self.backward_flops)}")
+            decomposition = "  =  " + " + ".join(parts) if parts else ""
+            lines.append(f"FLOPs:    Total {_fmt_t(tot)}{decomposition}")
+
+        # ── Memory ──
         if self.memory:
-            for k, v in self.memory.to_gb().items():
-                lines.append(f"  {k}: {v:.2f} GB")
+            mem_dict = self.memory.to_gb()
         elif self.memory_breakdown:
-            for k, v in self.memory_breakdown.items():
-                lines.append(f"  {k}: {v/1e9:.2f} GB")
+            mem_dict = {k: v / 1e9 for k, v in self.memory_breakdown.items()}
+        else:
+            mem_dict = {}
+        if mem_dict:
+            total = mem_dict.get("total")
+            if total is None:
+                total = sum(v for k, v in mem_dict.items() if k != "total")
+            parts = []
+            for key, label in [("weights", "W"), ("grads", "G"), ("opt_state", "Opt"),
+                               ("activations", "Act"), ("comm_buffers", "Comm")]:
+                v = mem_dict.get(key)
+                if v is not None and v > 0:
+                    parts.append(f"{label} {v:.2f}")
+            tail = f"  ({' + '.join(parts)})" if parts else ""
+            lines.append(f"Memory:   {total:.2f} GB/GPU{tail}")
 
-        lines.extend([
-            "",
-            "Pipeline:",
-            f"  Warmup steps: {self.warmup_steps}" if self.warmup_steps > 0 else "",
-            f"  Steady steps: {self.steady_steps}" if self.steady_steps > 0 else "",
-            f"  Cooldown steps: {self.cooldown_steps}" if self.cooldown_steps > 0 else "",
-            f"  Bubble fraction: {self.bubble_fraction:.1%}",
-            "",
-            f"Total params: {self.total_params/1e9:.2f}B" if self.total_params > 0 else "",
-        ])
+        # ── Pipeline ──
+        if self.warmup_steps > 0 or self.steady_steps > 0 or self.cooldown_steps > 0:
+            lines.append(
+                f"Pipeline: {self.warmup_steps}+{self.steady_steps}+{self.cooldown_steps} "
+                f"microbatches, bubble {self.bubble_fraction:.1%}"
+            )
+        elif self.bubble_fraction > 0:
+            lines.append(f"Pipeline: bubble {self.bubble_fraction:.1%}")
 
-        # Filter out empty lines
-        return "\n".join(line for line in lines if line)
+        # ── Params ──
+        if self.total_params > 0:
+            if self.total_params >= 1e9:
+                lines.append(f"Params:   {self.total_params/1e9:.2f} B")
+            else:
+                lines.append(f"Params:   {self.total_params/1e6:.2f} M")
+
+        # ── Warnings (Stack A) ──
+        if self.warnings:
+            lines.append("")
+            lines.append("Warnings:")
+            for w in self.warnings:
+                lines.append(f"  - {w}")
+
+        # ── Fused operators (graph-native runs only) ──
+        if self.fused_ops_summary:
+            lines.append("")
+            lines.append(f"Fused operators (top {min(12, len(self.fused_ops_summary))} by count):")
+            header = f"  {'op_type':<24} {'count':>5}  {'module_class':<22} {'dtype':<6} {'ΣFLOPs':>9}  sample names"
+            lines.append(header)
+            sorted_ops = sorted(
+                self.fused_ops_summary.items(),
+                key=lambda kv: kv[1].get("count", 0),
+                reverse=True,
+            )
+            for op_type, info in sorted_ops[:12]:
+                count = info.get("count", 0)
+                mc = info.get("module_class", "") or "—"
+                dtype = info.get("dtype", "") or "—"
+                total_flops = info.get("total_flops", 0) or 0
+                samples = info.get("sample_names", []) or []
+                samples_str = ", ".join(samples[:3])
+                if len(samples) > 3:
+                    samples_str += f", … (+{len(samples)-3})"
+                lines.append(
+                    f"  {op_type:<24} {count:>5}  {mc:<22} {dtype:<6} "
+                    f"{_fmt_t(total_flops):>9}  {samples_str}"
+                )
+
+        return "\n".join(lines)

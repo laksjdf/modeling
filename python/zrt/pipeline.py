@@ -18,7 +18,15 @@ Public API::
         seq_len=128,
     )
 
-    # Training: trace forward + backward (gradient ops included)
+    # Training: trace forward + backward (gradient ops included).
+    # result.graphs["train_forward"] and result.graphs["train_backward"] hold
+    # the captured raw OpGraph for each phase.
+    # result.graphs["train"] holds the stitched fwd+bwd OpGraph — the two
+    # phases merged into one connected graph, with cross-phase edges and
+    # annotations["phase"] ∈ {"fwd", "bwd"}.
+    # Module-boundary fusion is now applied later by the transform pipeline
+    # (FusionPass — bucket → rule-fuse | structural-collapse), so no
+    # separate fused graph is returned here.
     output_dir, phase_records = run_trace_phases(
         model_id="deepseek-ai/DeepSeek-V3-0324",
         num_layers=4,
@@ -26,6 +34,10 @@ Public API::
         seq_len=128,
         phases=("train_forward", "train_backward"),
     )
+    result = run_trace_phases(...)
+    train_graph = result.graphs["train"]            # OpGraph (stitched)
+    fwd_graph   = result.graphs["train_forward"]    # OpGraph
+    bwd_graph   = result.graphs["train_backward"]   # OpGraph
 
     # Single phase
     output_dir, records = run_trace(
@@ -52,11 +64,7 @@ from python.zrt.graph.dispatch import RecordingDispatch, TensorTracker
 from python.zrt.graph.graph_builder import build_op_graph, build_fused_op_graph
 from python.zrt.graph.model_loader import load_model
 from python.zrt.graph.tracker import ModuleTracker, NullModuleTracker
-from python.zrt.ir.adapter import (
-    records_to_opgraph,
-    fused_records_to_opgraph,
-    stitch_fwd_bwd,
-)
+from python.zrt.ir.adapter import records_to_opgraph, stitch_fwd_bwd
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
@@ -74,13 +82,15 @@ class TracePhaseResult(tuple):
 
     Attributes
     ----------
-    graphs : Dict[str, Tuple[OpGraph, OpGraph]]
-        Maps each phase name to ``(raw_opgraph, fused_opgraph)``.
+    graphs : Dict[str, OpGraph]
+        Maps each phase name to the raw captured ``OpGraph``.  Module-level
+        fusion is applied later by the transform pipeline, so only the raw
+        graph is stored here.
     """
 
     def __new__(cls, output_dir: Path, phase_records: Dict, phase_graphs: Dict):
         instance = super().__new__(cls, (output_dir, phase_records))
-        instance.graphs: Dict[str, Tuple[Any, Any]] = phase_graphs
+        instance.graphs: Dict[str, Any] = phase_graphs
         return instance
 
     @property
@@ -100,14 +110,14 @@ class TraceResult(tuple):
 
     Attributes
     ----------
-    graphs : Tuple[OpGraph, OpGraph] | None
-        ``(raw_opgraph, fused_opgraph)`` for the traced phase, or
+    graphs : OpGraph | None
+        The raw captured ``OpGraph`` for the traced phase, or
         ``None`` if graph building was skipped.
     """
 
     def __new__(cls, output_dir: Path, records: List, graphs):
         instance = super().__new__(cls, (output_dir, records))
-        instance.graphs = graphs  # Tuple[OpGraph, OpGraph] | None
+        instance.graphs = graphs  # OpGraph | None
         return instance
 
     @property
@@ -601,77 +611,6 @@ def _trace_compile_phase(
     return all_records, NullModuleTracker()
 
 
-def _save_phase_outputs(
-    records: List[Dict[str, Any]],
-    tracker: "ModuleTracker",
-    phase: str,
-    slug: str,
-    output_dir: Path,
-    config_summary: Dict[str, Any],
-    platform: str = "generic",
-    fusion_debug: bool = False,
-) -> Tuple[Any, Any]:
-    """Write Excel + JSON + ONNX graph files for one phase.
-
-    Returns
-    -------
-    (raw_opgraph, fused_opgraph)
-        Both are :class:`~python.zrt.ir.graph.OpGraph` instances built
-        from the raw and fused records respectively.
-    """
-    from python.zrt.transform.fusion import fuse_records
-
-    excel_path = output_dir / f"{slug}_{phase}_ops.xlsx"
-    from python.zrt.report.excel_writer import ExcelWriter
-    writer = ExcelWriter(tracker, platform=platform)
-    writer.write(records, excel_path, config_summary)
-    logger.info("Excel saved to %s", excel_path)
-
-    # Build OpGraph IR (primary representation)
-    graph_name = f"{slug}_{phase}"
-    raw_opgraph = records_to_opgraph(records, name=graph_name, phase=phase)
-
-    # Limit leaf fusion for backward graphs where module_path attribution
-    # is unreliable (forward hooks don't fire during backward()).
-    _is_bwd = phase in ("train_backward", "backward")
-    _max_leaf = 15 if _is_bwd else 0  # 0 = unlimited for forward
-    fused_with_children = fuse_records(
-        records, tracker,
-        platform=platform,
-        max_leaf_ops=_max_leaf,
-        keep_children=True,
-        debug=fusion_debug,
-    )
-    fused_opgraph = fused_records_to_opgraph(
-        fused_with_children, name=f"{graph_name}_fused", phase=phase
-    )
-
-    # Build NX graphs for export (existing exporter expects nx.DiGraph)
-    raw_nx = build_op_graph(records)
-    fused_nx = build_fused_op_graph(fused_with_children, records)
-
-    from python.zrt.report.onnx_exporter import export_all
-    graph_paths = export_all(
-        raw_graph=raw_nx,
-        fused_graph=fused_nx,
-        raw_records=records,
-        fused_records=fused_with_children,
-        output_dir=output_dir,
-        model_name=slug,
-        phase=phase,
-    )
-    for artifact, path in graph_paths.items():
-        logger.info("  %s: %s", artifact, path)
-
-    # DOT export for the fused OpGraph
-    from python.zrt.report.dot_exporter import export_dot, render_dot
-    dot_path = export_dot(fused_opgraph, output_dir / f"{slug}_{phase}_fused_graph.dot")
-    render_dot(dot_path)  # no-op when graphviz absent
-    logger.info("  fused_dot: %s", dot_path)
-
-    return raw_opgraph, fused_opgraph
-
-
 def _save_stitched_graph(
     stitched_graph: Any,
     slug: str,
@@ -690,6 +629,7 @@ def _save_stitched_graph(
     logger.info("Stitched fwd+bwd graph saved to %s", json_path)
 
 
+
 # ── Public API ─────────────────────────────────────────────────────────────────
 
 def run_trace_phases(
@@ -704,7 +644,6 @@ def run_trace_phases(
     platform: str = "generic",
     graph_mode: bool = False,
     gradient_checkpointing: bool = False,
-    fusion_debug: bool = False,
 ) -> Tuple[Path, Dict[str, List[Dict[str, Any]]]]:
     """Load *model_id* once, trace each requested phase, write separate files.
 
@@ -765,9 +704,9 @@ def run_trace_phases(
         A tuple ``(output_dir, {phase: records})``.  New code should use the
         ``.graphs`` attribute:
 
-        * ``result.graphs["train_forward"]``  → ``(raw_opgraph, fused_opgraph)``
-        * ``result.graphs["train_backward"]`` → ``(raw_opgraph, fused_opgraph)``
-        * ``result.graphs["train"]``          → ``(stitched_raw, stitched_fused)``
+        * ``result.graphs["train_forward"]``  → raw ``OpGraph``
+        * ``result.graphs["train_backward"]`` → raw ``OpGraph``
+        * ``result.graphs["train"]``          → stitched ``OpGraph``
           — present only when **both** ``train_forward`` and ``train_backward``
           were requested.  The stitched graph has ``phase="train"``; every node
           carries ``annotations["phase"] ∈ {"fwd", "bwd"}`` and cross-phase
@@ -776,14 +715,9 @@ def run_trace_phases(
     Output files (per phase)
     ------------------------
     ``<slug>_prefill_ops.xlsx``            — op table, Excel
-    ``<slug>_prefill_raw_graph.json``      — raw aten graph, JSON
-    ``<slug>_prefill_raw_graph.onnx``      — raw aten graph, ONNX (Netron-ready)
-    ``<slug>_prefill_fused_graph.*``       — fused graph
-    ``<slug>_decode_ops.xlsx``             — same set for decode
+    ``<slug>_decode_ops.xlsx``             — same for decode
     ``<slug>_train_forward_ops.xlsx``      — training forward op table
     ``<slug>_train_backward_ops.xlsx``     — training backward op table
-    ``<slug>_train_stitched_graph.json``   — unified fwd+bwd graph (only when
-                                             both training phases are requested)
     …
     """
     from python.zrt.graph.model_loader import _load_config
@@ -827,13 +761,8 @@ def run_trace_phases(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    config_summary = build_config_summary(
-        model_id, config, effective_num_layers, batch_size, seq_len,
-        target_layers=target_layers,
-    )
-
     all_records: Dict[str, List[Dict[str, Any]]] = {}
-    all_graphs: Dict[str, Tuple[Any, Any]] = {}
+    all_graphs: Dict[str, Any] = {}
     past_key_values: Any = None
     canonical_phases = [_PHASE_ALIASES.get(p, p) for p in phases]
 
@@ -875,16 +804,10 @@ def run_trace_phases(
                             "decode pass will run without KV cache "
                             "(attention shapes may differ from a real decode step)")
 
-            raw_opgraph, fused_opgraph = _save_phase_outputs(
-                records, tracker, phase, slug, output_dir, config_summary,
-                platform=platform, fusion_debug=fusion_debug)
-            # Expose compress_ratios from V4 config for SparseAttnSharedKVPass
-            cr = getattr(config, "compress_ratios", None)
-            if cr:
-                raw_opgraph.metadata["compress_ratios"] = list(cr)
-                fused_opgraph.metadata["compress_ratios"] = list(cr)
+            raw_opgraph = records_to_opgraph(
+                records, name=f"{slug}_{phase}", phase=phase)
             all_records[phase] = records
-            all_graphs[phase] = (raw_opgraph, fused_opgraph)
+            all_graphs[phase] = raw_opgraph
 
     finally:
         fake_mode.__exit__(None, None, None)
@@ -894,15 +817,13 @@ def run_trace_phases(
     # captured in the same call.  The shared TensorTracker (built above) gives
     # stitch_fwd_bwd exact tensor-ID matching across phases.
     if "train_forward" in all_graphs and "train_backward" in all_graphs:
-        fwd_raw,   fwd_fused   = all_graphs["train_forward"]
-        bwd_raw,   bwd_fused   = all_graphs["train_backward"]
-        stitched_raw   = stitch_fwd_bwd(fwd_raw,   bwd_raw,   name=f"{slug}_train_raw")
-        stitched_fused = stitch_fwd_bwd(fwd_fused, bwd_fused, name=f"{slug}_train_fused")
-        all_graphs["train"] = (stitched_raw, stitched_fused)
-        _save_stitched_graph(stitched_fused, slug, output_dir)
+        fwd_raw = all_graphs["train_forward"]
+        bwd_raw = all_graphs["train_backward"]
+        stitched_raw = stitch_fwd_bwd(fwd_raw, bwd_raw, name=f"{slug}_train_raw")
+        all_graphs["train"] = stitched_raw
         logger.info(
             "Stitched training graph: %d fwd + %d bwd = %d total nodes",
-            len(fwd_fused), len(bwd_fused), len(stitched_fused),
+            len(fwd_raw), len(bwd_raw), len(stitched_raw),
         )
 
     logger.info("All outputs saved to %s", output_dir)

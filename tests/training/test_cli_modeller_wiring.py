@@ -63,8 +63,8 @@ def test_train_hw_cli_delegates_to_graph_native_modeller(monkeypatch, capsys):
     bwd_graph = object()
     result = SimpleNamespace(
         graphs={
-            "train_forward": (fwd_graph, None),
-            "train_backward": (bwd_graph, None),
+            "train_forward": fwd_graph,
+            "train_backward": bwd_graph,
         },
         output_dir=None,
     )

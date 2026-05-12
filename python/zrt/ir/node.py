@@ -104,10 +104,17 @@ class OpNode:
     num_sub_ops:  int = 0
     fusion_level: str = ""  # "leaf" | "parent"
 
+    # ── variable name + IO provenance (filled by fusion v2) ──
+    name:         str = ""              # e.g. "wo_a" — leaf_attr from dispatch
+    provenance:   tuple = ()            # tuple[FusedIOPort, ...] — IO trace
+
     # ── call-site provenance ──
     src_file: str = ""
     src_line: int = 0
     src_code: str = ""
+
+    # ── module forward-call instance (used by fusion bucketing) ──
+    call_id: int = 0
 
     # ── convenience ──────────────────────────────────────────────────────────
 

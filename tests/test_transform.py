@@ -8,9 +8,9 @@ import python.zrt.hardware.registry as hw_registry
 from python.zrt.transform import (
     ParallelConfig, StreamConfig, QuantConfig, TransformContext,
     TensorParallelPass, ExpertParallelPass, CommInserterPass,
-    FlopsPass, RooflinePass, StreamAssignPass,
     build_default_pipeline,
 )
+from python.zrt.transform.analysis.passes import FlopsPass, RooflinePass, StreamAssignPass
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────

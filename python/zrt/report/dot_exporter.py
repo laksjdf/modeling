@@ -122,17 +122,36 @@ def export_dot(
     return output_path
 
 
+_RENDER_DOT_TIMEOUT_SECONDS = 30
+"""Hard wall-clock cap on a single ``dot`` invocation.
+
+Graphviz's layout (especially with ``splines=ortho``) is super-linear in
+node count and can run for hours on a 2k-node graph.  Production
+pipelines call ``render_dot`` on stitched fwd+bwd graphs without ever
+inspecting the SVG, so we'd rather skip the render than hang.  The cap
+is large enough that real diagnostic graphs (≤ a few hundred nodes)
+still render successfully on a typical laptop.
+"""
+
+
 def render_dot(dot_path: Path, format: str = "svg") -> Path | None:
     """Render a ``.dot`` file to SVG/PDF via the ``dot`` CLI.
 
-    Returns ``None`` silently when Graphviz is not installed.
+    Returns ``None`` silently when Graphviz is not installed, when the
+    rendering exceeds :data:`_RENDER_DOT_TIMEOUT_SECONDS`, or when ``dot``
+    exits non-zero.  These failure modes are non-fatal — the caller
+    treats the .dot file as the canonical artefact.
     """
     if not shutil.which("dot"):
         return None
     out = dot_path.with_suffix(f".{format}")
-    subprocess.run(
-        ["dot", f"-T{format}", str(dot_path), "-o", str(out)],
-        check=True,
-        capture_output=True,
-    )
+    try:
+        subprocess.run(
+            ["dot", f"-T{format}", str(dot_path), "-o", str(out)],
+            check=True,
+            capture_output=True,
+            timeout=_RENDER_DOT_TIMEOUT_SECONDS,
+        )
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+        return None
     return out

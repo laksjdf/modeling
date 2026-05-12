@@ -147,6 +147,47 @@ def build_fused_op_graph(fused_records: List[Dict[str, Any]],
     return G
 
 
+def build_fused_nx_from_opgraph(fused_opgraph) -> nx.DiGraph:
+    """Build a NetworkX DiGraph from a fused OpGraph IR.
+
+    Replaces ``build_fused_op_graph`` for the new pipeline that works
+    directly with OpGraph instead of fused record dicts.
+    """
+    G = nx.DiGraph()
+
+    for node in fused_opgraph.topo_sort():
+        G.add_node(node.id, **{
+            "op_type": node.op_type,
+            "aten_ops": " → ".join(node.fused_from) if node.fused_from else node.op_type,
+            "module_path": node.scope,
+            "module_class": node.module_class,
+            "layer": node.layer,
+            "fusion_level": node.fusion_level,
+            "num_sub_ops": node.num_sub_ops,
+            "input_shapes": ", ".join(str(list(t.shape)) for t in node.inputs),
+            "input_dtypes": ", ".join(str(t.dtype) for t in node.inputs),
+            "output_shapes": ", ".join(str(list(t.shape)) for t in node.outputs),
+            "output_dtypes": ", ".join(str(t.dtype) for t in node.outputs),
+            "label": node.op_type,
+        })
+
+    for edge in fused_opgraph.edges:
+        if edge.src in G.nodes and edge.dst in G.nodes:
+            if G.has_edge(edge.src, edge.dst):
+                existing = G.edges[edge.src, edge.dst]
+                existing["label"] = f"{int(existing.get('label', '0').split()[0]) + 1} tensors" if existing.get("label") else "2 tensors"
+            else:
+                G.add_edge(edge.src, edge.dst,
+                           tensor_ids=[edge.tensor_id] if edge.tensor_id is not None else [],
+                           label="",
+                           dtype=str(edge.tensor.dtype) if edge.tensor else "",
+                           shape=str(list(edge.tensor.shape)) if edge.tensor else "")
+
+    logger.info("Built fused NX graph from OpGraph: %d nodes, %d edges",
+                G.number_of_nodes(), G.number_of_edges())
+    return G
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _node_attrs(rec: Dict[str, Any]) -> Dict[str, Any]:
@@ -169,8 +210,10 @@ def _node_attrs(rec: Dict[str, Any]) -> Dict[str, Any]:
 
 def _fused_node_attrs(frec: Dict[str, Any]) -> Dict[str, Any]:
     """Extract node attributes from a fused op record."""
+    op_type = frec.get("op_type", frec.get("fused_op", ""))
     return {
-        "op_type": frec.get("fused_op", ""),
+        "op_type": op_type,
+        "op_name": frec.get("op_name", ""),
         "aten_ops": frec.get("aten_ops", ""),
         "module_path": frec.get("module_path", ""),
         "module_class": frec.get("module_class", ""),
@@ -181,7 +224,7 @@ def _fused_node_attrs(frec: Dict[str, Any]) -> Dict[str, Any]:
         "input_dtypes": frec.get("fused_input_dtypes", frec.get("input_dtypes", "")),
         "output_shapes": frec.get("fused_output_shapes", frec.get("output_shapes", "")),
         "output_dtypes": frec.get("fused_output_dtypes", frec.get("output_dtypes", "")),
-        "label": frec.get("fused_op", ""),
+        "label": op_type,
     }
 
 

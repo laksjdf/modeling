@@ -1,0 +1,214 @@
+# Common (model-agnostic) fusion rules.  Loaded BEFORE any model-specific YAML.
+# Step-4: replaces the old Python ``registry/builtins.py`` registration path.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. RMSNorm — full 6-op decomposition (with learned weight mul)
+#    Matches both Llama-style custom RMSNorm classes and ``nn.RMSNorm``
+#    (the latter uses ``add_.Scalar`` for the eps).
+#    Pattern rules drop the class gate (Step-2) — target_class is a hint.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: rms_norm
+  op_type: rms_norm
+  description: "Llama / Qwen / Mistral / DeepSeek RMSNorm 6-op decomposition"
+  default_phases: [inference, training]
+  priority: 50
+  target_class: "*"
+  match:
+    kind: ordered_regex
+    op_regexes:
+      - 'aten\.(pow\.Tensor_Scalar|square\.default)'
+      - 'aten\.mean\.dim'
+      - 'aten\.(add|add_)\.(Tensor|Scalar)'
+      - 'aten\.rsqrt\.default'
+      - 'aten\.mul\.Tensor'
+      - 'aten\.mul\.Tensor'
+    min_ops: 6
+    max_ops: 16
+  # Final ``self.weight * x`` dispatches to ``aten.mul.Tensor(weight, x)``:
+  # weight at slot 0, activation at slot 1.  HF Llama / DSV4 share this order.
+  io_roles:
+    - {role: activation, source_kind: input,  source_op_index: 0,  source_arg_index: 0,  shape_role: "[B,S,H]"}
+    - {role: weight,     source_kind: input,  source_op_index: -1, source_arg_index: 0,  shape_role: "[H]"}
+    - {role: output,     source_kind: output, source_op_index: -1, source_arg_index: -1, shape_role: "[B,S,H]"}
+  shape_derivation:
+    batch_size: "activation.shape[0]"
+    seq_len:    "activation.shape[1]"
+    hidden_in:  "activation.shape[-1]"
+    hidden_out: "output.shape[-1]"
+  flops_formula:  "6 * batch_size * seq_len * hidden_in"
+  memory_formula: "activation.bytes + weight.bytes + output.bytes"
+  annotations:
+    layer_norm_kind: rms
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. nn.RMSNorm — same 6-op pattern but kept as a separate name for parity
+#    with the legacy Python registration.  After Step-2 dropped the class
+#    gate for ordered_regex rules, this is functionally equivalent to
+#    ``rms_norm`` above; preserved so registry composition is stable.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: rms_norm_nn
+  op_type: rms_norm
+  description: "torch.nn.RMSNorm built-in 6-op decomposition"
+  default_phases: [inference, training]
+  priority: 50
+  target_class: "*"
+  match:
+    kind: ordered_regex
+    op_regexes:
+      - 'aten\.(pow\.Tensor_Scalar|square\.default)'
+      - 'aten\.mean\.dim'
+      - 'aten\.(add|add_)\.(Tensor|Scalar)'
+      - 'aten\.rsqrt\.default'
+      - 'aten\.mul\.Tensor'
+      - 'aten\.mul\.Tensor'
+    min_ops: 6
+    max_ops: 16
+  # Final ``weight * x`` dispatches to ``aten.mul.Tensor(weight, x)``:
+  # weight at slot 0, activation at slot 1.
+  io_roles:
+    - {role: activation, source_kind: input,  source_op_index: 0,  source_arg_index: 0,  shape_role: "[B,S,H]"}
+    - {role: weight,     source_kind: input,  source_op_index: -1, source_arg_index: 0,  shape_role: "[H]"}
+    - {role: output,     source_kind: output, source_op_index: -1, source_arg_index: -1, shape_role: "[B,S,H]"}
+  shape_derivation:
+    batch_size: "activation.shape[0]"
+    seq_len:    "activation.shape[1]"
+    hidden_in:  "activation.shape[-1]"
+    hidden_out: "output.shape[-1]"
+  flops_formula:  "6 * batch_size * seq_len * hidden_in"
+  memory_formula: "activation.bytes + weight.bytes + output.bytes"
+  annotations:
+    layer_norm_kind: rms
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. RMSNorm inline (5-op fragment, no learned weight mul)
+#    e.g. ``q *= torch.rsqrt(q.square().mean(-1, keepdim=True) + eps)``
+# ─────────────────────────────────────────────────────────────────────────────
+- name: rms_norm_inline
+  op_type: rms_norm_inline
+  description: "Inline RMSNorm fragment (no learned weight mul) - pow|square -> mean -> add -> rsqrt -> mul"
+  default_phases: [inference, training]
+  priority: 50
+  target_class: "*"
+  match:
+    kind: ordered_regex
+    op_regexes:
+      - 'aten\.(pow\.Tensor_Scalar|square\.default)'
+      - 'aten\.mean\.dim'
+      - 'aten\.(add|add_)\.(Tensor|Scalar)'
+      - 'aten\.rsqrt\.default'
+      - 'aten\.mul\.Tensor'
+    min_ops: 5
+    max_ops: 5
+  io_roles:
+    - {role: activation, source_kind: input,  source_op_index: 0,  source_arg_index: 0,  shape_role: "[B,S,N,D]"}
+    - {role: output,     source_kind: output, source_op_index: -1, source_arg_index: -1, shape_role: "[B,S,N,D]"}
+  shape_derivation:
+    batch_size: "activation.shape[0]"
+    seq_len:    "activation.shape[1]"
+    hidden_in:  "activation.shape[-1]"
+    hidden_out: "output.shape[-1]"
+  flops_formula:  "5 * activation.numel"
+  memory_formula: "activation.bytes + output.bytes"
+  annotations:
+    layer_norm_kind: rms
+    has_weight: false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. RMS coefficient (4-op, no mul x): pow -> mean -> add -> rsqrt
+#    Used by Block.hc_pre_attn pre-norm; combined into hc_pre via multi-pass.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: rms_coef
+  op_type: rms_coef
+  description: "RMS normalize coefficient (no mul x): pow|square -> mean -> add -> rsqrt"
+  default_phases: [inference, training]
+  priority: 50
+  target_class: "*"
+  match:
+    kind: ordered_regex
+    op_regexes:
+      - 'aten\.(pow\.Tensor_Scalar|square\.default)'
+      - 'aten\.mean\.dim'
+      - 'aten\.(add|add_)\.(Tensor|Scalar)'
+      - 'aten\.rsqrt\.default'
+    min_ops: 4
+    max_ops: 4
+  io_roles:
+    - {role: activation, source_kind: input,  source_op_index: 0,  source_arg_index: 0,  shape_role: "[B,S,H]"}
+    - {role: output,     source_kind: output, source_op_index: -1, source_arg_index: -1, shape_role: "[B,S,1]"}
+  shape_derivation:
+    batch_size: "activation.shape[0]"
+    seq_len:    "activation.shape[1]"
+    hidden_in:  "activation.shape[-1]"
+  flops_formula:  "4 * activation.numel"
+  memory_formula: "activation.bytes + output.bytes"
+  annotations:
+    layer_norm_kind: rms_coef
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. CrossEntropy — log_softmax + nll_loss (class_only — keeps class gate)
+# ─────────────────────────────────────────────────────────────────────────────
+- name: cross_entropy
+  op_type: cross_entropy
+  description: "log_softmax + nll_loss fused into a single CrossEntropyLoss node"
+  default_phases: [training]
+  priority: 10
+  target_class: "nn.CrossEntropyLoss"
+  match:
+    kind: ordered_regex
+    op_regexes:
+      - 'aten\._log_softmax\.default'
+      - 'aten\.nll_loss_forward\.default'
+    min_ops: 2
+    max_ops: 8
+  io_roles:
+    - {role: logits, source_kind: input,  source_op_index: 0,  source_arg_index: 0,  shape_role: "[B,S,V]"}
+    - {role: output, source_kind: output, source_op_index: -1, source_arg_index: -1, shape_role: "[]"}
+  shape_derivation:
+    batch_size: "logits.shape[0]"
+    seq_len:    "logits.shape[1]"
+    vocab_size: "logits.shape[-1]"
+  flops_formula:  "4 * batch_size * seq_len * vocab_size"
+  memory_formula: "logits.bytes + output.bytes"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. Dropout (training mode) — empty_like + bernoulli_ + div_ + mul
+#    class_only — keeps class gate.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: dropout
+  op_type: dropout
+  description: "empty_like + bernoulli_ + div_ + mul Dropout sequence"
+  default_phases: [training]
+  priority: 10
+  target_class: "nn.Dropout"
+  match:
+    kind: ordered_regex
+    op_regexes:
+      - 'aten\.empty_like\.default'
+      - 'aten\.bernoulli_\.float'
+      - 'aten\.div_\.Scalar'
+      - 'aten\.mul\.Tensor'
+    min_ops: 4
+    max_ops: 8
+  io_roles:
+    - {role: activation, source_kind: input,  source_op_index: 0,  source_arg_index: 0,  shape_role: "[*]"}
+    - {role: output,     source_kind: output, source_op_index: -1, source_arg_index: -1, shape_role: "[*]"}
+  memory_formula: "activation.bytes + output.bytes"
+  annotations:
+    transparent: true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. Add+Norm — virtual rule.  Not a real matcher; ``AddNormCompositor`` runs
+#    only when this rule's name is in the active set.  class_only with a
+#    sentinel target_class so the registry name index has a hook to
+#    enable/disable.
+# ─────────────────────────────────────────────────────────────────────────────
+- name: add_norm
+  op_type: add_norm
+  description: "Post-fusion Add+Norm composer (residual_add + RMSNorm/LayerNorm pair)"
+  default_phases: [inference, training]
+  priority: 0
+  target_class: "__virtual_add_norm__"
+  match:
+    kind: class_only
+    min_ops: 2
+    max_ops: 2

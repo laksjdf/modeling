@@ -43,17 +43,10 @@ def test_train_and_inference_phases_coexist():
     assert len(phase_records["train_forward"]) > 0
 
 
-def test_train_forward_output_files_created(tmp_path):
-    """Excel / JSON / ONNX files are written for training phases."""
-    run_trace_phases(**_COMMON, phases=("train_forward",), output_dir=tmp_path)
-    xlsx_files = list(tmp_path.glob("*train_forward_ops.xlsx"))
-    assert xlsx_files, "Expected train_forward Excel file to be created"
-
-
 # ── End-to-end tests (forward + backward together) ────────────────────────────
 
-def test_train_e2e_both_phases_files_created(tmp_path):
-    """E2E: train_forward + train_backward both produce records and output files."""
+def test_train_e2e_both_phases_records_present(tmp_path):
+    """E2E: train_forward + train_backward both produce non-empty op records."""
     result = run_trace_phases(
         **_COMMON, phases=("train_forward", "train_backward"), output_dir=tmp_path
     )
@@ -61,8 +54,6 @@ def test_train_e2e_both_phases_files_created(tmp_path):
 
     for phase in ("train_forward", "train_backward"):
         assert len(phase_records[phase]) > 0, f"{phase} produced no records"
-        assert list(tmp_path.glob(f"*{phase}_ops.xlsx")), f"Missing xlsx for {phase}"
-        assert list(tmp_path.glob(f"*{phase}_raw_graph.json")), f"Missing raw graph json for {phase}"
 
 
 def test_train_e2e_opgraph_has_nodes(tmp_path):
@@ -71,9 +62,8 @@ def test_train_e2e_opgraph_has_nodes(tmp_path):
         **_COMMON, phases=("train_forward", "train_backward"), output_dir=tmp_path
     )
     for phase in ("train_forward", "train_backward"):
-        raw_g, fused_g = result.graphs[phase]
+        raw_g = result.graphs[phase]
         assert raw_g.num_nodes() > 0, f"{phase} raw OpGraph is empty"
-        assert fused_g.num_nodes() > 0, f"{phase} fused OpGraph is empty"
 
 
 def test_train_backward_has_backward_only_ops():

@@ -1,0 +1,23 @@
+# DeepSeek-V4 default fusion config (auto-loaded for --model-id hf_models/deepseek_v4)
+#
+# Two phase sections — the loader picks the one matching ctx.phase_for_fusion().
+# Within each section: enabled_rules / disabled_rules / allow_structural_collapse / merge_sibling_classes.
+
+training:
+  # kv_compressor / sparse_indexer wrap modules with KV-cache buffer writes;
+  # leave them raw so loss.backward() sees the real autograd chain.
+  # sparse_attention_kernel matches a contiguous bmm→mul→softmax→bmm→bmm
+  # subsequence inside Attention.forward — pure compute, safe to fuse in training.
+  enabled_rules: null
+  disabled_rules:
+    - kv_compressor
+    - sparse_indexer
+  allow_structural_collapse: false
+  merge_sibling_classes: []
+
+inference:
+  # All registered rules whose default_phases includes "inference" fire.
+  enabled_rules: null
+  disabled_rules: []
+  allow_structural_collapse: false
+  merge_sibling_classes: []

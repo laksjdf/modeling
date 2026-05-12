@@ -126,17 +126,74 @@ class TrainingConfig:
 
 
 @dataclass
+class FusionConfig:
+    """User-facing operator-fusion controls.
+
+    Loaded from YAML (default search path or ``--fusion-config``).  Filters
+    which fusion rules fire during a single ``FusionPass`` run.
+
+    enabled_rules
+        ``None`` → use each rule's ``default_phases`` for the active phase.
+        Non-empty set → only rules whose ``name`` is in this set are active.
+    disabled_rules
+        Always subtracted after ``enabled_rules`` resolution.  Useful for
+        starting from defaults and removing a few specific rules.
+    allow_structural_collapse
+        Re-enables the legacy ``op_type = module_class`` fallback for
+        unmatched multi-op buckets.  Off by default — unmatched ops stay
+        as raw aten nodes.
+    merge_sibling_classes
+        Module class names for which ``_merge_parent_groups`` is allowed
+        to fuse runs of identical sibling instances (e.g. ``Expert`` lists
+        in MoE).  Off by default to keep buckets aligned with single
+        forward calls.
+    """
+
+    enabled_rules: set[str] | None = None
+    disabled_rules: set[str] = field(default_factory=set)
+    allow_structural_collapse: bool = False
+    merge_sibling_classes: set[str] = field(default_factory=set)
+
+    @classmethod
+    def merged(cls, base: "FusionConfig | None",
+               override: "FusionConfig | None") -> "FusionConfig":
+        """Layer ``override`` on top of ``base`` (override wins on every field)."""
+        b = base or cls()
+        if override is None:
+            return cls(
+                enabled_rules=set(b.enabled_rules) if b.enabled_rules is not None else None,
+                disabled_rules=set(b.disabled_rules),
+                allow_structural_collapse=b.allow_structural_collapse,
+                merge_sibling_classes=set(b.merge_sibling_classes),
+            )
+        return cls(
+            enabled_rules=(set(override.enabled_rules)
+                           if override.enabled_rules is not None
+                           else (set(b.enabled_rules) if b.enabled_rules is not None else None)),
+            disabled_rules=set(b.disabled_rules) | set(override.disabled_rules),
+            allow_structural_collapse=override.allow_structural_collapse,
+            merge_sibling_classes=set(b.merge_sibling_classes) | set(override.merge_sibling_classes),
+        )
+
+
+@dataclass
 class TransformContext:
     hw_spec:      "HardwareSpec"
     parallel:     ParallelConfig  = field(default_factory=ParallelConfig)
     stream_config: StreamConfig   = field(default_factory=StreamConfig)
     quant:        QuantConfig | None = None
     training:     TrainingConfig | None = None  # Training-specific config
+    fusion:       FusionConfig    = field(default_factory=FusionConfig)
     optim_flags:  set[str]        = field(default_factory=set)
     phase:        str             = "prefill"
     profile:      Any             = None   # ModelProfile (optional)
     stack:        Any             = None   # SoftwareStack (optional)
+    model_id:     str             = ""     # HF model id, used by FusionPass to load platform rules
 
     @property
     def is_training(self) -> bool:
         return self.training is not None
+
+    def phase_for_fusion(self) -> str:
+        """Return ``"training"`` when training, else ``"inference"``."""
+        return "training" if self.is_training else "inference"

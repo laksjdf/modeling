@@ -68,8 +68,7 @@ def main() -> None:
     parser.add_argument(
         "--output",
         metavar="FILE",
-        help="Write result to FILE. For --estimate-config: .xlsx for Excel report (default), "
-             ".json for JSON. For --search-config: writes Pareto frontier JSON.",
+        help="Write result to FILE. For --estimate-config: .xlsx for Excel, .html for interactive graph view, .json for JSON. For --search-config: writes Pareto frontier JSON.",
     )
 
     # ── Model ─────────────────────────────────────────────────────────────────
@@ -175,6 +174,24 @@ def main() -> None:
         help="Weight quantization dtype for analysis: int4, int8, fp8 (default: no quantization)",
     )
 
+    # ── Fusion config ─────────────────────────────────────────────────────────
+    parser.add_argument(
+        "--fusion-config",
+        metavar="YAML",
+        default=None,
+        help="Override fusion rule selection with a YAML file. "
+             "Without this, the loader looks up "
+             "python/zrt/transform/fusion/configs/<model_slug>[_<phase>].yaml "
+             "and falls back to <phase>_default.yaml.",
+    )
+    parser.add_argument(
+        "--list-fusion-rules",
+        action="store_true",
+        default=False,
+        help="Print all registered fusion rule names + descriptions then exit. "
+             "Use this to look up names for --fusion-config YAML files.",
+    )
+
     # ── Hardware (triggers perf report / modelling) ───────────────────────────
     parser.add_argument(
         "--hw",
@@ -224,6 +241,11 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+
+    # ── --list-fusion-rules: print and exit ──────────────────────────────────
+    if args.list_fusion_rules:
+        _list_fusion_rules()
+        return
 
     # ── Three independent modes ───────────────────────────────────────────────
     # 1. Spec-based estimation (--estimate-config)
@@ -413,6 +435,49 @@ def _build_model_profile(model_id: str, args) -> "SimpleNamespace":
     )
 
 
+def _list_fusion_rules() -> None:
+    """Print every registered fusion rule and exit.
+
+    Walks every YAML under ``rules/`` (including ``_common.yaml``) so the
+    printed list is the union across all model packs we ship.
+    """
+    from pathlib import Path
+    from python.zrt.transform.fusion.registry import (
+        all_rules, clear_rules, register_rule,
+    )
+    from python.zrt.transform.fusion.loading.yaml_rule_loader import load_yaml_rules
+
+    clear_rules()
+    rules_dir = Path(__file__).parent / "transform" / "fusion" / "rules"
+    if rules_dir.exists():
+        for yaml_path in sorted(rules_dir.glob("*.yaml")):
+            for rule in load_yaml_rules(yaml_path):
+                try:
+                    register_rule(rule)
+                except ValueError:
+                    pass  # Duplicate name across model packs is OK for listing.
+
+    rules = all_rules()
+    if not rules:
+        print("No fusion rules registered.")
+        return
+    width_name = max(len(r.name) for r in rules)
+    print(f"{'rule name'.ljust(width_name)}  op_type                  default_phases  description")
+    print("-" * 110)
+    for r in sorted(rules, key=lambda x: x.name):
+        phases = ",".join(r.default_phases)
+        op_t = r.op_type or "-"
+        desc = r.description or "(no description)"
+        print(f"{r.name.ljust(width_name)}  {op_t.ljust(24)} {phases.ljust(15)} {desc}")
+
+
+def _resolve_fusion_config(args, model_id: str, phase: str):
+    """Build a FusionConfig for the current run."""
+    from python.zrt.transform.fusion.yaml_loader import resolve_fusion_config
+    explicit = getattr(args, "fusion_config", None)
+    return resolve_fusion_config(model_id, phase, explicit_path=explicit)
+
+
 def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
     """Run the inference transform + simulate + report pipeline."""
     from python.zrt.transform import (
@@ -421,9 +486,9 @@ def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
     )
     from python.zrt.transform.context import QuantConfig
     from python.zrt.report import export_reports
-    from python.zrt.report.excel_writer import append_perf_summary
 
     quant = QuantConfig(weight=args.quant, activation=args.quant) if args.quant else None
+    fusion_cfg = _resolve_fusion_config(args, model_id, phase="inference")
     ctx = TransformContext(
         hw_spec=hw,
         parallel=ParallelConfig(
@@ -431,6 +496,8 @@ def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
         ),
         stream_config=StreamConfig(num_compute_streams=1, num_comm_streams=1),
         quant=quant,
+        fusion=fusion_cfg,
+        model_id=model_id,
     )
     pipe = build_default_pipeline()
 
@@ -457,20 +524,12 @@ def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
             logger.warning("Report export failed: %s", exc)
             continue
 
-        # Print console summary + append Excel
+        # Print console summary
         if flat is not None:
             try:
                 print(f"\n{flat}")
             except UnicodeEncodeError:
                 logger.info("Performance summary: %s", flat)
-
-            xlsx_path = result.output_dir / f"{slug}_{phase}_ops.xlsx"
-            if xlsx_path.exists():
-                try:
-                    append_perf_summary(xlsx_path, flat)
-                    logger.info("Performance summary written to %s", xlsx_path)
-                except Exception as exc:
-                    logger.warning("Excel summary append failed: %s", exc)
 
 
 def _run_training_modelling(args, model_id: str, hw, result) -> None:
@@ -478,14 +537,12 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
     from python.zrt.transform.analysis import estimate_training_from_graphs
     from python.zrt.transform.exporter import export_training_graphs
 
-    fwd_pair = result.graphs.get("train_forward")
-    if not fwd_pair:
+    raw_fwd = result.graphs.get("train_forward")
+    if raw_fwd is None:
         logger.error("--train --hw requires train_forward phase but none was captured.")
         return
 
-    raw_fwd = fwd_pair[0]
-    bwd_pair = result.graphs.get("train_backward")
-    raw_bwd = bwd_pair[0] if bwd_pair else None
+    raw_bwd = result.graphs.get("train_backward")
 
     if raw_bwd is None:
         logger.warning("No train_backward graph captured; backward metrics will use forward-only fallback.")
@@ -512,6 +569,7 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
     except Exception as _exc:
         logger.warning("Could not read MoE config: %s", _exc)
 
+    fusion_cfg = _resolve_fusion_config(args, model_id, phase="training")
     report, ctx, transformed = estimate_training_from_graphs(
         forward_graph=raw_fwd,
         backward_graph=raw_bwd,
@@ -538,6 +596,8 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
         quant=args.quant,
         moe_total_experts=_moe_total,
         moe_active_experts=_moe_active,
+        model_id=model_id,
+        fusion_config=fusion_cfg,
     )
 
     try:
@@ -559,11 +619,15 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
             bwd_for_export = None
 
         if fwd_for_export:
+            fwd_records = result.phase_records.get("train_forward")
+            bwd_records = result.phase_records.get("train_backward")
             export_training_graphs(
                 fwd_graph=fwd_for_export,
                 bwd_graph=bwd_for_export,
                 ctx=ctx,
                 output_dir=output_dir,
+                fwd_records=fwd_records,
+                bwd_records=bwd_records,
             )
             logger.info("Training Excel exported to %s", output_dir / f"{slug}_training.xlsx")
     except Exception as exc:
@@ -621,7 +685,7 @@ def _run_estimate(config_path: str, output_path: str | None, *, breakdown: bool 
     report = estimate(model, system, strategy, graph=graph)
 
     if output_path:
-        # If output ends with .xlsx, write Excel; otherwise JSON
+        # If output ends with .xlsx/.xls → Excel, .html → HTML, otherwise JSON
         if output_path.endswith((".xlsx", ".xls")):
             from python.zrt.training.io.excel_exporter import export_estimate_excel
             export_estimate_excel(
@@ -630,6 +694,14 @@ def _run_estimate(config_path: str, output_path: str | None, *, breakdown: bool 
                 op_costs=op_costs, output_path=output_path,
             )
             print(f"Excel report written to {output_path}")
+        elif output_path.endswith(".html"):
+            from python.zrt.training.io.html_exporter import export_estimate_html
+            export_estimate_html(
+                report=report, graph=graph, model=model,
+                system=system, strategy=strategy,
+                op_costs=op_costs, output_path=output_path,
+            )
+            print(f"HTML report written to {output_path}")
         else:
             report_to_json(report, output_path)
             print(f"Report written to {output_path}")

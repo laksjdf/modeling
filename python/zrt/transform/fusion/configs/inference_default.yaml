@@ -1,0 +1,9 @@
+# Global inference fallback fusion config
+#
+# enabled_rules: null  → take every rule whose default_phases contains
+#                        "inference" minus disabled_rules.
+# Use --list-fusion-rules to see registered rule names.
+enabled_rules: null
+disabled_rules: []
+allow_structural_collapse: false
+merge_sibling_classes: []

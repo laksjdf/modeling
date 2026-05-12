@@ -221,8 +221,25 @@ class PipelineParallelPass(GraphPass):
                 if sv >= 0 and dv >= 0 and sv != dv and ss != ds:
                     crossing_edges.append(edge)
 
-        p2p_idx = 0
+        # Dedupe: emit one send_recv per (src_node, src_stage, dst_stage)
+        # tuple — a producer with N cross-stage consumers needs only ONE
+        # P2P node, with all N consumers rewired through it.  Without this
+        # dedupe a single boundary tensor with many consumers (e.g. shared
+        # embed/head residual) generates a flood of duplicate send_recvs.
+        bucketed: Dict[tuple, List[Edge]] = {}
         for edge in crossing_edges:
+            ss = node_stage.get(edge.src, -1)
+            ds = node_stage.get(edge.dst, -1)
+            sv = node_virtual_stage.get(edge.src, -1)
+            dv = node_virtual_stage.get(edge.dst, -1)
+            key = (edge.src, edge.src_idx, ss, ds, sv, dv)
+            bucketed.setdefault(key, []).append(edge)
+
+        p2p_idx = 0
+        for (src_id, src_idx, ss, ds, sv, dv), edges in bucketed.items():
+            # Use the first edge as the prototype; all share src_node and
+            # src_idx so the carried tensor is identical.
+            edge = edges[0]
             ss = node_stage[edge.src]
             ds = node_stage[edge.dst]
             sv = node_virtual_stage.get(edge.src, -1)
@@ -268,21 +285,22 @@ class PipelineParallelPass(GraphPass):
             if is_vpp and dv >= 0:
                 p2p_node.annotations["virtual_stage_id"] = dv
 
-            # Insert after source node
+            # Insert one comm node after the producer; route every cross-stage
+            # consumer of this producer through it.
             graph.insert_after(edge.src, p2p_node, [Edge(
-                src=edge.src, src_idx=0,
+                src=edge.src, src_idx=src_idx,
                 dst=p2p_id, dst_idx=0,
                 tensor=tensor,
             )])
 
-            # Rewire: remove original crossing edge, add p2p→dst edge
-            if edge in graph.edges:
-                graph.edges.remove(edge)
-            graph.edges.append(Edge(
-                src=p2p_id, src_idx=0,
-                dst=edge.dst, dst_idx=edge.dst_idx,
-                tensor=recv_tensor,
-            ))
+            for ce in edges:
+                if ce in graph.edges:
+                    graph.edges.remove(ce)
+                graph.edges.append(Edge(
+                    src=p2p_id, src_idx=0,
+                    dst=ce.dst, dst_idx=ce.dst_idx,
+                    tensor=recv_tensor,
+                ))
             graph._rebuild_adjacency()
 
     # ── balance check ─────────────────────────────────────────────────────────

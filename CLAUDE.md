@@ -103,7 +103,7 @@ Graph Capture → Transform Pipeline → DAGScheduler → Report Generator
 - `context.py`: `TransformContext`, `ParallelConfig` (TP/EP/PP/DP/SP), `StreamConfig`
 - `pipeline.py`: `build_default_pipeline()` — pluggable pass system
 - `parallel/`: tensor_parallel.py, expert_parallel.py, pipeline_parallel.py, data_parallel.py, context_parallel.py, comm_inserter.py
-- `fusion/`: fusion passes based on software stack rules
+- `fusion/`: MRO-based fusion system (v2) — rules keyed by `type(module).__mro__`, single-pass algorithm, preserves `name` + `provenance`. See `docs/fusion_v2_zh.md` for rule registration guide.
 - `analysis/`: FLOPs, Roofline, communication latency, training modeling (modeller.py, training.py)
 - `optim/`: optimization passes (quant, recomp, EPLB, MTP)
 - `training/`: training-specific graph passes — `RecomputePass` (activation recompute annotation), `OffloadPass`, `OptimizerPass`, `ZeroFSDPPass`

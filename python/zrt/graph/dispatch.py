@@ -147,18 +147,25 @@ class RecordingDispatch(TorchDispatchMode):
 
         module_path = ""
         module_class = ""
+        module_class_obj = None
+        call_id = 0
         if self._module_tracker:
             module_path = self._module_tracker.current_module
             module_class = self._module_tracker.current_module_class
-            # During backward, forward hooks don't fire for autograd-generated
-            # intermediate ops, so module_path stays frozen at the last forward
-            # module (typically mlp.gate).  Clear the path when it's unchanged
-            # from the pre-backward value to avoid misattribution.
+            module_class_obj = self._module_tracker.current_module_class_obj
+            call_id = getattr(self._module_tracker, "current_call_id", 0)
+            # During backward, only wipe the module attribution when no real
+            # backward hook is currently active.  ``_bwd_expected_pop > 0``
+            # means a ``register_full_backward_pre_hook`` fired for a
+            # specific module — its scope is authoritative.  Otherwise the
+            # tracker stack reflects forward residue and should be cleared.
             if getattr(self._module_tracker, '_in_backward_phase', False):
-                stale = getattr(self._module_tracker, '_pre_backward_module', '')
-                if module_path == stale:
+                pending = getattr(self._module_tracker, '_bwd_expected_pop', 0)
+                if pending == 0:
                     module_path = ""
                     module_class = ""
+                    module_class_obj = None
+                    call_id = 0
 
         if self._target_layers is not None:
             layer_str = extract_layer_idx(module_path)
@@ -182,6 +189,8 @@ class RecordingDispatch(TorchDispatchMode):
             "aten_op": func_name,
             "module_path": module_path,
             "module_class": module_class,
+            "module_class_obj": module_class_obj,
+            "leaf_attr": module_path.rsplit(".", 1)[-1] if module_path else "",
             "layer": extract_layer_idx(module_path),
             "component": classify_component(module_path, func_name),
             "src_file": src_file,
@@ -198,6 +207,7 @@ class RecordingDispatch(TorchDispatchMode):
             "_input_ids": input_ids,
             "_output_ids": output_ids,
             "recompute": in_recompute,
+            "call_id": call_id,
         })
 
         return out

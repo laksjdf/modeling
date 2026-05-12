@@ -89,22 +89,41 @@ class OpGraph:
     def topo_sort(self, debug: bool = False) -> list[OpNode]:
         """Return nodes in topological order (Kahn's algorithm).
 
+        Uses a min-heap keyed by insertion index so that when multiple
+        nodes are simultaneously ready, the one that appeared first in
+        capture order is emitted next.  This keeps the output close to
+        the original execution order and makes cross-referencing between
+        the raw and fused Excel sheets intuitive.
+
         Raises RuntimeError if the graph has a cycle.
         """
+        import heapq
+
+        # Build a stable ordering key: insertion index in self.nodes
+        insert_order: dict[str, int] = {
+            nid: idx for idx, nid in enumerate(self.nodes)
+        }
+
+        def _sort_key(nid: str) -> int:
+            return insert_order.get(nid, len(self.nodes))
+
         in_deg: dict[str, int] = {
             nid: len(preds) for nid, preds in self._pred.items()
         }
-        q: deque[str] = deque(
-            nid for nid, deg in in_deg.items() if deg == 0
-        )
+        # Seed the heap with all root nodes
+        heap: list[tuple[int, str]] = [
+            (_sort_key(nid), nid) for nid, deg in in_deg.items() if deg == 0
+        ]
+        heapq.heapify(heap)
+
         result: list[OpNode] = []
-        while q:
-            nid = q.popleft()
+        while heap:
+            _, nid = heapq.heappop(heap)
             result.append(self.nodes[nid])
             for s in self._succ.get(nid, []):
                 in_deg[s] -= 1
                 if in_deg[s] == 0:
-                    q.append(s)
+                    heapq.heappush(heap, (_sort_key(s), s))
         if len(result) != len(self.nodes):
             unreachable = [nid for nid in self.nodes if nid not in {n.id for n in result}]
             if debug:
@@ -164,6 +183,12 @@ class OpGraph:
         External edges that enter ``old_ids`` are rewired to ``new_node``'s
         inputs; edges leaving ``old_ids`` are rewired from ``new_node``'s
         outputs.  Internal edges (both endpoints in ``old_ids``) are dropped.
+
+        The new node is inserted at the *earliest* dict-insertion position
+        of any node in ``old_ids`` so the surviving order in
+        ``self.nodes`` reflects the original execution flow.  Without
+        this, repeated fusions would push every fused node to the end of
+        the dict, scrambling the tie-breaker used by ``topo_sort``.
         """
         # collect external edge endpoints before deletion
         in_edges  = [e for e in self.edges
@@ -171,14 +196,22 @@ class OpGraph:
         out_edges = [e for e in self.edges
                      if e.src in old_ids and e.dst not in old_ids]
 
-        # remove old nodes and their edges
-        for nid in old_ids:
-            self.nodes.pop(nid, None)
+        # find the earliest dict-insertion position of any old_id; insert
+        # the new node at that slot when we rebuild the dict below
+        old_positions = [i for i, nid in enumerate(self.nodes)
+                         if nid in old_ids]
+        insert_pos = min(old_positions) if old_positions else len(self.nodes)
+
+        # rebuild self.nodes preserving order, with new_node at insert_pos
+        surviving = [(nid, n) for nid, n in self.nodes.items()
+                     if nid not in old_ids]
+        surviving.insert(insert_pos, (new_node.id, new_node))
+        self.nodes = dict(surviving)
+
+        # drop internal edges (both endpoints in old_ids) and any edge
+        # that touches an old node — external endpoints are rewired below
         self.edges = [e for e in self.edges
                       if e.src not in old_ids and e.dst not in old_ids]
-
-        # insert new node
-        self.nodes[new_node.id] = new_node
 
         # rewire
         for e in in_edges:

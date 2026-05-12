@@ -1,0 +1,19 @@
+# Global training fallback fusion config
+#
+# Industry practice (Megatron-LM / Transformer Engine): stateful ops
+# (KV cache writers, custom kernels with non-trivial backward, sparse
+# routing) stay decomposed so loss.backward() observes the real grad
+# chain.  Pure-compute / well-bounded ops (RMSNorm, Linear, RoPE,
+# MoE Gate/Expert, Add+Norm) are fused for analysis clarity.
+#
+# Each rule's default_phases already excludes the stateful ones
+# (kv_compressor, sparse_indexer, sparse_attention_kernel were marked
+# inference-only in deepseek_v4.yaml).  Listing them in disabled_rules
+# is redundant but explicit — keeps the intent visible at the call site.
+enabled_rules: null
+disabled_rules:
+  - kv_compressor
+  - sparse_indexer
+  - sparse_attention_kernel
+allow_structural_collapse: false
+merge_sibling_classes: []
