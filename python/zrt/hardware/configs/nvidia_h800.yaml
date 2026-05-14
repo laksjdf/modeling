@@ -11,6 +11,8 @@ compute:
   int4_tops: 3958
   fp8_tops: 3958
 
+  sram_kb_per_sm: 228  # Same SM as H100: 228 KB shared memory/L1 per SM
+
 memory:
   capacity_gb: 80
   hbm_bandwidth_gbps: 3350    # HBM3

@@ -10,6 +10,7 @@ compute:
   int8_tops: 624
   int4_tops: 1248
   fp8_tops: 0       # A100 does not support FP8
+  sram_kb_per_sm: 192
 
 memory:
   capacity_gb: 80

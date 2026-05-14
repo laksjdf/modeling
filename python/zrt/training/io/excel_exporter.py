@@ -200,19 +200,26 @@ def export_estimate_excel(
             return "-"
         return f"{x:.2e}"
 
+    from python.zrt.training.io.html_exporter import _op_detail
+
     op_rows = [
         ["#", "Op Name", "Kind", "Layer", "Layer Kind",
+         "Input Tensors", "Output Tensors",
          "Fwd FLOPs", "Bwd FLOPs", "Total FLOPs",
-         "Bound", "Fwd Bytes", "Bwd Bytes", "Latency (μs)"],
+         "Fwd Formula", "Bwd Formula",
+         "Bound", "Fwd Bytes", "Bwd Bytes",
+         "Fwd Bytes Formula", "Bwd Bytes Formula",
+         "Latency (μs)"],
     ]
     for idx, op in enumerate(graph.ops, 1):
         cost = op_costs.get(op.name)
         if cost is None:
             from zrt.training.models.flops import op_cost as _op_cost
-            cost = _op_cost(op, model)
+            cost = _op_cost(op, model, system)
 
-        fwd_flops = cost.fwd_flops
-        bwd_flops = cost.dx_flops + cost.dw_flops
+        detail = _op_detail(op, cost)
+        fwd_flops = cost.fwd_cube_flops + cost.fwd_vector_flops
+        bwd_flops = cost.dx_cube_flops + cost.dx_vector_flops + cost.dw_cube_flops + cost.dw_vector_flops
         total_flops = fwd_flops + bwd_flops
         layer_k = _LAYER_KIND_MAP.get(op.layer_kind.value, op.layer_kind.value)
 
@@ -230,15 +237,21 @@ def export_estimate_excel(
             op.kind,
             op.layer_id,
             layer_k,
+            detail["inputs"],
+            detail["outputs"],
             _fmt_num(fwd_flops),
             _fmt_num(bwd_flops),
             _fmt_num(total_flops),
+            detail["fwd_formula"],
+            detail["bwd_formula"],
             cost.bound,
             _fmt_num(cost.fwd_bytes),
             _fmt_num(cost.dx_bytes + cost.dw_bytes),
+            detail["fwd_bytes_formula"],
+            detail["bwd_bytes_formula"],
             f"{latency_us:.2f}" if latency_us > 0 else "-",
         ])
-    _write_sheet(ws2, op_rows, col_widths=[5, 35, 18, 6, 12, 18, 18, 18, 10, 16, 16, 14])
+    _write_sheet(ws2, op_rows, col_widths=[5, 35, 18, 6, 12, 35, 35, 18, 18, 18, 60, 50, 10, 16, 16, 50, 50, 14])
 
     # ── Sheet 3: Model ───────────────────────────────────────────────────
     ws3 = wb.create_sheet("Model")

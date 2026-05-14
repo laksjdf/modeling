@@ -770,17 +770,24 @@ class TrainingPipelinePass(GraphPass):
         if latency_sum > 0.0:
             return latency_sum
 
-        bucket_bytes = sum(n.attrs["bucket_bytes"] for n in dp_comm_nodes)
         gpus_per_node = hw.interconnect.intra_node.num_devices
         link = hw.interconnect.inter_node if dp > gpus_per_node else hw.interconnect.intra_node
         dp_bw_bytes_per_us = (
             link.bandwidth_gbps * 1e9 / 8 / 1e6
         )
-        ring_factor = 2.0 * (dp - 1) / dp
-        return (
-            ring_factor * bucket_bytes / dp_bw_bytes_per_us
-            if dp_bw_bytes_per_us > 0 else 0.0
-        )
+        if dp_bw_bytes_per_us <= 0:
+            return 0.0
+
+        total = 0.0
+        for node in dp_comm_nodes:
+            bucket_bytes = node.attrs["bucket_bytes"]
+            collective = node.attrs.get("collective", "all_reduce")
+            if collective in ("reduce_scatter", "all_gather"):
+                ring_factor = (dp - 1) / dp
+            else:
+                ring_factor = 2.0 * (dp - 1) / dp
+            total += ring_factor * bucket_bytes / dp_bw_bytes_per_us
+        return total
 
     @staticmethod
     def _detect_ep_imbalance(g: "OpGraph", ctx: "TransformContext") -> float:

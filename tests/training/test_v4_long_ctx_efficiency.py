@@ -1,15 +1,16 @@
-"""Long-context efficiency tests — verify V4 vs V3.2 ratios match paper figure 1.
+"""Long-context efficiency regression tests for current training specs.
 
-Paper claims (at 1M context):
+The DeepSeek-V4 paper claims inference-time ratios at 1M context:
   V4-Pro  single-token FLOPs / V3.2 ≈ 0.27
   V4-Pro  KV cache size / V3.2       ≈ 0.10
   V4-Flash single-token FLOPs / V3.2 ≈ 0.10
   V4-Flash KV cache size / V3.2      ≈ 0.07
 
-NOTE: Current ratios don't match paper because our model uses training-time
-param counts without V4-specific KV compression (CSA/HCA) that kicks in at
-inference. The test asserts broad bounds to catch regressions; as V4
-compression is modeled more accurately, bounds should tighten toward paper vals.
+This module intentionally does not claim those inference ratios are modeled.
+The current training configs use effective training parameters and a simple
+per-token KV estimate, so the tests pin that implemented behavior tightly.
+When inference CSA/HCA KV compression is modeled, replace these expected
+ratios with paper-aligned invariants.
 """
 
 import pytest
@@ -69,33 +70,31 @@ def v4_flash():
 
 
 class TestV4ProLongCtxEfficiency:
-    """V4-Pro vs V3.2 ratios at long context."""
+    """V4-Pro vs V3.2 ratios under the current training-spec model."""
 
     def test_per_token_flops_ratio(self, v4_pro, v32):
-        """V4-Pro per-token FLOPs / V3.2 ≈ 0.27 (paper fig 1)."""
+        """V4-Pro per-token training FLOPs ratio is pinned to current specs."""
         ratio = _per_token_flops(v4_pro) / _per_token_flops(v32)
-        # V4-Pro has more params but much higher compression
-        assert 0.10 < ratio < 2.0, f"V4-Pro/V3.2 FLOPs ratio = {ratio:.3f}"
+        assert ratio == pytest.approx(1.3450563709363128, rel=1e-6)
 
     def test_kv_cache_ratio(self, v4_pro, v32):
-        """V4-Pro KV cache / V3.2 ≈ 0.10 (paper fig 1)."""
+        """V4-Pro simple KV estimate ratio is pinned to current specs."""
         ratio = _kv_cache_total(v4_pro) / _kv_cache_total(v32)
-        # Both use MLA with same kv_lora_rank; V4 may have different layer count
-        assert 0.05 < ratio < 5.0, f"V4-Pro/V3.2 KV cache ratio = {ratio:.3f}"
+        assert ratio == pytest.approx(2.0327868852459017, rel=1e-6)
 
 
 class TestV4FlashLongCtxEfficiency:
-    """V4-Flash vs V3.2 ratios at long context."""
+    """V4-Flash vs V3.2 ratios under the current training-spec model."""
 
     def test_per_token_flops_ratio(self, v4_flash, v32):
-        """V4-Flash per-token FLOPs / V3.2 ≈ 0.10 (paper fig 1)."""
+        """V4-Flash per-token training FLOPs ratio is pinned to current specs."""
         ratio = _per_token_flops(v4_flash) / _per_token_flops(v32)
-        assert 0.03 < ratio < 1.0, f"V4-Flash/V3.2 FLOPs ratio = {ratio:.3f}"
+        assert ratio == pytest.approx(0.3744235509136079, rel=1e-6)
 
     def test_kv_cache_ratio(self, v4_flash, v32):
-        """V4-Flash KV cache / V3.2 ≈ 0.07 (paper fig 1)."""
+        """V4-Flash simple KV estimate ratio is pinned to current specs."""
         ratio = _kv_cache_total(v4_flash) / _kv_cache_total(v32)
-        assert 0.03 < ratio < 2.0, f"V4-Flash/V3.2 KV cache ratio = {ratio:.3f}"
+        assert ratio == pytest.approx(1.4426229508196722, rel=1e-6)
 
 
 class TestKVCacheBasic:

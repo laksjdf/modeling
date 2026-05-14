@@ -144,6 +144,27 @@ class TestDPZero2:
         for node in dp_nodes:
             assert node.op_type == "comm.reduce_scatter"
 
+    def test_reduce_scatter_has_lower_modeled_time_than_all_reduce(self):
+        graph = _make_backward_graph(num_layers=1)
+        ctx_z0 = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=1, dp=4),
+            training=TrainingConfig(micro_batch=1, global_batch=8, zero_stage=0),
+        )
+        ctx_z2 = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=1, dp=4),
+            training=TrainingConfig(micro_batch=1, global_batch=8, zero_stage=2),
+        )
+
+        ar_graph = DataParallelPass().run(graph, ctx_z0)
+        rs_graph = DataParallelPass().run(graph, ctx_z2)
+
+        ar_time = TrainingPipelinePass._compute_dp_ar_time(ar_graph, _make_hardware_spec(), ctx_z0)
+        rs_time = TrainingPipelinePass._compute_dp_ar_time(rs_graph, _make_hardware_spec(), ctx_z2)
+
+        assert rs_time == pytest.approx(ar_time / 2)
+
 
 class TestDPOverlap:
     """Tests for DP overlap-in-bubble behavior."""

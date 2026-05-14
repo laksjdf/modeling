@@ -1,0 +1,264 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# 取消同一 PR 的前一次运行，节省 CI 分钟数
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONPATH: python
+  PYTHON_VERSION: "3.12"
+  # 覆盖率门禁阈值 — 单点定义，修改后所有作业和 job name 一并更新
+  # 历史欠账还清后建议把 GLOBAL_COVERAGE_THRESHOLD 上调至 80
+  GLOBAL_COVERAGE_THRESHOLD: "65"
+  PATCH_COVERAGE_THRESHOLD: "80"
+
+jobs:
+  # ── 门禁 1: 代码规范 (ruff) ──────────────────────────────────────────────
+  # PR 阶段：只检查 PR 实际改动的【行】（不是整个文件），避免历史欠账阻塞新 PR
+  # main push 阶段：全量扫描但 soft-fail，给历史欠账可视化展示窗口
+  # 历史欠账清理后可改为 push 也硬失败、并移除 PR 路径的行号过滤
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # diff 需要 base 历史
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Lint PR-changed lines only (PR — hard fail)
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -e
+          git fetch origin "${{ github.base_ref }}"
+          BASE="origin/${{ github.base_ref }}"
+
+          CHANGED=$(git diff --name-only --diff-filter=AM "${BASE}...HEAD" -- '*.py')
+          if [ -z "$CHANGED" ]; then
+            echo "No Python file changes — skipping lint."
+            exit 0
+          fi
+          echo "Files in PR diff:"
+          echo "$CHANGED"
+
+          # ruff 整文件扫描（输出 JSON），随后用 git diff 算出改动行号、只保留落在改动行上的违规
+          echo "$CHANGED" | xargs ruff check --output-format=json > ruff_violations.json || true
+
+          export BASE
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          base = os.environ["BASE"]
+
+          # 1. 解析 unified diff，得到 {file: set(改动后的行号)}
+          diff = subprocess.check_output(
+              ["git", "diff", "--unified=0", "--diff-filter=AM",
+               f"{base}...HEAD", "--", "*.py"],
+              text=True,
+          )
+          changed_lines = {}
+          cur = None
+          for line in diff.splitlines():
+              if line.startswith("+++ b/"):
+                  cur = line[6:]
+                  changed_lines[cur] = set()
+              elif line.startswith("@@") and cur is not None:
+                  # @@ -old,oldcount +new,newcount @@
+                  new_part = line.split()[2].lstrip("+")
+                  if "," in new_part:
+                      start, count = map(int, new_part.split(","))
+                  else:
+                      start, count = int(new_part), 1
+                  for ln in range(start, start + max(count, 1)):
+                      changed_lines[cur].add(ln)
+
+          # 2. 过滤 ruff 违规，只保留行号在 PR 改动行集合里的
+          with open("ruff_violations.json") as f:
+              violations = json.load(f)
+
+          cwd = Path.cwd()
+          bad = []
+          for v in violations:
+              fp = Path(v["filename"])
+              try:
+                  rel = str(fp.relative_to(cwd))
+              except ValueError:
+                  rel = str(fp)
+              row = v["location"]["row"]
+              if row in changed_lines.get(rel, set()):
+                  bad.append(v)
+
+          if bad:
+              print(f"::error::{len(bad)} lint error(s) on PR-changed lines:")
+              for v in bad:
+                  print(f"  {v['filename']}:{v['location']['row']}:"
+                        f"{v['location']['column']} {v['code']} {v['message']}")
+              sys.exit(1)
+          print(f"OK: no lint errors on PR-changed lines "
+                f"(filtered from {len(violations)} file-level violations).")
+          PY
+
+      - name: Lint full tree (push to main — soft fail, surface historical debt)
+        if: github.event_name == 'push'
+        continue-on-error: true
+        run: ruff check python/ tests/
+
+  # ── 门禁 2: 单元测试 + 全局覆盖率门槛（历史代码基线，后续逐步提升）────────
+  test:
+    name: Test & Global Coverage Gate (≥${{ env.GLOBAL_COVERAGE_THRESHOLD }}%)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # diff-cover 需要完整历史以对比 base 分支
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+          pip install pytest pytest-cov diff-cover
+
+      - name: Run tests (skip network tests)
+        run: |
+          pytest tests/ \
+            -m "not network" \
+            --cov=python/zrt \
+            --cov-report=xml:coverage.xml \
+            --cov-report=term-missing \
+            --cov-fail-under=${{ env.GLOBAL_COVERAGE_THRESHOLD }} \
+            -q
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 7
+
+  # ── 门禁 3: PR 新增/修改代码必须有测试覆盖（patch coverage 门槛）─────────
+  # 防止"全局达标但新增代码全部没测试"的搭便车情形。
+  # 仅源码（python/zrt/**.py）参与计算；纯文档/配置/重命名等无源码改动的 PR
+  # 会因 diff 不包含可测行而被 diff-cover 自动放行。
+  patch-coverage:
+    name: Patch Coverage Gate (≥${{ env.PATCH_COVERAGE_THRESHOLD }}% on PR diff)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install diff-cover
+        run: pip install diff-cover
+
+      - name: Download coverage artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-report
+
+      - name: Ensure base branch is available
+        run: git fetch origin ${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}
+
+      - name: Enforce patch coverage threshold
+        run: |
+          diff-cover coverage.xml \
+            --compare-branch=origin/${{ github.base_ref }} \
+            --include "python/zrt/**/*.py" \
+            --fail-under=${{ env.PATCH_COVERAGE_THRESHOLD }} \
+            --html-report=patch-coverage.html \
+            --markdown-report=patch-coverage.md
+
+      - name: Upload patch coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: patch-coverage-report
+          path: |
+            patch-coverage.html
+            patch-coverage.md
+          retention-days: 7
+
+  # ── 预留门禁 3: 类型检查 (mypy) ─────────────────────────────────────────
+  # 取消下方注释即可启用；建议先修复现有类型错误后再开启
+  #
+  # type-check:
+  #   name: Type Check (mypy)
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: actions/setup-python@v5
+  #       with:
+  #         python-version: ${{ env.PYTHON_VERSION }}
+  #     - name: Install mypy
+  #       run: pip install mypy torch --index-url https://download.pytorch.org/whl/cpu
+  #     - name: Run mypy
+  #       run: mypy python/zrt/ --ignore-missing-imports
+
+  # ── 预留门禁 4: 安全扫描 (pip-audit + bandit) ────────────────────────────
+  # 取消下方注释即可启用
+  #
+  # security:
+  #   name: Security Scan
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: actions/setup-python@v5
+  #       with:
+  #         python-version: ${{ env.PYTHON_VERSION }}
+  #     - name: Install scanners
+  #       run: pip install bandit pip-audit
+  #     - name: bandit (source code SAST)
+  #       run: bandit -r python/zrt/ -ll -x python/zrt/training/configs
+  #     - name: pip-audit (dependency CVE scan)
+  #       run: pip-audit -r requirements.txt
+
+  # ── 预留门禁 5: 慢速集成测试（可选，仅 main push 触发）───────────────────
+  # 取消下方注释即可启用
+  #
+  # integration-test:
+  #   name: Integration Tests (slow)
+  #   runs-on: ubuntu-latest
+  #   if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: actions/setup-python@v5
+  #       with:
+  #         python-version: ${{ env.PYTHON_VERSION }}
+  #         cache: pip
+  #     - name: Install dependencies
+  #       run: |
+  #         pip install torch --index-url https://download.pytorch.org/whl/cpu
+  #         pip install -r requirements.txt pytest pytest-cov
+  #     - name: Run slow tests
+  #       run: |
+  #         pytest tests/ -m "slow" -q

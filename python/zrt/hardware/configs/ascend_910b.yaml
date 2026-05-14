@@ -16,6 +16,7 @@ compute:
   # Vector: elementwise/norm unit peak ~40 TFLOPS bf16
   cube_bf16_tflops: 280
   vector_bf16_tflops: 40
+  sram_kb_per_sm: 192  # DaVinci AI Core L1 unified buffer (~192 KB)
   overlap_ratio:
     attn_core: 0.6   # ~60% pipeline overlap for fused attention
 

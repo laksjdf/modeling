@@ -47,8 +47,8 @@ def estimate(
         graph = build_graph(model, strategy)
 
     # Total training FLOPs (graph-based, split by phase)
-    total_flops = total_training_flops(graph, model, strategy)
-    fwd_flops, bwd_flops = forward_backward_flops(graph, model, strategy)
+    total_flops = total_training_flops(graph, model, strategy, system)
+    fwd_flops, bwd_flops = forward_backward_flops(graph, model, strategy, system)
 
     # Pipeline step time (includes per-stage timing + memory + MFU via 6P rule)
     step_result: StepResult = pipeline_step_time(graph, model, system, strategy)

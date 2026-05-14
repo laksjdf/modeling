@@ -23,8 +23,7 @@ def test_all_operators():
     print("开始测试所有算子...")
     print(f"总共有 {len(OP_CLASS_REGISTRY)} 个算子")
     
-    passed = 0
-    failed = 0
+    failures = []
     
     for op_name, op_class in OP_CLASS_REGISTRY.items():
         try:
@@ -70,15 +69,12 @@ def test_all_operators():
             assert hasattr(op, 'memory_bytes'), f"{op_name} 缺少memory_bytes属性"
             print(f"[OK] {op_name}: 属性检查成功")
             
-            passed += 1
-            
         except Exception as e:
             print(f"[FAIL] {op_name}: 测试失败 - {e}")
-            failed += 1
+            failures.append(f"{op_name}: {e}")
     
-    print(f"\n测试完成: 成功 {passed}, 失败 {failed}")
-    return failed == 0
+    print(f"\n测试完成: 成功 {len(OP_CLASS_REGISTRY) - len(failures)}, 失败 {len(failures)}")
+    assert not failures, "\n".join(failures)
 
 if __name__ == "__main__":
-    success = test_all_operators()
-    sys.exit(0 if success else 1)
+    test_all_operators()

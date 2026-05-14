@@ -36,6 +36,10 @@ class ComputeSpec:
     vector_bf16_tflops: float | None = None
     overlap_ratio: dict[str, float] = field(default_factory=dict)
 
+    # SRAM per SM for FlashAttention tile-level modeling (KB).
+    # 0 = tile model disabled.
+    sram_kb_per_sm: float = 0.0
+
 
 @dataclass
 class MemoryTier:

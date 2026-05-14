@@ -10,7 +10,7 @@ def _check_torch_available():
     try:
         import torch
         return True
-    except ImportError:
+    except Exception:
         return False
 
 
@@ -48,6 +48,7 @@ def test_train_hw_cli_delegates_to_graph_native_modeller(monkeypatch, capsys):
         ep=1,
         dp=4,
         cp=5,
+        cp_kind="ring",
         zero_stage=2,
         optimizer="adamw",
         muon_rotation=True,
@@ -80,5 +81,6 @@ def test_train_hw_cli_delegates_to_graph_native_modeller(monkeypatch, capsys):
     assert calls[0]["pp"] == 3
     assert calls[0]["dp"] == 4
     assert calls[0]["cp"] == 5
+    assert calls[0]["cp_kind"] == "ring"
     assert calls[0]["zero_stage"] == 2
     assert "graph-native report" in capsys.readouterr().out

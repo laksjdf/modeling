@@ -143,6 +143,16 @@ class RecordingDispatch(TorchDispatchMode):
         output_ids = [self.tensor_tracker.get_id(t) for t in output_tensors]
 
         if self._skip_reshapes and func_name in SKIP_OPS:
+            # Alias the SKIP op's output tensor IDs to its first input ID.
+            # Without this, the view/reshape/_to_copy produces a fresh tracker
+            # ID that has no record, so records_to_opgraph cannot wire the
+            # downstream consumer back to the upstream producer — every edge
+            # crossing a SKIP op gets dropped.  Aliasing keeps the dataflow
+            # chain intact across un-recorded transparent ops.
+            if input_tensors and output_tensors:
+                anchor_id = self.tensor_tracker.get_id(input_tensors[0])
+                for t in output_tensors:
+                    self.tensor_tracker._id_map[id(t)] = anchor_id
             return out
 
         module_path = ""

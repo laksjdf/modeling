@@ -14,6 +14,7 @@ compute:
   # Heterogeneous-core (DaVinci Cube/Vector split, ~2x 910B)
   cube_bf16_tflops: 560
   vector_bf16_tflops: 80
+  sram_kb_per_sm: 192  # DaVinci AI Core L1 unified buffer (~192 KB)
   overlap_ratio:
     attn_core: 0.6   # ~60% pipeline overlap for fused attention
 

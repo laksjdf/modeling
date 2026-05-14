@@ -14,14 +14,13 @@ from python.zrt.ir.adapter import records_to_opgraph, fused_records_to_opgraph
 
 _MODULE_MAP = {
     # ── Graph builder / tracer (require torch) ──────────────────────────────
-    "main": "python.zrt.graph.main",
-    "run_trace": "python.zrt.graph.main",
-    "run_trace_phases": "python.zrt.graph.main",
-    "TraceResult": "python.zrt.graph.main",
-    "TracePhaseResult": "python.zrt.graph.main",
-    "build_config_summary": "python.zrt.graph.main",
-    "infer_layer_types": "python.zrt.graph.main",
-    "auto_target_layers": "python.zrt.graph.main",
+    "run_trace": "python.zrt.pipeline",
+    "run_trace_phases": "python.zrt.pipeline",
+    "TraceResult": "python.zrt.pipeline",
+    "TracePhaseResult": "python.zrt.pipeline",
+    "build_config_summary": "python.zrt.pipeline",
+    "infer_layer_types": "python.zrt.pipeline",
+    "auto_target_layers": "python.zrt.pipeline",
     "load_model": "python.zrt.graph.model_loader",
     "_is_moe_module": "python.zrt.graph.patches",
     "_patch_moe_for_meta": "python.zrt.graph.patches",

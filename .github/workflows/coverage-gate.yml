@@ -1,0 +1,97 @@
+name: Coverage No-Regression
+
+# 只在 PR 时运行，防止合并后整体覆盖率下降。
+# 与 ci.yml 的三道闸互补（阈值由 ci.yml 的 env 块统一管理）：
+#   1) ci.yml::test           — 全局覆盖率绝对下限
+#   2) ci.yml::patch-coverage — PR 新增/修改代码覆盖率门槛（防搭便车）
+#   3) 本工作流               — 整体覆盖率不得低于 base 分支（防慢性退化）
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONPATH: python
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  coverage-regression:
+    name: Coverage No-Regression Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 需要完整历史才能切换到 base 分支
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+          pip install pytest pytest-cov
+
+      # ── 步骤 1：在 base 分支（main）跑测试，记录覆盖率 ────────────────────
+      # 关键设计：
+      # - pytest 不加 `|| true` —— base 分支测试失败属于 broken main，应直接红，
+      #   而不是把退出码吞了导致后续比较拿"0"当 base 覆盖率（任何 PR ≥0 都过）。
+      # - 正则解析失败 sys.exit(1) —— pytest-cov 输出格式变更不能静默 fallback 到 0。
+      # - 切分支前 git clean -fdx 清除 __pycache__/.coverage/.pytest_cache 残留。
+      - name: Measure base branch coverage
+        run: |
+          git clean -fdx
+          git checkout ${{ github.base_ref }}
+          pytest tests/ -m "not network" \
+            --cov=python/zrt --cov-report=term -q 2>&1 | tee /tmp/base.txt
+          python - <<'EOF'
+          import re, pathlib, sys
+          txt = pathlib.Path("/tmp/base.txt").read_text()
+          m = re.search(r"TOTAL\s+\d+\s+\d+\s+(\d+)%", txt)
+          if not m:
+              print("ERROR: TOTAL coverage line not found in pytest output. "
+                    "pytest-cov may have changed format, or tests failed before "
+                    "coverage was reported.", file=sys.stderr)
+              sys.exit(1)
+          pct = m.group(1)
+          pathlib.Path("/tmp/base_pct.txt").write_text(pct)
+          print(f"Base coverage: {pct}%")
+          EOF
+
+      # ── 步骤 2：切回 PR 分支，跑测试，记录覆盖率 ─────────────────────────
+      # PR 侧故意不加 `|| true` —— PR 自己挂了就该红。
+      - name: Measure PR branch coverage
+        run: |
+          git clean -fdx
+          git checkout ${{ github.head_ref }}
+          pytest tests/ -m "not network" \
+            --cov=python/zrt --cov-report=term -q 2>&1 | tee /tmp/pr.txt
+          python - <<'EOF'
+          import re, pathlib, sys
+          txt = pathlib.Path("/tmp/pr.txt").read_text()
+          m = re.search(r"TOTAL\s+\d+\s+\d+\s+(\d+)%", txt)
+          if not m:
+              print("ERROR: TOTAL coverage line not found in pytest output.",
+                    file=sys.stderr)
+              sys.exit(1)
+          pct = m.group(1)
+          pathlib.Path("/tmp/pr_pct.txt").write_text(pct)
+          print(f"PR coverage: {pct}%")
+          EOF
+
+      # ── 步骤 3：对比，PR 覆盖率不得低于 base ────────────────────────────
+      - name: Enforce no regression
+        run: |
+          BASE=$(cat /tmp/base_pct.txt)
+          PR=$(cat /tmp/pr_pct.txt)
+          echo "Base branch: ${BASE}%  |  This PR: ${PR}%"
+          if [ "$PR" -lt "$BASE" ]; then
+            echo "❌ Coverage regression: ${PR}% < ${BASE}% (base branch)"
+            exit 1
+          fi
+          echo "✅ Coverage did not regress: ${PR}% >= ${BASE}%"

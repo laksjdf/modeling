@@ -6,27 +6,23 @@ Reference: Calculon (Isaev et al. SC'23), Korthikanti et al. 2022.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from zrt.training.ir.training_graph import Graph, Op
 from zrt.training.spec.model import ModelSpec
 from zrt.training.spec.strategy import Strategy
+from zrt.training.spec.system import SystemSpec
 
 
 @dataclass
 class OpCost:
-    fwd_flops: float = 0.0
-    dx_flops: float = 0.0
-    dw_flops: float = 0.0
     fwd_bytes: float = 0.0
     dx_bytes: float = 0.0
     dw_bytes: float = 0.0
-    # Legacy: used ONLY for FLOP accounting guards in total_training_flops/recompute_overhead_flops.
-    # Timing model ALWAYS uses max(compute_time, memory_time).
-    bound: str = "compute"   # "compute" | "memory"
+    bound: str = "compute"   # diagnostic only — bound is determined dynamically by _is_compute_bound
 
-    # Heterogeneous core FLOPs (Cube/Vector). For attn_core, cube+vector > fwd_flops
-    # (vector portion is extra work not in the standard 6P accounting model).
+    # Heterogeneous core FLOPs (Cube/Vector).
     fwd_cube_flops: float = 0.0
     fwd_vector_flops: float = 0.0
     dx_cube_flops: float = 0.0
@@ -53,18 +49,18 @@ def _bytes_from_tensors(op: Op) -> float:
     return float(sum(t.nbytes() for t in op.inputs) + sum(t.nbytes() for t in op.outputs))
 
 
-def op_cost(op: Op, model: ModelSpec) -> OpCost:
+def op_cost(op: Op, model: ModelSpec, system: SystemSpec | None = None) -> OpCost:
     """Compute raw cost per op (FLOPs + bytes for roofline timing)."""
     if op.kind == "matmul":
         return _matmul_cost(op)
     if op.kind == "sparse_attn":
-        return _sparse_attn_cost(op)
+        return _sparse_attn_cost(op, system)
     if op.kind == "hca_attn":
-        return _hca_attn_cost(op)
+        return _hca_attn_cost(op, system)
     if op.kind == "swa_attn":
-        return _swa_attn_cost(op)
+        return _swa_attn_cost(op, system)
     if op.kind == "attn_core":
-        return _attn_cost(op, model)
+        return _attn_cost(op, model, system)
     if op.kind == "mhc_pre":
         return _mhc_pre_cost(op)
     if op.kind == "mhc_post":
@@ -96,19 +92,13 @@ def _embed_cost(op: Op) -> OpCost:
     Forward: read embedding table rows -> write embeddings
     Backward: read embeddings -> update embedding table rows (gradient scatter)
     """
-    # Get dimensions from op meta
-    seq = op.meta.get("m", 0)  # sequence length
-    hidden = op.meta.get("n", 0)  # embedding dimension
+    seq = op.inputs[0].shape_local[0] if op.inputs else op.meta.get("m", 0)
+    hidden = op.outputs[0].shape_local[-1] if op.outputs else op.meta.get("n", 0)
 
-    # Forward bytes: read seq * hidden elements from embedding table
-    # Backward bytes: same volume (gradient scatter)
     bpe = _bpe(op)
     fwd_bytes = seq * hidden * bpe
 
     return OpCost(
-        fwd_flops=0.0,  # gather has no FLOPs
-        dx_flops=0.0,   # scatter gradient has no FLOPs
-        dw_flops=0.0,   # embedding table update is scatter, no FLOPs
         fwd_bytes=fwd_bytes,
         dx_bytes=fwd_bytes,
         dw_bytes=fwd_bytes,
@@ -117,17 +107,28 @@ def _embed_cost(op: Op) -> OpCost:
 
 
 def _matmul_cost(op: Op) -> OpCost:
-    m = op.meta.get("m", 0)
-    n = op.meta.get("n_local", op.meta.get("n", 0))
-    k = op.meta.get("k_local", op.meta.get("k", 0))
+    # Fused ops (routed_expert) and grouped matmuls (wo_a) have meta
+    # dimensions that don't correspond to tensor shapes — must read from meta.
+    meta_k = op.meta.get("k", 0)
+    use_meta = (
+        op.meta.get("fused_weight_dims", False)
+        or not op.inputs
+        or not op.outputs
+        or (meta_k > 0 and op.inputs[0].shape_logical[-1] != meta_k)
+    )
+    if use_meta:
+        m = op.meta.get("m", 0)
+        n = op.meta.get("n_local", op.meta.get("n", 0))
+        k = op.meta.get("k_local", op.meta.get("k", 0))
+    else:
+        m = op.inputs[0].shape_local[0]
+        k = op.inputs[0].shape_local[-1]
+        n = op.outputs[0].shape_local[-1]
     bpe = _bpe(op)
     fwd = 2.0 * m * n * k * op.meta.get("fwd_multiplier", 1.0)
     # read A(m×k) + B(k×n), write C(m×n) — symmetric for fwd/dx/dw
     total_bytes = (m * k + k * n + m * n) * bpe
     return OpCost(
-        fwd_flops=fwd,
-        dx_flops=fwd,
-        dw_flops=fwd,
         fwd_bytes=total_bytes,
         dx_bytes=total_bytes,
         dw_bytes=total_bytes,
@@ -137,7 +138,21 @@ def _matmul_cost(op: Op) -> OpCost:
     )
 
 
-def _attn_cost(op: Op, model: ModelSpec) -> OpCost:
+def _fa_tile_shape(head_dim: int, act_bpe: int, sram_bytes: int) -> tuple[int, int]:
+    """Return (Br, Bc) tile dimensions for FlashAttention-2.
+
+    Fits Q_tile + K_tile + V_tile + S_tile in SRAM:
+      SRAM ≈ Br·d·bpe + 2·Bc·d·bpe + Br·Bc·4 (fp32 stats).
+    Returns FA-2 defaults (128, 64) when sram_bytes == 0.
+    """
+    if sram_bytes <= 0:
+        return 128, 64
+    Bc = max(16, min(128, sram_bytes // (4 * head_dim * act_bpe)))
+    Br = max(16, min(128, sram_bytes // (3 * head_dim * act_bpe)))
+    return Br, Bc
+
+
+def _attn_cost(op: Op, model: ModelSpec | None, system: SystemSpec | None = None) -> OpCost:
     b = op.meta.get("b", 1)
     s = op.meta.get("s", 0)
     h = op.meta.get("heads", 0)
@@ -174,8 +189,8 @@ def _attn_cost(op: Op, model: ModelSpec) -> OpCost:
         )
         mult = 2.0 if causal else 4.0
         fwd = mult * b * s * s * h * d * compression_ratio
-        # Cube core always does full dense QK+AV matmuls (causal mask is Vector-side)
-        cube_fwd = 4.0 * b * s * s * h * d * compression_ratio
+        # FA-2-class kernels skip masked tiles in the cube engine
+        cube_fwd = fwd
         vector_fwd = 5.0 * b * h * s * s
 
     # Ring-CP: multiply by cp_tiles to account for multiple rounds
@@ -198,21 +213,29 @@ def _attn_cost(op: Op, model: ModelSpec) -> OpCost:
         kv_len = s  # standard attention: K, V same length as Q
 
     bpe = _bpe(op)
-    # Forward: read Q(s) + K(kv_len) + V(kv_len), write O(s)
-    fwd_bytes = (2.0 * b * h * s * d + 2.0 * b * h * kv_len * d) * bpe
-    # Backward: read Q(s) + K(kv_len) + V(kv_len) + dO(s),
-    #           write dQ(s) + dK(kv_len) + dV(kv_len)
-    # Flash attention recomputes O from QK^T, so O is not read from HBM
-    dx_bytes = (3.0 * b * h * s * d + 4.0 * b * h * kv_len * d) * bpe
+
+    # Tile-aware byte formula: K,V are re-read per Q-block in FlashAttention.
+    sram_bytes = int(system.gpu.sram_kb_per_sm * 1024) if system and system.gpu.sram_kb_per_sm > 0 else 0
+    Br, Bc = _fa_tile_shape(d, bpe, sram_bytes)
+    Tr = math.ceil(s / Br)
+    Tc = math.ceil(kv_len / Bc)
+    # Causal: average K-blocks per Q-block is (Tc+1)/2 for dense contiguous mask,
+    # but top-k positions are scattered — no causal halving for sparse.
+    if sparse_topk > 0:
+        tc_eff = Tc
+    else:
+        tc_eff = (Tc + 1) / 2 if causal else Tc
+
+    q_bytes  = b * h * s * d
+    o_bytes  = b * h * s * d
+    kv_bytes = b * h * Tr * tc_eff * Bc * d
+    fwd_bytes = (q_bytes + o_bytes + 2.0 * kv_bytes) * bpe
+    # Backward: ≈2× fwd minus small saved-state (M, L) overhead
+    dx_bytes = (2.0 * q_bytes + 4.0 * kv_bytes) * bpe
 
     return OpCost(
-        fwd_flops=fwd,
-        dx_flops=dx,
-        dw_flops=0.0,
         fwd_bytes=fwd_bytes,
         dx_bytes=dx_bytes,
-        dw_bytes=0.0,
-        # Cube = dense QK+AV matmuls, Vector = softmax/scaling/mask
         fwd_cube_flops=cube_fwd,
         fwd_vector_flops=vector_fwd,
         dx_cube_flops=2.5 * cube_fwd,
@@ -227,7 +250,7 @@ def _attn_compression_ratio(value: float) -> float:
     return ratio
 
 
-def _sparse_attn_cost(op: Op) -> OpCost:
+def _sparse_attn_cost(op: Op, system: SystemSpec | None = None) -> OpCost:
     """CSA / DSA: sparse attention over indexer top-k KV + sliding window.
 
     Q: (seq, heads, head_dim)
@@ -244,27 +267,28 @@ def _sparse_attn_cost(op: Op) -> OpCost:
     swa = op.meta.get("swa_window", 0)
 
     if topk <= 0:
-        # Degenerate: no sparse_topk set — fall back to full causal
-        return _attn_cost(op, None)  # model not needed for fallback
+        return _attn_cost(op, None, system)
 
     effective_len = topk + swa
     fwd = 2.0 * b * s * effective_len * h * d
-    dx = 2.5 * fwd
-    # Cube = QK^T + AV matmuls over effective_len, Vector = softmax/scaling/mask
     cube_fwd = fwd
     vector_fwd = 5.0 * b * h * s * effective_len
 
     bpe = _bpe(op)
-    fwd_bytes = (2.0 * b * h * s * d + 2.0 * b * h * effective_len * d) * bpe
-    dx_bytes = (3.0 * b * h * s * d + 4.0 * b * h * effective_len * d) * bpe
+    sram_bytes = int(system.gpu.sram_kb_per_sm * 1024) if system and system.gpu.sram_kb_per_sm > 0 else 0
+    Br, Bc = _fa_tile_shape(d, bpe, sram_bytes)
+    Tr = math.ceil(s / Br)
+    Tc = math.ceil(effective_len / Bc)
+    tc_eff = Tc  # top-k positions are scattered, no causal halving
+    q_bytes = b * h * s * d
+    o_bytes = b * h * s * d
+    kv_bytes = b * h * Tr * tc_eff * Bc * d
+    fwd_bytes = (q_bytes + o_bytes + 2.0 * kv_bytes) * bpe
+    dx_bytes = (2.0 * q_bytes + 4.0 * kv_bytes) * bpe
 
     return OpCost(
-        fwd_flops=fwd,
-        dx_flops=dx,
-        dw_flops=0.0,
         fwd_bytes=fwd_bytes,
         dx_bytes=dx_bytes,
-        dw_bytes=0.0,
         fwd_cube_flops=cube_fwd,
         fwd_vector_flops=vector_fwd,
         dx_cube_flops=2.5 * cube_fwd,
@@ -272,7 +296,7 @@ def _sparse_attn_cost(op: Op) -> OpCost:
     )
 
 
-def _hca_attn_cost(op: Op) -> OpCost:
+def _hca_attn_cost(op: Op, system: SystemSpec | None = None) -> OpCost:
     """HCA: dense attention on compressed KV (seq/ratio) + sliding window.
 
     Q: (seq, heads, head_dim)
@@ -287,28 +311,29 @@ def _hca_attn_cost(op: Op) -> OpCost:
     swa = op.meta.get("swa_window", 0)
 
     if ratio <= 0:
-        # Degenerate: no compress_ratio — fall back to full causal
-        return _attn_cost(op, None)
+        return _attn_cost(op, None, system)
 
     compressed_len = max(1, s // ratio)
     effective_len = compressed_len + swa
     fwd = 2.0 * b * s * effective_len * h * d
-    dx = 2.5 * fwd
-    # Cube = QK^T + AV matmuls over effective_len, Vector = softmax/scaling/mask
     cube_fwd = fwd
     vector_fwd = 5.0 * b * h * s * effective_len
 
     bpe = _bpe(op)
-    fwd_bytes = (2.0 * b * h * s * d + 2.0 * b * h * effective_len * d) * bpe
-    dx_bytes = (3.0 * b * h * s * d + 4.0 * b * h * effective_len * d) * bpe
+    sram_bytes = int(system.gpu.sram_kb_per_sm * 1024) if system and system.gpu.sram_kb_per_sm > 0 else 0
+    Br, Bc = _fa_tile_shape(d, bpe, sram_bytes)
+    Tr = math.ceil(s / Br)
+    Tc = math.ceil(effective_len / Bc)
+    tc_eff = (Tc + 1) / 2  # always causal
+    q_bytes = b * h * s * d
+    o_bytes = b * h * s * d
+    kv_bytes = b * h * Tr * tc_eff * Bc * d
+    fwd_bytes = (q_bytes + o_bytes + 2.0 * kv_bytes) * bpe
+    dx_bytes = (2.0 * q_bytes + 4.0 * kv_bytes) * bpe
 
     return OpCost(
-        fwd_flops=fwd,
-        dx_flops=dx,
-        dw_flops=0.0,
         fwd_bytes=fwd_bytes,
         dx_bytes=dx_bytes,
-        dw_bytes=0.0,
         fwd_cube_flops=cube_fwd,
         fwd_vector_flops=vector_fwd,
         dx_cube_flops=2.5 * cube_fwd,
@@ -316,7 +341,7 @@ def _hca_attn_cost(op: Op) -> OpCost:
     )
 
 
-def _swa_attn_cost(op: Op) -> OpCost:
+def _swa_attn_cost(op: Op, system: SystemSpec | None = None) -> OpCost:
     """SWA-only: pure sliding window attention.
 
     Q: (seq, heads, head_dim)
@@ -330,26 +355,27 @@ def _swa_attn_cost(op: Op) -> OpCost:
     swa = op.meta.get("swa_window", 0)
 
     if swa <= 0:
-        # Degenerate: no swa_window — fall back to full causal
-        return _attn_cost(op, None)
+        return _attn_cost(op, None, system)
 
     fwd = 2.0 * b * s * swa * h * d
-    dx = 2.5 * fwd
-    # Cube = QK^T + AV matmuls over swa_window, Vector = softmax/scaling/mask
     cube_fwd = fwd
     vector_fwd = 5.0 * b * h * s * swa
 
     bpe = _bpe(op)
-    fwd_bytes = (2.0 * b * h * s * d + 2.0 * b * h * swa * d) * bpe
-    dx_bytes = (3.0 * b * h * s * d + 4.0 * b * h * swa * d) * bpe
+    sram_bytes = int(system.gpu.sram_kb_per_sm * 1024) if system and system.gpu.sram_kb_per_sm > 0 else 0
+    Br, Bc = _fa_tile_shape(d, bpe, sram_bytes)
+    Tr = math.ceil(s / Br)
+    Tc = math.ceil(swa / Bc)
+    tc_eff = (Tc + 1) / 2  # always causal
+    q_bytes = b * h * s * d
+    o_bytes = b * h * s * d
+    kv_bytes = b * h * Tr * tc_eff * Bc * d
+    fwd_bytes = (q_bytes + o_bytes + 2.0 * kv_bytes) * bpe
+    dx_bytes = (2.0 * q_bytes + 4.0 * kv_bytes) * bpe
 
     return OpCost(
-        fwd_flops=fwd,
-        dx_flops=dx,
-        dw_flops=0.0,
         fwd_bytes=fwd_bytes,
         dx_bytes=dx_bytes,
-        dw_bytes=0.0,
         fwd_cube_flops=cube_fwd,
         fwd_vector_flops=vector_fwd,
         dx_cube_flops=2.5 * cube_fwd,
@@ -384,9 +410,6 @@ def _mhc_pre_cost(op: Op) -> OpCost:
     fwd_bytes = lin_in_bytes + lin_wt_bytes + lin_out_bytes + sink_bytes + sum_bytes
 
     return OpCost(
-        fwd_flops=fwd,
-        dx_flops=2.5 * fwd,
-        dw_flops=fwd_lin,
         fwd_bytes=fwd_bytes,
         dx_bytes=fwd_bytes * 1.5,
         fwd_cube_flops=fwd,
@@ -407,9 +430,6 @@ def _mhc_post_cost(op: Op) -> OpCost:
     fwd_bytes = float(b * s * hc * h * bpe * 2 + b * s * hc * hc * h * bpe * 2)
 
     return OpCost(
-        fwd_flops=fwd,
-        dx_flops=2.5 * fwd,
-        dw_flops=0.0,
         fwd_bytes=fwd_bytes,
         dx_bytes=fwd_bytes * 1.5,
         fwd_cube_flops=fwd,
@@ -432,9 +452,6 @@ def _mhc_head_cost(op: Op) -> OpCost:
     fwd_bytes = float(2 * b * s * (hc * h) * mix * bpe + b * s * hc * h * bpe)
 
     return OpCost(
-        fwd_flops=fwd,
-        dx_flops=2.5 * fwd,
-        dw_flops=fwd_lin,
         fwd_bytes=fwd_bytes,
         dx_bytes=fwd_bytes * 1.5,
         fwd_cube_flops=fwd,
@@ -460,9 +477,6 @@ def _elementwise_cost(op: Op) -> OpCost:
     fwd_flops = flops_per_elem * n
     fwd_bytes = _bytes_from_tensors(op) or op.meta.get("bytes_fwd", 0.0)
     return OpCost(
-        fwd_flops=fwd_flops,
-        dx_flops=fwd_flops * 2.5,
-        dw_flops=0.0,
         fwd_bytes=fwd_bytes,
         dx_bytes=fwd_bytes * 1.5,
         dw_bytes=0.0,
@@ -483,8 +497,7 @@ def _compressor_pool_cost(op: Op) -> OpCost:
     # softmax over coff*m elements × (s/m) groups, then weighted sum
     fwd_flops = 4.0 * (s // m) * coff * m * d
     bytes_fwd = op.meta.get("bytes_fwd", s * d * 4)  # read kv + write compressed
-    return OpCost(fwd_flops=fwd_flops, dx_flops=fwd_flops,
-                  fwd_bytes=bytes_fwd, dx_bytes=bytes_fwd * 1.5, bound="compute",
+    return OpCost(fwd_bytes=bytes_fwd, dx_bytes=bytes_fwd * 1.5,
                   fwd_cube_flops=fwd_flops, dx_cube_flops=fwd_flops)
 
 
@@ -500,18 +513,37 @@ def _indexer_topk_cost(op: Op) -> OpCost:
     # ReLU + weighted sum + topk: memory-bound
     bytes_fwd = op.meta.get("bytes_fwd", s * ih * id_ * 4)
     return OpCost(
-        fwd_flops=einsum_flops,
-        dx_flops=2.0 * einsum_flops,
-        dw_flops=0.0,
         fwd_bytes=bytes_fwd,
-        bound="compute",
         fwd_cube_flops=einsum_flops,
         dx_cube_flops=2.0 * einsum_flops,
     )
 
 
+def _is_compute_bound(cost: OpCost, phase: str, system: SystemSpec) -> bool:
+    """Determine if an op phase is compute-bound at the roofline knee.
+
+    Uses peak FLOPS and peak BW (no efficiency curves) so that bound is a
+    structural property of the op shape, not dependent on the efficiency model.
+    """
+    flops = getattr(cost, f"{phase}_cube_flops") + getattr(cost, f"{phase}_vector_flops")
+    bytes_ = getattr(cost, f"{phase}_bytes")
+    if flops <= 0:
+        return False  # memory-only op (e.g. embed)
+    if bytes_ <= 0:
+        return True
+    compute_t = flops / (system.gpu.flops_bf16 * 1e12)
+    memory_t = bytes_ / (system.gpu.hbm_bw_gbps * 1e9)
+    return compute_t >= memory_t
+
+
+def _accounted_flops(cost: OpCost, phase: str) -> float:
+    """Return cube + vector FLOPs for a given phase."""
+    return getattr(cost, f"{phase}_cube_flops") + getattr(cost, f"{phase}_vector_flops")
+
+
 def total_training_flops(
     graph: Graph, model: ModelSpec, strategy: Strategy,
+    system: SystemSpec,
 ) -> float:
     """Total FLOPs per training step (forward + backward).
 
@@ -525,9 +557,10 @@ def total_training_flops(
     """
     total = 0.0
     for op in graph.ops:
-        cost = op_cost(op, model)
-        if cost.bound == "compute":
-            total += cost.fwd_flops + cost.dx_flops + cost.dw_flops
+        cost = op_cost(op, model, system)
+        for phase in ("fwd", "dx", "dw"):
+            if _is_compute_bound(cost, phase, system):
+                total += _accounted_flops(cost, phase)
 
     # Scale by microbatch count
     M = strategy.num_microbatches()
@@ -538,6 +571,7 @@ def total_training_flops(
 
 def forward_backward_flops(
     graph: Graph, model: ModelSpec, strategy: Strategy,
+    system: SystemSpec,
 ) -> tuple[float, float]:
     """Return (forward_flops, backward_flops) separately.
 
@@ -546,16 +580,20 @@ def forward_backward_flops(
     fwd = 0.0
     bwd = 0.0
     for op in graph.ops:
-        cost = op_cost(op, model)
-        if cost.bound == "compute":
-            fwd += cost.fwd_flops
-            bwd += cost.dx_flops + cost.dw_flops
+        cost = op_cost(op, model, system)
+        if _is_compute_bound(cost, "fwd", system):
+            fwd += _accounted_flops(cost, "fwd")
+        if _is_compute_bound(cost, "dx", system):
+            bwd += _accounted_flops(cost, "dx")
+        if _is_compute_bound(cost, "dw", system):
+            bwd += _accounted_flops(cost, "dw")
     M = strategy.num_microbatches()
     return fwd * M, bwd * M
 
 
 def recompute_overhead_flops(
     graph: Graph, model: ModelSpec, strategy: Strategy,
+    system: SystemSpec,
 ) -> float:
     """Extra FLOPs from recomputing forward activations during backward pass.
 
@@ -583,9 +621,9 @@ def recompute_overhead_flops(
 
         op_cats = _op_recompute_categories(op)
         if "full" in cats or (op_cats & cats):
-            cost = op_cost(op, model)
-            if cost.bound == "compute":
-                extra += cost.fwd_flops
+            cost = op_cost(op, model, system)
+            if _is_compute_bound(cost, "fwd", system):
+                extra += _accounted_flops(cost, "fwd")
 
     M = strategy.num_microbatches()
     return extra * M

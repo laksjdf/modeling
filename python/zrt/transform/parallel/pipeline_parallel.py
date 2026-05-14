@@ -265,6 +265,15 @@ class PipelineParallelPass(GraphPass):
             p2p_id = f"comm_p2p_{direction}_{ss}_{ds}_{p2p_idx}"
             p2p_idx += 1
 
+            src_node_obj = graph.nodes[edge.src]
+            dst_node_obj = graph.nodes[edge.dst]
+            inherited_layer = src_node_obj.layer or dst_node_obj.layer or ""
+            inherited_scope = (
+                src_node_obj.scope
+                or dst_node_obj.scope
+                or f"pipeline.p2p.{direction}.stage{ss}_to_{ds}"
+            )
+
             p2p_node = OpNode(
                 id=p2p_id,
                 op_type="comm.send_recv",
@@ -277,7 +286,10 @@ class PipelineParallelPass(GraphPass):
                     "src_virtual_stage": sv if is_vpp and sv >= 0 else None,
                     "dst_virtual_stage": dv if is_vpp and dv >= 0 else None,
                 },
-                scope=f"pipeline.p2p.{direction}.stage{ss}_to_{ds}",
+                scope=inherited_scope,
+                layer=inherited_layer,
+                module_class=src_node_obj.module_class or dst_node_obj.module_class,
+                component=src_node_obj.component or dst_node_obj.component,
                 category="communication",
             )
             p2p_node.annotations["stage_id"] = ds

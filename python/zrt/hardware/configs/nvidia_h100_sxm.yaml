@@ -19,6 +19,7 @@ compute:
   vector_bf16_tflops: 66.9
   overlap_ratio:
     attn_core: 0.6
+  sram_kb_per_sm: 228
 
 memory:
   capacity_gb: 80

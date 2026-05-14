@@ -41,9 +41,12 @@ def test_anchor_yaml_has_config(yaml_file):
 @pytest.mark.parametrize("yaml_file", sorted(ANCHOR_DIR.glob("*.yaml")))
 def test_anchor_config_is_internally_consistent(yaml_file):
     """Verify anchor configs are internally consistent (no conflicting products)."""
+    from zrt.training.io.config_loader import load_anchor_config
+
     data = _load_anchor(yaml_file)
     config = data["config"]
     name = data["name"]
+    _, system, _ = load_anchor_config(yaml_file)
 
     tp = config.get("tp", 1)
     pp = config.get("pp", 1)
@@ -51,7 +54,7 @@ def test_anchor_config_is_internally_consistent(yaml_file):
 
     # Basic sanity: world_size should be consistent with tp * pp * dp
     # (EP excluded per current policy — see test_ep_rank_product.py)
-    world_size = config.get("world_size", tp * pp * dp)
+    world_size = system.world_size
     rank_product = tp * pp * dp
 
     assert rank_product == world_size, (

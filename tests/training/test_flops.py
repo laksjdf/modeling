@@ -22,14 +22,13 @@ def test_matmul_cost():
     )
     cost = op_cost(op, model)
     expected = 2 * 1024 * 4096 * 4096
-    assert cost.fwd_flops == expected
-    assert cost.dx_flops == expected
-    assert cost.dw_flops == expected
-    assert cost.bound == "compute"
+    assert cost.fwd_cube_flops == expected
+    assert cost.dx_cube_flops == expected
+    assert cost.dw_cube_flops == expected
 
 
 def test_attn_core_cost():
-    """Attention core: causal fwd = 2*b*s^2*h*d."""
+    """Attention core: causal cube_fwd = 2*b*s^2*h*d, vector_fwd = 5*b*h*s^2."""
     op = Op(name="test_attn", kind="attn_core", meta={
         "b": 1, "s": 2048, "heads": 32, "head_dim": 128, "causal": True,
     })
@@ -39,11 +38,13 @@ def test_attn_core_cost():
         layers=[LayerKind.DENSE],
     )
     cost = op_cost(op, model)
-    # fwd = 2 * 1 * 2048 * 2048 * 32 * 128
-    expected_fwd = 2 * 1 * 2048 * 2048 * 32 * 128
-    assert cost.fwd_flops == expected_fwd
-    assert cost.dx_flops == pytest.approx(2.5 * expected_fwd, rel=0.01)
-    assert cost.dw_flops == 0.0
+    # cube = 2 * 1 * 2048 * 2048 * 32 * 128 (causal, mask-aware)
+    expected_cube = 2 * 1 * 2048 * 2048 * 32 * 128
+    expected_vector = 5 * 1 * 32 * 2048 * 2048
+    assert cost.fwd_cube_flops == expected_cube
+    assert cost.fwd_vector_flops == expected_vector
+    assert cost.dx_cube_flops == pytest.approx(2.5 * expected_cube, rel=0.01)
+    assert cost.dx_vector_flops == pytest.approx(2.5 * expected_vector, rel=0.01)
 
 
 def test_attn_core_cost_uses_model_compression_ratio():
@@ -62,9 +63,8 @@ def test_attn_core_cost_uses_model_compression_ratio():
 
     dense_fwd = 2 * 1 * 1024 * 1024 * 16 * 128
     expected_fwd = dense_fwd * 0.27
-    assert cost.fwd_flops == pytest.approx(expected_fwd)
-    assert cost.dx_flops == pytest.approx(2.5 * expected_fwd)
-    assert cost.dw_flops == 0.0
+    assert cost.fwd_cube_flops == pytest.approx(expected_fwd)
+    assert cost.dx_cube_flops == pytest.approx(2.5 * expected_fwd)
 
 
 def test_attn_core_cost_op_ratio_overrides_model_ratio():
@@ -83,7 +83,7 @@ def test_attn_core_cost_op_ratio_overrides_model_ratio():
     cost = op_cost(op, model)
 
     dense_fwd = 2 * 1 * 512 * 512 * 8 * 128
-    assert cost.fwd_flops == pytest.approx(dense_fwd * 0.5)
+    assert cost.fwd_cube_flops == pytest.approx(dense_fwd * 0.5)
 
 
 def test_memory_bound_cost():
@@ -127,9 +127,18 @@ def test_6p_rule():
         layers=[LayerKind.DENSE] * 4,
     )
     strategy = Strategy(tp=1, pp=1, dp=1, micro_batch=1, global_batch=1)
+    system = SystemSpec(
+        gpu=GPU(name="test", flops_bf16=312, flops_fp8=624, hbm_gb=80, hbm_bw_gbps=2000),
+        host_mem_gb=256,
+        interconnect=InterconnectSpec(
+            intra_node=LinkSpec(type="NVLink", bandwidth_gbps=900, latency_us=1.0, topology="all_to_all", num_devices=8),
+            inter_node=LinkSpec(type="IB", bandwidth_gbps=400, latency_us=5.0, topology="fat_tree"),
+        ),
+        nodes=1, gpus_per_node=1,
+    )
     graph = build_graph(model, strategy)
 
-    total = total_training_flops(graph, model, strategy)
+    total = total_training_flops(graph, model, strategy, system)
 
     # 6P rule: 6 * total_params * tokens
     tokens = 1 * 2048  # micro_batch * seq_len
@@ -151,8 +160,8 @@ def test_unknown_op_zero_cost():
         layers=[LayerKind.DENSE],
     )
     cost = op_cost(op, model)
-    assert cost.fwd_flops == 0.0
-    assert cost.dx_flops == 0.0
+    assert cost.fwd_cube_flops == 0.0
+    assert cost.dx_cube_flops == 0.0
 
 
 
@@ -271,7 +280,7 @@ def test_hfu_exceeds_mfu_with_selective_recompute():
     )
 
     graph = build_graph(model, strategy)
-    overhead = recompute_overhead_flops(graph, model, strategy)
+    overhead = recompute_overhead_flops(graph, model, strategy, system)
     assert overhead > 0, "Selective recompute should produce nonzero overhead FLOPs"
 
     report = estimate(model, system, strategy)
@@ -287,9 +296,18 @@ def test_recompute_overhead_zero_by_default():
         layers=[LayerKind.DENSE] * 4,
     )
     strategy = Strategy(tp=1, pp=1, dp=1, micro_batch=1, global_batch=1)
+    system = SystemSpec(
+        gpu=GPU(name="test", flops_bf16=312, flops_fp8=624, hbm_gb=80, hbm_bw_gbps=2000),
+        host_mem_gb=256,
+        interconnect=InterconnectSpec(
+            intra_node=LinkSpec(type="NVLink", bandwidth_gbps=900, latency_us=1.0, topology="all_to_all", num_devices=8),
+            inter_node=LinkSpec(type="IB", bandwidth_gbps=400, latency_us=5.0, topology="fat_tree"),
+        ),
+        nodes=1, gpus_per_node=1,
+    )
     graph = build_graph(model, strategy)
 
-    assert recompute_overhead_flops(graph, model, strategy) == 0.0
+    assert recompute_overhead_flops(graph, model, strategy, system) == 0.0
 
 
 def test_recompute_overhead_full_recompute():
@@ -303,10 +321,19 @@ def test_recompute_overhead_full_recompute():
         tp=1, pp=1, dp=1, micro_batch=1, global_batch=1,
         recompute=RecomputePolicy(per_layer={"dense": {"full"}}),
     )
+    system = SystemSpec(
+        gpu=GPU(name="test", flops_bf16=312, flops_fp8=624, hbm_gb=80, hbm_bw_gbps=2000),
+        host_mem_gb=256,
+        interconnect=InterconnectSpec(
+            intra_node=LinkSpec(type="NVLink", bandwidth_gbps=900, latency_us=1.0, topology="all_to_all", num_devices=8),
+            inter_node=LinkSpec(type="IB", bandwidth_gbps=400, latency_us=5.0, topology="fat_tree"),
+        ),
+        nodes=1, gpus_per_node=1,
+    )
     graph = build_graph(model, strategy)
 
-    overhead = recompute_overhead_flops(graph, model, strategy)
-    total = total_training_flops(graph, model, strategy)
+    overhead = recompute_overhead_flops(graph, model, strategy, system)
+    total = total_training_flops(graph, model, strategy, system)
 
     # Full recompute reruns the entire forward: overhead ≈ forward_flops = total / 3
     # Allow generous range since total includes backward and not all ops are compute-bound
@@ -364,6 +391,15 @@ def test_layer_kind_scoped_recompute():
         layers=[LayerKind.DENSE, LayerKind.MOE],
         num_experts=4, moe_ffn=1024, top_k=1,
     )
+    system = SystemSpec(
+        gpu=GPU(name="test", flops_bf16=312, flops_fp8=624, hbm_gb=80, hbm_bw_gbps=2000),
+        host_mem_gb=256,
+        interconnect=InterconnectSpec(
+            intra_node=LinkSpec(type="NVLink", bandwidth_gbps=900, latency_us=1.0, topology="all_to_all", num_devices=8),
+            inter_node=LinkSpec(type="IB", bandwidth_gbps=400, latency_us=5.0, topology="fat_tree"),
+        ),
+        nodes=1, gpus_per_node=1,
+    )
     # Only recompute attention in MOE layers
     strategy = Strategy(
         tp=1, pp=1, dp=1, micro_batch=1, global_batch=1,
@@ -371,7 +407,7 @@ def test_layer_kind_scoped_recompute():
     )
     graph = build_graph(model, strategy)
 
-    overhead = recompute_overhead_flops(graph, model, strategy)
+    overhead = recompute_overhead_flops(graph, model, strategy, system)
     # Should be nonzero (MOE layer's attention ops are recomputed)
     assert overhead > 0, "MOE-targeted recompute should produce nonzero overhead"
 
@@ -380,7 +416,7 @@ def test_layer_kind_scoped_recompute():
         tp=1, pp=1, dp=1, micro_batch=1, global_batch=1,
         recompute=RecomputePolicy(per_layer={"dense": {"attn"}}),
     )
-    overhead_dense = recompute_overhead_flops(graph, model, strategy_dense)
+    overhead_dense = recompute_overhead_flops(graph, model, strategy_dense, system)
     # Dense layer and MoE layer have different op counts; should differ
     # At minimum, both should be non-negative and not equal if layer sizes differ
     assert overhead_dense >= 0

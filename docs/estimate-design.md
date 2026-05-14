@@ -255,31 +255,60 @@ class Graph:
 ```
 build_graph(model, strategy)
 │
+├── Global head (layer_id = -1):
+│   ├── embed (vocab → hidden)
+│   └── hc_expand (optional, if hc_mult > 1)
+│
 ├── Layer 0 (Dense):
-│   ├── embed lookup
-│   ├── _build_attn_ops() → q_a_proj, q_b_proj, kv_a_proj, kv_b_proj,
-│   │                       attn_core, o_proj, + v4 variants (wq_a/wq_b, wo_a/wo_b)
-│   ├── _build_dense_ffn() → up_proj, gate_proj, down_proj, swiglu
-│   ├── norms (pre_attn_ln, post_attn_ln, pre_ffn_ln, post_ffn_ln)
-│   └── residual adds, rope
+│   ├── [mhc_pre_attn]            ← 仅 hc_mult > 1
+│   ├── ln1 (pre-attn RMSNorm)
+│   ├── _build_attn_ops() — 按架构分发：
+│   │   ├── MLA (DeepSeek-V3):    q_a_proj, q_a_norm, q_b_proj,
+│   │   │                         kv_a_proj, kv_a_norm, kv_b_proj,
+│   │   │                         rope, attn_core, o_proj
+│   │   ├── V4:                   wq_a, q_norm, wq_b, q_rsqrt_norm,
+│   │   │                         wkv, kv_norm, [compressor: comp_wkv/comp_wgate/comp_pool],
+│   │   │                         [indexer: idx_wq_b/idx_weights/idx_comp_wkv/
+│   │   │                                   idx_comp_wgate/idx_comp_pool/idx_score_topk],
+│   │   │                         rope, attn_core/sparse_attn/hca_attn/swa_attn,
+│   │   │                         wo_a, wo_b
+│   │   └── Standard MHA:         qkv_proj, rope, attn_core, o_proj
+│   ├── residual1 (add) / [mhc_post_attn + mhc_pre_ffn]
+│   ├── ln2 (pre-FFN RMSNorm)
+│   ├── up_proj, gate_proj, swiglu, down_proj
+│   └── residual2 (add) / [mhc_post_ffn]
 │
 ├── Layer 3 (MoE):
-│   ├── same attn ops as Dense
-│   ├── _build_moe_ops() → router, routed_expert_ffn (fused up/gate/down × topk)
-│   │                      + shared_up_proj, shared_gate_proj, shared_down_proj
-│   ├── mhc_pre, mhc_post (Hyper-Connections)
-│   └── norms, residual adds
+│   ├── [mhc_pre_attn]
+│   ├── ln1 (pre-attn RMSNorm)
+│   ├── same _build_attn_ops() as Dense (支持 MLA Indexer for MoE layers)
+│   ├── residual1 / [mhc_post_attn + mhc_pre_ffn]
+│   ├── ln2 (pre-FFN RMSNorm)
+│   ├── _build_moe_ffn_ops():
+│   │   ├── router (matmul: h → num_experts) + topk_select (softmax)
+│   │   │   └── 或 hash_route (if hash-routed layer)
+│   │   ├── [shared experts: shared_up_proj, shared_gate_proj, shared_swiGLU, shared_down_proj]
+│   │   ├── routed_expert_ffn (fused matmul × 3 × top_k)
+│   │   └── expert_agg (add)
+│   └── residual2 / [mhc_post_ffn]
 │
-├── Indexer Layers (every 4 layers):
-│   ├── idx_score_topk (einsum scoring)
-│   ├── idx_comp_pool (KV compressor)
-│   └── idx_wq_b, idx_weights, idx_comp_wkv, idx_comp_wgate
+├── MTP Layers (if mtp_depth > 0):
+│   ├── mtp_embed_proj (matmul: h → h)
+│   └── + 完整 MoE/Dense block（与普通层相同的全套算子）
 │
-├── Global ops (layer_id = -1):
-│   └── lm_head (matmul: seq × hidden → vocab)
+├── Indexer ops（内嵌于 MLA MoE 层 / V4 CSA 层，非独立层）:
+│   执行顺序（数据依赖顺序）：
+│   1. idx_wq_b      (q_lora_rank → ih × id_)
+│   2. idx_weights   (h → ih)
+│   3. idx_comp_wkv  (h → coff × id_)
+│   4. idx_comp_wgate(h → coff × id_)
+│   5. idx_comp_pool (压缩 → kv_len = seq // 4)
+│   6. idx_score_topk(einsum scoring → top-k indices)
 │
-└── MTP Layers (if mtp_depth > 0):
-    └── mtp_embed_proj, mtp_attn, mtp_ffn
+└── Global tail (layer_id = -1):
+    ├── [mhc_head]   ← 仅 hc_mult > 1
+    ├── final_ln (RMSNorm)
+    └── lm_head (matmul: hidden → vocab)
 ```
 
 ### 5.3 并行切分与通信插入 (`ir/shard.py`)
@@ -740,8 +769,12 @@ classDiagram
         +float dx_bytes
         +float dw_bytes
         +string bound
-        +float cube_flops
-        +float vector_flops
+        +float fwd_cube_flops
+        +float fwd_vector_flops
+        +float dx_cube_flops
+        +float dx_vector_flops
+        +float dw_cube_flops
+        +float dw_vector_flops
     }
 
     class StageTime {
@@ -836,9 +869,10 @@ classDiagram
 | # | 文件 | 问题 | 状态 |
 |---|------|------|------|
 | 1 | `schedules.py:_compute_optimizer_time()` | 忽略 EP sharding — MoE 模型 optimizer FLOPs 高估 | 未修复 |
-| 2 | `flops.py:_indexer_topk_cost()` | `kv_len = seq//4` 应为 `seq` — FLOPs 低估 4× | 未修复 |
+| 2 | `builders.py:_build_indexer_ops()` + `flops.py:_indexer_topk_cost()` | V3.2 MLA 路径的 `kv_len = seq//4` intent 不一致：builder 传 `seq//4`，但 `flops.py` 注释说 V3.2 应为 full `seq`。V4-CSA 的 `seq//4` 是正确的（Indexer 压缩后 KV）。需确认 V3.2 scoring 是否在压缩后空间进行。 | 待验证 |
 | 3 | `flops.py:_indexer_topk_cost()` | `dx_flops=2×fwd` 只计 idx_q 梯度，缺 idx_kv | 待验证 |
-| 4 | `schedules.py:tokens_per_sec` | 分母用 `step_time`（含 optimizer）→ 略低估 | 已修复 → `pipeline_time` |
+| 4 | `builders.py:_build_v4_attn()` | Tensor 名称断裂：`kv_norm` 输出 `kv_normed` 但 `attn_core` 输入用 `k_all`/`v_all`；`q_rsqrt_norm` 输出 `q_norm2` 但 `attn_core` 输入用 `q_final`。当前 FLOPs 估算不受影响，但 IR DAG 不合法。 | 未修复 |
+| 5 | `schedules.py:tokens_per_sec` | 分母用 `step_time`（含 optimizer）→ 略低估 | 已修复 → `pipeline_time` |
 
 ## 12. CLI 使用方式
 

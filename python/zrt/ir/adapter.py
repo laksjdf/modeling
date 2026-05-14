@@ -155,53 +155,47 @@ def records_to_opgraph(
         )
         graph.add_node(node)
 
-    # ── Pass 2: build tensor_id → (producer_node_id, output_slot) map ────────
+    # ── Pass 2: single-pass walk in capture order — for each record, wire its
+    # inputs to whoever last produced the tensor_id, then update the producer
+    # map with its outputs.  This is necessary for correctness with:
+    #   * in-place ops (copy_/add_/mul_/div_) whose output reuses an input
+    #     tensor_id — subsequent readers must depend on the mutator, not the
+    #     pre-mutation producer.
+    #   * tensor-id recycling from Python `id()` reuse after GC — the latest
+    #     writer is the right producer to attach.
+    # The legacy `producer_idx > consumer_idx` filter is obsolete here because
+    # walking in capture order naturally keeps edges going forward in time.
     tensor_producer: dict[int, tuple[str, int]] = {}
-    for rec in records:
-        node_id = f"op_{rec['node_id']}"
-        for slot, tid in enumerate(rec.get("_output_ids", [])):
-            if tid not in tensor_producer:
-                tensor_producer[tid] = (node_id, slot)
-
-    # ── Pass 3: create data-flow edges ────────────────────────────────────────
-    seen_pairs: dict[tuple[str, str], int] = {}   # (src, dst) → edge count
 
     for rec in records:
         consumer_id = f"op_{rec['node_id']}"
-        consumer_idx = int(consumer_id.split("_")[1])
+
         for dst_idx, tid in enumerate(rec.get("_input_ids", [])):
-            if tid not in tensor_producer:
+            producer = tensor_producer.get(tid)
+            if producer is None:
                 continue
-            producer_id, src_idx = tensor_producer[tid]
+            producer_id, src_idx = producer
             if producer_id == consumer_id:
-                continue  # skip self-loops
+                continue  # self-loop (in-place op reading its own tensor)
 
-            # Skip backward edges (where producer comes after consumer in execution order)
-            # This handles KV cache aliasing in decode phase where tensors produced late
-            # should not feed back to earlier layers
-            producer_idx = int(producer_id.split("_")[1])
-            if producer_idx > consumer_idx:
-                logger.debug(
-                    "Skipping backward edge: %s (op %d) -> %s (op %d) for tensor %d",
-                    producer_id, producer_idx, consumer_id, consumer_idx, tid
-                )
-                continue
-
-            # Look up the TensorMeta we built in pass 1
             producer_node = graph.nodes.get(producer_id)
             tensor: TensorMeta | None = None
             if producer_node and src_idx < len(producer_node.outputs):
                 tensor = producer_node.outputs[src_idx]
 
-            edge = Edge(
+            graph.add_edge(Edge(
                 src=producer_id,
                 src_idx=src_idx,
                 dst=consumer_id,
                 dst_idx=dst_idx,
                 tensor=tensor,
                 tensor_id=tid,
-            )
-            graph.add_edge(edge)
+            ))
+
+        # Record this op as the latest producer for each of its output tensors.
+        # Overwriting handles in-place mutations and tensor-id recycling.
+        for slot, tid in enumerate(rec.get("_output_ids", [])):
+            tensor_producer[tid] = (consumer_id, slot)
 
     logger.debug(
         "records_to_opgraph: %d nodes, %d edges (phase=%s)",
@@ -304,32 +298,17 @@ def fused_records_to_opgraph(
         )
         graph.add_node(node)
 
-    # ── Pass 2: build tensor_id → producer fused-node map ────────────────────
+    # ── Pass 2: single-pass walk — wire consumer inputs to most recent
+    # producer, then update producer map with this record's outputs.  Mirrors
+    # the raw-record path so in-place / id-recycling cases stay consistent.
     tensor_producer: dict[int, str] = {}
-    for frec, (ext_in, ext_out) in zip(fused_records, io_list):
-        node_id = f"fused_{frec['node_id']}"
-        for tid in ext_out:
-            if tid not in tensor_producer:
-                tensor_producer[tid] = node_id
 
-    # ── Pass 3: create data-flow edges ────────────────────────────────────────
     for frec, (ext_in, ext_out) in zip(fused_records, io_list):
         consumer_id = f"fused_{frec['node_id']}"
-        consumer_idx = int(consumer_id.split("_")[1])
-        for dst_idx, tid in enumerate(sorted(ext_in)):
-            if tid not in tensor_producer:
-                continue
-            producer_id = tensor_producer[tid]
-            if producer_id == consumer_id:
-                continue
 
-            # Skip backward edges in fused graphs too
-            producer_idx = int(producer_id.split("_")[1])
-            if producer_idx > consumer_idx:
-                logger.debug(
-                    "Skipping backward edge in fused graph: %s (op %d) -> %s (op %d) for tensor %d",
-                    producer_id, producer_idx, consumer_id, consumer_idx, tid
-                )
+        for dst_idx, tid in enumerate(sorted(ext_in)):
+            producer_id = tensor_producer.get(tid)
+            if producer_id is None or producer_id == consumer_id:
                 continue
 
             producer_node = graph.nodes.get(producer_id)
@@ -354,6 +333,9 @@ def fused_records_to_opgraph(
                 tensor_id=tid,
             )
             graph.add_edge(edge)
+
+        for tid in ext_out:
+            tensor_producer[tid] = consumer_id
 
     logger.debug(
         "fused_records_to_opgraph: %d nodes, %d edges (phase=%s)",

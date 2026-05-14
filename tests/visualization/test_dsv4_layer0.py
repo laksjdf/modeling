@@ -36,7 +36,7 @@ if str(_REPO) not in sys.path:
 torch = pytest.importorskip("torch")
 
 from python.zrt.graph import run_trace_phases
-from python.zrt.graph.main import _make_model_slug
+from python.zrt.pipeline import _make_model_slug
 from python.zrt.transform.context import (
     FusionConfig,
     ParallelConfig,
@@ -93,6 +93,42 @@ def _check_replace_subgraph_invariants(raw_graph, fused_graph, summary: list[str
     )
 
 
+def _check_raw_graph_no_orphan_consumers(
+    raw_graph, raw_records: list[dict], summary: list[str]
+) -> None:
+    """Every input tensor whose id has *already been produced earlier in
+    capture order* must have a corresponding inbound edge on the consumer.
+
+    Tensors only produced later (Python ``id()`` recycling after GC) or
+    never produced (model weights, input_ids) are correctly external — no
+    edge expected.  Anything else is dropped dataflow.
+    """
+    incoming_tids: dict[str, set[int]] = {nid: set() for nid in raw_graph.nodes}
+    for e in raw_graph.edges:
+        incoming_tids[e.dst].add(e.tensor_id)
+
+    produced_so_far: set[int] = set()
+    orphans: list[tuple[str, int, str]] = []
+    for r in raw_records:
+        consumer_id = f"op_{r['node_id']}"
+        in_set = incoming_tids.get(consumer_id, set())
+        for tid in r.get("_input_ids", []):
+            if tid in produced_so_far and tid not in in_set:
+                orphans.append((consumer_id, tid, r["aten_op"]))
+        for tid in r.get("_output_ids", []):
+            produced_so_far.add(tid)
+
+    summary.append(
+        f"  raw-graph dataflow continuity: {len(orphans)} orphan inputs "
+        f"({len(produced_so_far)} unique produced tensor ids, "
+        f"{len(raw_graph.edges)} edges)"
+    )
+    assert not orphans, (
+        f"records_to_opgraph dropped {len(orphans)} edges — first 5: "
+        f"{orphans[:5]}"
+    )
+
+
 def _check_data_flow_preserved(raw_graph, fused_graph, summary: list[str]) -> None:
     """For each fused node verify external IO matches the original graph.
 
@@ -142,7 +178,8 @@ def _check_data_flow_preserved(raw_graph, fused_graph, summary: list[str]) -> No
 
 
 def _capture_raw_graph():
-    """Run ``run_trace_phases`` against DSV4 layer 0 and return the OpGraph."""
+    """Run ``run_trace_phases`` against DSV4 layer 0 and return the
+    ``(graph, records)`` pair."""
     result = run_trace_phases(
         model_id=_MODEL_ID,
         num_layers=2,                 # need at least 2 to have layer 0 + epilogue
@@ -156,7 +193,7 @@ def _capture_raw_graph():
         graph_mode=False,
         gradient_checkpointing=False,
     )
-    return result.graphs["train_forward"]
+    return result.graphs["train_forward"], result.phase_records["train_forward"]
 
 
 def _capture_model_for_tree() -> object:
@@ -216,7 +253,7 @@ def test_dsv4_layer0_visualization():
     # and exits cleanly.  Loading the model a second time afterwards (for
     # the tree render) avoids the "Mixing fake modes NYI" collision that
     # happens when two FakeTensorModes are alive simultaneously.
-    raw_graph = _capture_raw_graph()
+    raw_graph, raw_records = _capture_raw_graph()
     raw_stats = assert_dag(raw_graph)
     assert raw_stats["dangling_edges"] == 0, raw_stats
     assert raw_stats["self_loops"] == 0, raw_stats
@@ -293,6 +330,7 @@ def test_dsv4_layer0_visualization():
     summary = _summary_lines(raw_graph, fused_graph, _make_model_slug(_MODEL_ID))
     summary.append("")
     summary.append("## Invariants")
+    _check_raw_graph_no_orphan_consumers(raw_graph, raw_records, summary)
     _check_replace_subgraph_invariants(raw_graph, fused_graph, summary)
     _check_data_flow_preserved(raw_graph, fused_graph, summary)
 

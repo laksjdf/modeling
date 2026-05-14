@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from zrt.training.spec.model import ModelSpec
+from zrt.training.spec.model import LayerKind, ModelSpec
 from zrt.training.spec.strategy import CPKind, Strategy
 from zrt.training.spec.system import SystemSpec
 
@@ -116,6 +116,14 @@ def validate(model: ModelSpec, system: SystemSpec, strategy: Strategy) -> list[s
         warnings.append(
             f"EP ({strategy.ep}) > gpus_per_node ({system.gpus_per_node}); "
             f"EP A2A will cross node boundaries (inter-node bandwidth)"
+        )
+
+    has_moe_layers = any(lk == LayerKind.MOE for lk in model.layers)
+    if has_moe_layers and model.n_shared_experts > 0 and model.moe_ffn == 0:
+        warnings.append(
+            f"moe_ffn=0 but n_shared_experts={model.n_shared_experts}>0 with MOE layers: "
+            "shared expert SwiGLU will have zero FLOPs and zero latency. "
+            "Set moe_ffn to the per-expert FFN hidden size."
         )
 
     if strategy.ep > 1 and strategy.dp % strategy.ep != 0:

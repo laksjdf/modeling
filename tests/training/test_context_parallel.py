@@ -128,6 +128,7 @@ class TestUlyssesCP:
                 assert n.attrs["message_size_bytes"] == expected_bytes, (
                     f"Expected {expected_bytes}, got {n.attrs['message_size_bytes']}"
                 )
+                assert n.attrs["msg_bytes"] == expected_bytes
 
     def test_ulysses_group_size(self):
         graph = _make_attn_graph()
@@ -193,6 +194,7 @@ class TestRingCP:
                      if n.op_type == "comm.send_recv" and n.attrs.get("role") == "cp_ring"]
         for p2p in p2p_nodes:
             assert p2p.attrs["message_size_bytes"] == expected_bytes
+            assert p2p.attrs["msg_bytes"] == expected_bytes
 
     def test_ring_overlap_target_format(self):
         graph = _make_attn_graph()
@@ -231,6 +233,42 @@ class TestRingCP:
             assert isinstance(p2p.attrs["round"], int)
             assert "scope" in p2p.attrs
             assert "layer" in p2p.attrs
+
+
+class TestHybridAndCompressedCP:
+    """Tests for graph-native CP annotations that must be consumed by comm insertion."""
+
+    def test_hybrid_inserts_ulysses_a2a_and_ring_p2p(self):
+        graph = _make_attn_graph(num_layers=1)
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=1, cp=4),
+            training=TrainingConfig(micro_batch=1, global_batch=8, cp_kind="hybrid"),
+        )
+
+        g = ContextParallelPass().run(graph, ctx)
+        g = CommInserterPass().run(g, ctx)
+
+        roles = [n.attrs.get("role") for n in g.nodes.values()]
+        assert "cp_hybrid_ulysses_pre" in roles
+        assert "cp_hybrid_ulysses_post" in roles
+        # The graph fixture marks qkv/attention/o_proj scopes as attention-like.
+        assert roles.count("cp_hybrid_ring") == 3 * 4
+
+    def test_compressed_inserts_stage1_p2p_and_stage2_allgather(self):
+        graph = _make_attn_graph(num_layers=1)
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=1, cp=4),
+            training=TrainingConfig(micro_batch=1, global_batch=8, cp_kind="compressed"),
+        )
+
+        g = ContextParallelPass().run(graph, ctx)
+        g = CommInserterPass().run(g, ctx)
+
+        roles = {n.attrs.get("role") for n in g.nodes.values()}
+        assert "cp_compressed_stage1" in roles
+        assert "cp_compressed_stage2" in roles
 
 
 class TestCPSkip:

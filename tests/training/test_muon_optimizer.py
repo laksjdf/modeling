@@ -319,6 +319,168 @@ class TestMuonConfig:
         assert config.ns_steps == 10
 
 
+class TestComputeOptimizerTimeSharding:
+    """_compute_optimizer_time must apply EP and ZeRO-1/2 DP sharding.
+
+    Root cause of "Muon optimizer time abnormally high":
+      _compute_optimizer_time() uses model.total_params() without applying
+      EP sharding (Bug #1) or ZeRO-1/2 DP sharding (Bug #2).  Since Muon
+      FLOPs scale as O(P × hidden) rather than O(P), overestimating P
+      causes the optimizer term to dominate the step_time estimate entirely.
+    """
+
+    def test_ep64_muon_optimizer_time_is_much_less_than_ep1(self):
+        """EP=64 should give ~9× less Muon optimizer time than EP=1 (experts dominate).
+
+        With EP=1:  optimizer FLOPs use ALL expert params (64 experts per GPU).
+        With EP=64: each GPU holds 1/64 of experts → P much smaller → time much less.
+
+        Fails with current code: EP is never applied → EP=64 returns same time as EP=1.
+        """
+        model = _make_moe_model()
+        system = _make_mock_system()
+
+        strategy_ep1 = Strategy(
+            tp=1, pp=1, ep=1, dp=1, micro_batch=1, global_batch=1,
+            optimizer=OptKind.MUON, zero_stage=0,
+        )
+        strategy_ep64 = Strategy(
+            tp=1, pp=1, ep=64, dp=1, micro_batch=1, global_batch=1,
+            optimizer=OptKind.MUON, zero_stage=0,
+        )
+
+        from zrt.training.compose.schedules import _compute_optimizer_time
+        time_ep1 = _compute_optimizer_time(model, system, strategy_ep1)
+        time_ep64 = _compute_optimizer_time(model, system, strategy_ep64)
+
+        # Expert params are ~91% of total.  With EP=64:
+        #   effective P = non_expert(9%) + expert(91%)/64 ≈ 10.4% of EP=1 total.
+        # Allow generous 20% threshold — actual ratio should be ~10%.
+        assert time_ep64 < time_ep1 * 0.20, (
+            f"EP=64 Muon time ({time_ep64:.4f}s) should be <<  EP=1 ({time_ep1:.4f}s). "
+            f"Missing EP sharding in _compute_optimizer_time causes overestimate."
+        )
+
+    def test_ep64_adam_optimizer_time_is_much_less_than_ep1(self):
+        """EP sharding bug affects Adam too — same missing EP division applies."""
+        model = _make_moe_model()
+        system = _make_mock_system()
+
+        strategy_ep1 = Strategy(
+            tp=1, pp=1, ep=1, dp=1, micro_batch=1, global_batch=1,
+            optimizer=OptKind.ADAM, zero_stage=0,
+        )
+        strategy_ep64 = Strategy(
+            tp=1, pp=1, ep=64, dp=1, micro_batch=1, global_batch=1,
+            optimizer=OptKind.ADAM, zero_stage=0,
+        )
+
+        from zrt.training.compose.schedules import _compute_optimizer_time
+        time_ep1 = _compute_optimizer_time(model, system, strategy_ep1)
+        time_ep64 = _compute_optimizer_time(model, system, strategy_ep64)
+
+        assert time_ep64 < time_ep1 * 0.20, (
+            f"EP=64 Adam time ({time_ep64:.4f}s) should be << EP=1 ({time_ep1:.4f}s). "
+            f"EP sharding must be applied for both Muon and Adam."
+        )
+
+    def test_zero1_dp8_reduces_muon_optimizer_time(self):
+        """ZeRO-1 with DP=8 should reduce optimizer time ~8× vs ZeRO-0.
+
+        ZeRO-1 shards optimizer states: each GPU only updates P/DP parameters.
+        Current code checks `zero_stage >= 3`, so ZeRO-1/2 are not applied.
+
+        Fails with current code: ZeRO-1 returns same time as ZeRO-0.
+        """
+        model = _make_mock_model()
+        system = _make_mock_system()
+
+        strategy_zero0 = Strategy(
+            tp=1, pp=1, dp=8, micro_batch=1, global_batch=8,
+            optimizer=OptKind.MUON, zero_stage=0,
+        )
+        strategy_zero1 = Strategy(
+            tp=1, pp=1, dp=8, micro_batch=1, global_batch=8,
+            optimizer=OptKind.MUON, zero_stage=1,
+        )
+
+        from zrt.training.compose.schedules import _compute_optimizer_time
+        time_zero0 = _compute_optimizer_time(model, system, strategy_zero0)
+        time_zero1 = _compute_optimizer_time(model, system, strategy_zero1)
+
+        # ZeRO-1, DP=8 → P/8 → time/8.  Assert at least 4× reduction.
+        assert time_zero1 < time_zero0 / 4, (
+            f"ZeRO-1 DP=8 Muon time ({time_zero1:.6f}s) should be ~8× less than "
+            f"ZeRO-0 ({time_zero0:.6f}s). Fix: change `zero_stage >= 3` to `>= 1`."
+        )
+
+    def test_zero2_same_reduction_as_zero1(self):
+        """ZeRO-2 should give identical optimizer time reduction as ZeRO-1.
+
+        Both shard optimizer states across DP; neither needs special handling.
+        """
+        model = _make_mock_model()
+        system = _make_mock_system()
+
+        strategy_zero1 = Strategy(
+            tp=1, pp=1, dp=8, micro_batch=1, global_batch=8,
+            optimizer=OptKind.MUON, zero_stage=1,
+        )
+        strategy_zero2 = Strategy(
+            tp=1, pp=1, dp=8, micro_batch=1, global_batch=8,
+            optimizer=OptKind.MUON, zero_stage=2,
+        )
+
+        from zrt.training.compose.schedules import _compute_optimizer_time
+        time_zero1 = _compute_optimizer_time(model, system, strategy_zero1)
+        time_zero2 = _compute_optimizer_time(model, system, strategy_zero2)
+
+        assert time_zero1 == time_zero2, (
+            f"ZeRO-1 ({time_zero1:.6f}s) and ZeRO-2 ({time_zero2:.6f}s) should match."
+        )
+
+    def test_ep_sharding_factor_is_correct(self):
+        """The EP-sharded optimizer time should be approximately 1/EP of the EP=1 time.
+
+        For a model where MoE expert params dominate, the reduction should be close
+        to 1/EP (ignoring the small non-expert fraction).
+        """
+        model = _make_moe_model()
+        system = _make_mock_system()
+
+        strategy_ep1 = Strategy(
+            tp=1, pp=1, ep=1, dp=1, micro_batch=1, global_batch=1,
+            optimizer=OptKind.MUON, zero_stage=0,
+        )
+        strategy_ep8 = Strategy(
+            tp=1, pp=1, ep=8, dp=1, micro_batch=1, global_batch=1,
+            optimizer=OptKind.MUON, zero_stage=0,
+        )
+
+        from zrt.training.compose.schedules import _compute_optimizer_time
+        time_ep1 = _compute_optimizer_time(model, system, strategy_ep1)
+        time_ep8 = _compute_optimizer_time(model, system, strategy_ep8)
+
+        # Expected: ~(9% + 91%/8) / 100% = ~20.4% of EP=1.
+        # Assert: between 10% and 35% of EP=1.
+        ratio = time_ep8 / time_ep1
+        assert 0.10 < ratio < 0.35, (
+            f"EP=8 time ratio {ratio:.3f} should be in [0.10, 0.35] "
+            f"(EP=1: {time_ep1:.4f}s, EP=8: {time_ep8:.4f}s)."
+        )
+
+
+def _make_moe_model(num_experts: int = 64) -> ModelSpec:
+    """MoE ModelSpec where expert params (~91% of total) dominate."""
+    return ModelSpec(
+        hidden=1024, ffn=4096, num_heads=8, num_kv_heads=8,
+        head_dim=128, vocab=32000, seq_len=2048,
+        layers=[LayerKind.MOE] * 4,
+        num_experts=num_experts, moe_ffn=1024, top_k=2,
+        n_shared_experts=0,
+    )
+
+
 def _make_mock_model() -> ModelSpec:
     """Create a mock ModelSpec for testing."""
     return ModelSpec(

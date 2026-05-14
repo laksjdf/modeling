@@ -68,7 +68,9 @@ def main() -> None:
     parser.add_argument(
         "--output",
         metavar="FILE",
-        help="Write result to FILE. For --estimate-config: .xlsx for Excel, .html for interactive graph view, .json for JSON. For --search-config: writes Pareto frontier JSON.",
+        help="Write output files. If omitted: writes both .xlsx and .html to output/estimate/<config>_<timestamp>. "
+             "If a directory or filename without extension is given: writes both .xlsx and .html to that location. "
+             "If a filename with .xlsx/.html extension is given: writes both .xlsx and .html to the same directory with the same base name.",
     )
 
     # ── Model ─────────────────────────────────────────────────────────────────
@@ -167,6 +169,11 @@ def main() -> None:
     parser.add_argument(
         "--cp", type=int, default=1,
         help="Context-parallel degree (default: 1).",
+    )
+    parser.add_argument(
+        "--cp-kind", default="ulysses",
+        choices=["ulysses", "ring", "hybrid", "compressed", "none"],
+        help="Context-parallel strategy for graph-native training modelling.",
     )
     parser.add_argument(
         "--quant", default=None,
@@ -586,6 +593,7 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
         ep=args.ep,
         dp=args.dp,
         cp=args.cp,
+        cp_kind=getattr(args, "cp_kind", "ulysses"),
         zero_stage=args.zero_stage,
         optimizer=args.optimizer,
         muon_rotation=args.muon_rotation,
@@ -669,6 +677,8 @@ def _run_estimate(config_path: str, output_path: str | None, *, breakdown: bool 
     from python.zrt.training.search.report import report_summary, report_to_json
     from python.zrt.training.ir.builders import build_graph
     from python.zrt.training.models.flops import op_cost as _op_cost, total_training_flops
+    from python.zrt.training.io.excel_exporter import export_estimate_excel
+    from python.zrt.training.io.html_exporter import export_estimate_html
 
     try:
         model, system, strategy = load_specs(config_path)
@@ -680,47 +690,65 @@ def _run_estimate(config_path: str, output_path: str | None, *, breakdown: bool 
     graph = build_graph(model, strategy)
     op_costs: dict[str, object] = {}
     for op in graph.ops:
-        op_costs[op.name] = _op_cost(op, model)
+        op_costs[op.name] = _op_cost(op, model, system)
 
     report = estimate(model, system, strategy, graph=graph)
 
     if output_path:
-        # If output ends with .xlsx/.xls → Excel, .html → HTML, otherwise JSON
-        if output_path.endswith((".xlsx", ".xls")):
-            from python.zrt.training.io.excel_exporter import export_estimate_excel
-            export_estimate_excel(
-                report=report, graph=graph, model=model,
-                system=system, strategy=strategy,
-                op_costs=op_costs, output_path=output_path,
-            )
-            print(f"Excel report written to {output_path}")
-        elif output_path.endswith(".html"):
-            from python.zrt.training.io.html_exporter import export_estimate_html
-            export_estimate_html(
-                report=report, graph=graph, model=model,
-                system=system, strategy=strategy,
-                op_costs=op_costs, output_path=output_path,
-            )
-            print(f"HTML report written to {output_path}")
+        # If output_path is a directory or ends with a filename without extension,
+        # use it as the base directory/name. If it ends with .xlsx/.html/.json,
+        # extract the directory and base name, then output both Excel and HTML there.
+        from pathlib import Path as _Path
+        p = _Path(output_path)
+        if p.suffix.lower() in (".xlsx", ".xls", ".html", ".json"):
+            base_dir = p.parent
+            base_name = p.stem
+        elif output_path.endswith("/") or p.is_dir():
+            base_dir = p
+            _slug = config_path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+            base_name = _slug
         else:
-            report_to_json(report, output_path)
-            print(f"Report written to {output_path}")
+            base_dir = p.parent if p.parent.name else _Path(".")
+            base_name = p.name
+
+        excel_path = str(base_dir / f"{base_name}.xlsx")
+        html_path = str(base_dir / f"{base_name}.html")
+
+        export_estimate_excel(
+            report=report, graph=graph, model=model,
+            system=system, strategy=strategy,
+            op_costs=op_costs, output_path=excel_path,
+        )
+        print(f"Excel report written to {excel_path}")
+
+        export_estimate_html(
+            report=report, graph=graph, model=model,
+            system=system, strategy=strategy,
+            op_costs=op_costs, output_path=html_path,
+        )
+        print(f"HTML report written to {html_path}")
+
         if breakdown:
             print()
             print(report_summary(report))
     else:
-        # Default: write Excel to output/estimate with timestamp
+        # Default: write both Excel and HTML to output/estimate with timestamp
         from datetime import datetime
-        from python.zrt.training.io.excel_exporter import export_estimate_excel
         _slug = config_path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
         _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        _default_path = Path("output") / "estimate" / f"{_slug}_{_ts}.xlsx"
+        _default_base = Path("output") / "estimate" / f"{_slug}_{_ts}"
         export_estimate_excel(
             report=report, graph=graph, model=model,
             system=system, strategy=strategy,
-            op_costs=op_costs, output_path=_default_path,
+            op_costs=op_costs, output_path=f"{_default_base}.xlsx",
         )
-        print(f"Excel report written to {_default_path}")
+        export_estimate_html(
+            report=report, graph=graph, model=model,
+            system=system, strategy=strategy,
+            op_costs=op_costs, output_path=f"{_default_base}.html",
+        )
+        print(f"Excel report written to {_default_base}.xlsx")
+        print(f"HTML report written to {_default_base}.html")
         print()
         print(report_summary(report))
 

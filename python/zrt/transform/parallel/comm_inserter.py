@@ -234,10 +234,11 @@ class CommInserterPass(GraphPass):
             cp_split = node.annotations.get("cp_split", {})
             cp_kind = cp_split.get("kind", "none")
 
-            if cp_kind == "ulysses":
+            if cp_kind in ("ulysses", "hybrid"):
                 # Ulysses: A2A scatter-seq/gather-heads BEFORE attn; inverse A2A AFTER
                 pre_comm_id = f"comm_a2a_cp_pre_{node.id}"
                 post_comm_id = f"comm_a2a_cp_post_{node.id}"
+                role_prefix = "cp_ulysses" if cp_kind == "ulysses" else "cp_hybrid_ulysses"
 
                 if pre_comm_id not in g.nodes:
                     pre_comm = OpNode(
@@ -246,8 +247,9 @@ class CommInserterPass(GraphPass):
                         inputs=copy.deepcopy(node.inputs),
                         outputs=copy.deepcopy(node.inputs),
                         attrs={"group_size": cp, "collective": "all_to_all",
-                               "role": "cp_ulysses_pre",
-                               "message_size_bytes": ulysses_msg_bytes},
+                               "role": f"{role_prefix}_pre",
+                               "message_size_bytes": ulysses_msg_bytes,
+                               "msg_bytes": ulysses_msg_bytes},
                         scope=node.scope,
                         layer=node.layer,
                         category="communication",
@@ -263,8 +265,9 @@ class CommInserterPass(GraphPass):
                         inputs=copy.deepcopy(node.outputs),
                         outputs=copy.deepcopy(node.outputs),
                         attrs={"group_size": cp, "collective": "all_to_all",
-                               "role": "cp_ulysses_post",
-                               "message_size_bytes": ulysses_msg_bytes},
+                               "role": f"{role_prefix}_post",
+                               "message_size_bytes": ulysses_msg_bytes,
+                               "msg_bytes": ulysses_msg_bytes},
                         scope=node.scope,
                         layer=node.layer,
                         category="communication",
@@ -272,10 +275,11 @@ class CommInserterPass(GraphPass):
                     post_comm.annotations["inserted_by"] = "cp_pass"
                     _rewire(g, node.id, post_comm)
 
-            elif cp_kind == "ring":
+            if cp_kind in ("ring", "hybrid"):
                 p2p_rounds = cp_split.get("p2p_rounds", cp)
                 for i in range(p2p_rounds):
-                    p2p_id = f"comm_p2p_cp_ring_{node.id}_round_{i}"
+                    p2p_prefix = "ring" if cp_kind == "ring" else "hybrid_ring"
+                    p2p_id = f"comm_p2p_cp_{p2p_prefix}_{node.id}_round_{i}"
                     if p2p_id not in g.nodes:
                         p2p_comm = OpNode(
                             id=p2p_id,
@@ -283,8 +287,9 @@ class CommInserterPass(GraphPass):
                             inputs=copy.deepcopy(node.inputs),
                             outputs=copy.deepcopy(node.inputs),
                             attrs={"group_size": cp, "collective": "send_recv",
-                                   "role": "cp_ring", "round": i,
+                                   "role": f"cp_{p2p_prefix}", "round": i,
                                    "message_size_bytes": ring_msg_bytes,
+                                   "msg_bytes": ring_msg_bytes,
                                    "cp_rounds": p2p_rounds,
                                    "scope": node.scope, "layer": node.layer},
                             scope=node.scope,
@@ -295,6 +300,47 @@ class CommInserterPass(GraphPass):
                         p2p_comm.annotations["overlap_target"] = f"fa_tile:{node.id}"
                         g.nodes[p2p_comm.id] = p2p_comm
                         _prepend_comm(g, node.id, p2p_comm)
+
+            if cp_kind == "compressed":
+                stage1_id = f"comm_p2p_cp_compressed_stage1_{node.id}"
+                stage2_id = f"comm_ag_cp_compressed_stage2_{node.id}"
+                if stage1_id not in g.nodes:
+                    stage1 = OpNode(
+                        id=stage1_id,
+                        op_type="comm.send_recv",
+                        inputs=copy.deepcopy(node.inputs),
+                        outputs=copy.deepcopy(node.inputs),
+                        attrs={"group_size": cp, "collective": "send_recv",
+                               "role": "cp_compressed_stage1",
+                               "message_size_bytes": ring_msg_bytes,
+                               "msg_bytes": ring_msg_bytes,
+                               "scope": node.scope, "layer": node.layer},
+                        scope=node.scope,
+                        layer=node.layer,
+                        category="communication",
+                    )
+                    stage1.annotations["inserted_by"] = "cp_pass"
+                    stage1.annotations["overlap_target"] = f"fa_tile:{node.id}"
+                    g.nodes[stage1.id] = stage1
+                    _prepend_comm(g, node.id, stage1)
+
+                if stage2_id not in g.nodes:
+                    stage2 = OpNode(
+                        id=stage2_id,
+                        op_type="comm.all_gather",
+                        inputs=copy.deepcopy(node.inputs),
+                        outputs=copy.deepcopy(node.inputs),
+                        attrs={"group_size": cp, "collective": "all_gather",
+                               "role": "cp_compressed_stage2",
+                               "message_size_bytes": ulysses_msg_bytes,
+                               "msg_bytes": ulysses_msg_bytes},
+                        scope=node.scope,
+                        layer=node.layer,
+                        category="communication",
+                    )
+                    stage2.annotations["inserted_by"] = "cp_pass"
+                    g.nodes[stage2.id] = stage2
+                    _prepend_comm(g, node.id, stage2)
 
 
 def _moe_scope_root(scope: str) -> str:

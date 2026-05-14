@@ -109,6 +109,7 @@ def _parse_compute(c: dict[str, Any]) -> ComputeSpec:
         cube_bf16_tflops=float(cube_raw) if cube_raw is not None else None,
         vector_bf16_tflops=float(vector_raw) if vector_raw is not None else None,
         overlap_ratio={k: float(v) for k, v in overlap_raw.items()},
+        sram_kb_per_sm=float(c.get("sram_kb_per_sm", 0.0)),
     )
 
 

@@ -119,24 +119,12 @@ def _cost_phase_time(
     cost: OpCost, phase: str, system: SystemSpec,
     gpu_name: str, overlap: float = 0.0,
 ) -> float:
-    """Compute time for one phase (fwd/dx/dw), dispatching to heterogeneous path when available.
-
-    Falls back to the unified peak roofline when cube_flops and vector_flops
-    are both zero — meaning the op doesn't have heterogeneous modeling and
-    should use the legacy single-peak path instead of treating compute as zero.
-    """
-    if has_heterogeneous_compute(system):
-        cube = getattr(cost, f"{phase}_cube_flops")
-        vector = getattr(cost, f"{phase}_vector_flops")
-        # If neither cube nor vector FLOPs are set, this op doesn't have
-        # heterogeneous modeling — fall back to the unified flops path.
-        if cube > 0 or vector > 0:
-            bytes_ = getattr(cost, f"{phase}_bytes")
-            return op_to_time_hetero(cube, vector, bytes_, system, gpu_name,
-                                     overlap_ratio=overlap)
-    flops = getattr(cost, f"{phase}_flops")
+    """Compute time for one phase (fwd/dx/dw) using heterogeneous roofline."""
+    cube = getattr(cost, f"{phase}_cube_flops")
+    vector = getattr(cost, f"{phase}_vector_flops")
     bytes_ = getattr(cost, f"{phase}_bytes")
-    return op_to_time(flops, bytes_, system, gpu_name)
+    return op_to_time_hetero(cube, vector, bytes_, system, gpu_name,
+                             overlap_ratio=overlap)
 
 
 def stage_time(
@@ -149,23 +137,17 @@ def stage_time(
     """Compute forward + backward time for one PP stage and one microbatch."""
     gpu_name = system.gpu.name
     gpu = system.gpu
-    hetero = has_heterogeneous_compute(system)
 
     t_fwd = 0.0
     t_bwd_dx = 0.0
     t_bwd_dw = 0.0
 
     for op in stage_ops:
-        cost = op_cost(op, model)
-        if hetero:
-            overlap = gpu.overlap_ratio.get(op.kind, 0.0)
-            fwd_t = _cost_phase_time(cost, "fwd", system, gpu_name, overlap)
-            dx_t  = _cost_phase_time(cost, "dx",  system, gpu_name, overlap)
-            dw_t  = _cost_phase_time(cost, "dw",  system, gpu_name, overlap)
-        else:
-            fwd_t = op_to_time(cost.fwd_flops, cost.fwd_bytes, system, gpu_name)
-            dx_t  = op_to_time(cost.dx_flops,  cost.dx_bytes,  system, gpu_name)
-            dw_t  = op_to_time(cost.dw_flops,  cost.dw_bytes,  system, gpu_name)
+        cost = op_cost(op, model, system)
+        overlap = gpu.overlap_ratio.get(op.kind, 0.0)
+        fwd_t = _cost_phase_time(cost, "fwd", system, gpu_name, overlap)
+        dx_t  = _cost_phase_time(cost, "dx",  system, gpu_name, overlap)
+        dw_t  = _cost_phase_time(cost, "dw",  system, gpu_name, overlap)
         t_fwd    += fwd_t
         t_bwd_dx += dx_t
         t_bwd_dw += dw_t
@@ -262,13 +244,9 @@ def stage_time(
         t_ep_gemm_bwd = 0.0
         for op in stage_ops:
             if op.kind == "matmul" and "routed_expert" in op.name:
-                cost = op_cost(op, model)
-                if hetero:
-                    dx_t = _cost_phase_time(cost, "dx", system, gpu_name, overlap)
-                    dw_t = _cost_phase_time(cost, "dw", system, gpu_name, overlap)
-                else:
-                    dx_t = op_to_time(cost.dx_flops, cost.dx_bytes, system, gpu_name)
-                    dw_t = op_to_time(cost.dw_flops, cost.dw_bytes, system, gpu_name)
+                cost = op_cost(op, model, system)
+                dx_t = _cost_phase_time(cost, "dx", system, gpu_name, overlap)
+                dw_t = _cost_phase_time(cost, "dw", system, gpu_name, overlap)
                 t_ep_gemm_bwd += dx_t + dw_t
         saved_bwd = _wave_overlap_saved(t_comm_ep_bwd, t_ep_gemm_bwd, K)
         saved_bwd = min(saved_bwd, t_comm_bwd)
@@ -308,8 +286,8 @@ def _recompute_time(
 
         op_cats = _op_recompute_categories(op)
         if "full" in cats or (op_cats & cats):
-            cost = op_cost(op, model)
-            overlap = system.gpu.overlap_ratio.get(op.kind, 0.0) if has_heterogeneous_compute(system) else 0.0
+            cost = op_cost(op, model, system)
+            overlap = system.gpu.overlap_ratio.get(op.kind, 0.0)
             t += _cost_phase_time(cost, "fwd", system, gpu_name, overlap)
 
     return t
@@ -328,8 +306,8 @@ def _ep_parallel_fraction(
     t_total = 0.0
     t_ep = 0.0
     for op in ops:
-        cost = op_cost(op, model)
-        if cost.fwd_flops > 0 or cost.fwd_bytes > 0:
+        cost = op_cost(op, model, system)
+        if cost.fwd_cube_flops > 0 or cost.fwd_vector_flops > 0 or cost.fwd_bytes > 0:
             t = _cost_phase_time(cost, "fwd", system, gpu_name,
                                  system.gpu.overlap_ratio.get(op.kind, 0.0))
         else:
@@ -401,7 +379,7 @@ def _ep_gemm_time(
     total = 0.0
     for op in ops:
         if op.kind == "matmul" and "routed_expert" in op.name:
-            cost = op_cost(op, model)
+            cost = op_cost(op, model, system)
             total += _cost_phase_time(cost, "fwd", system, gpu_name,
                                       system.gpu.overlap_ratio.get(op.kind, 0.0))
     return total

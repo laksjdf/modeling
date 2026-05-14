@@ -689,6 +689,8 @@ def _compute_optimizer_time(model: ModelSpec, system: SystemSpec, strategy: Stra
 
     Uses roofline model with achieved efficiency from perf_tables.
     """
+    from zrt.training.spec.model import LayerKind
+
     P = model.total_params()
     if strategy.tp > 1:
         P //= strategy.tp
@@ -698,7 +700,17 @@ def _compute_optimizer_time(model: ModelSpec, system: SystemSpec, strategy: Stra
         non_embed = P - embed
         non_embed = int(non_embed * (n_layers / strategy.pp) / n_layers)
         P = non_embed + embed // strategy.pp
-    if strategy.zero_stage >= 3:
+    # EP shards expert params across ep ranks: each GPU holds num_experts/ep experts.
+    if strategy.ep > 1:
+        n_moe = sum(1 for lk in model.layers if lk == LayerKind.MOE)
+        if n_moe > 0 and model.moe_ffn > 0:
+            expert_p_all = n_moe * 3 * model.hidden * model.moe_ffn * model.num_experts
+            # Scale expert params by the same PP fraction already applied to P
+            expert_p_stage = expert_p_all // strategy.pp if strategy.pp > 1 else expert_p_all
+            non_expert_p = max(0, P - expert_p_stage)
+            P = non_expert_p + expert_p_stage // strategy.ep
+    # ZeRO-1/2/3 all shard optimizer states across DP: each GPU updates P/dp params.
+    if strategy.zero_stage >= 1:
         P //= strategy.dp
 
     gpu = system.gpu
@@ -764,9 +776,7 @@ def compute_mfu(
     from zrt.training.models.flops import total_training_flops
 
     tokens = strategy.global_batch * model.seq_len if strategy.global_batch > 0 else strategy.micro_batch * strategy.dp * model.seq_len
-    actual_flops = total_training_flops(graph, model, strategy)
-
-    # Peak FLOP/s of single GPU (total_flops is per-GPU because the graph
+    actual_flops = total_training_flops(graph, model, strategy, system)
     # models sharded computation; cluster-wide FLOPs = per_gpu × world_size,
     # and cluster peak = per_gpu_peak × world_size — the world_size cancels).
     peak = system.gpu.flops_bf16 * 1e12
@@ -789,8 +799,10 @@ def compute_hfu(
     """
     from zrt.training.models.flops import total_training_flops, recompute_overhead_flops
 
-    actual_flops = total_training_flops(graph, model, strategy)
-    rc_overhead = recompute_overhead_flops(graph, model, strategy)
+    actual_flops = total_training_flops(graph, model, strategy, system)
+
+    # Peak FLOP/s of single GPU (total_flops is per-GPU because the graph
+    rc_overhead = recompute_overhead_flops(graph, model, strategy, system)
     peak = system.gpu.flops_bf16 * 1e12
 
     # Divide by PP (same rationale as compute_mfu)

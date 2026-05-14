@@ -106,16 +106,18 @@ class TestOpCostSplit:
         op = Op(name="qkv_proj", kind="matmul", inputs=[], outputs=[],
                 meta={"m": 4, "n": 4096, "k": 4096})
         cost = op_cost(op, self._mock_model())
-        assert cost.fwd_cube_flops == cost.fwd_flops
+        expected = 2 * 4 * 4096 * 4096
+        assert cost.fwd_cube_flops == expected
         assert cost.fwd_vector_flops == 0.0
-        assert cost.dx_cube_flops == cost.dx_flops
+        assert cost.dx_cube_flops == expected
         assert cost.dx_vector_flops == 0.0
 
     def test_lm_head_pure_cube(self):
         op = Op(name="lm_head", kind="lm_head", inputs=[], outputs=[],
                 meta={"m": 4, "n": 32000, "k": 4096})
         cost = op_cost(op, self._mock_model())
-        assert cost.fwd_cube_flops == cost.fwd_flops
+        expected = 2 * 4 * 32000 * 4096
+        assert cost.fwd_cube_flops == expected
         assert cost.fwd_vector_flops == 0.0
 
     def test_attn_core_explicit_split(self):
@@ -124,30 +126,33 @@ class TestOpCostSplit:
                 meta={"b": b, "s": s, "heads": h, "head_dim": d, "causal": True})
         cost = op_cost(op, self._mock_model())
 
-        expected_cube = 4 * b * s * s * h * d  # dense QK+AV (Cube core always does full matmul)
+        expected_fwd = 2 * b * s * s * h * d  # causal: 2*mult
+        expected_cube = expected_fwd  # FA-2-class kernels skip masked tiles
         expected_vector = 5 * b * h * s * s
 
         assert cost.fwd_cube_flops == expected_cube
         assert cost.fwd_vector_flops == expected_vector
-        assert cost.fwd_flops == 2 * b * s * s * h * d  # causal total for 6P accounting
         # dx uses 2.5x multiplier for both
         assert cost.dx_cube_flops == 2.5 * expected_cube
         assert cost.dx_vector_flops == 2.5 * expected_vector
 
     def test_elementwise_pure_vector(self):
-        op = Op(name="layernorm", kind="ln", inputs=[], outputs=[],
-                meta={"bytes_fwd": 8192})
+        from zrt.training.ir.training_graph import Tensor
+        from zrt.training.spec.dtype import Dtype
+        op = Op(name="layernorm", kind="ln", inputs=[], outputs=[
+            Tensor(name="out", shape_logical=(1, 128, 4096), shape_local=(1, 128, 4096),
+                   dtype=Dtype.BF16, is_activation=True),
+        ], meta={})
         cost = op_cost(op, self._mock_model())
         assert cost.fwd_cube_flops == 0.0
-        # fwd_vector_flops matches fwd_flops
-        assert cost.fwd_vector_flops == cost.fwd_flops
+        assert cost.fwd_vector_flops > 0
+        assert cost.dx_vector_flops > 0
 
     def test_unknown_op_pure_cube_fallback(self):
         op = Op(name="custom_op", kind="unknown_kind", inputs=[], outputs=[],
                 meta={})
         cost = op_cost(op, self._mock_model())
         # Unknown ops return OpCost() with all zeros
-        assert cost.fwd_flops == 0.0
         assert cost.fwd_cube_flops == 0.0
         assert cost.fwd_vector_flops == 0.0
 

@@ -19,6 +19,216 @@ if TYPE_CHECKING:
     from zrt.training.spec.report import TrainingReport
 
 
+def _fmt_shape(shape: tuple[int, ...]) -> str:
+    """Format shape tuple as string."""
+    if not shape:
+        return "()"
+    return "(" + ", ".join(str(d) for d in shape) + ")"
+
+
+def _fmt_tensor(t) -> str:
+    """Format a Tensor as 'name: shape dtype'."""
+    return f"{_fmt_shape(t.shape_local)} {t.dtype.value}"
+
+
+def _tensor_list_info(tensors: list, label: str = "") -> str:
+    """Format input/output tensor list."""
+    if not tensors:
+        return "-"
+    parts = []
+    for t in tensors:
+        flag = "W" if t.is_param else "A"  # Weight vs Activation
+        parts.append(f"[{flag}] {_fmt_tensor(t)}")
+    return " | ".join(parts)
+
+
+def _op_formula(op, cost):
+    """Return (fwd_formula, bwd_formula, fwd_bytes_formula, bwd_bytes_formula) for an op."""
+    m = op.meta
+    ff = _fwd_flops(cost)
+    df = _dx_flops(cost)
+    wf = _dw_flops(cost)
+
+    if op.kind == "matmul" or op.kind == "lm_head":
+        mm = m.get("m", 0)
+        nn = m.get("n_local", m.get("n", 0))
+        kk = m.get("k_local", m.get("k", 0))
+        mult = m.get("fwd_multiplier", 1.0)
+        bpe = _bpe_from_op(op)
+        fwd_val = ff
+        bytes_val = cost.fwd_bytes
+
+        if mult != 1.0:
+            fwd_str = f"2×m×n×k×{mult} = 2×{mm}×{nn}×{kk}×{mult} = {_fmt_e(fwd_val)}"
+        else:
+            fwd_str = f"2×m×n×k = 2×{mm}×{nn}×{kk} = {_fmt_e(fwd_val)}"
+        bwd_str = f"dx+dw = 2×fwd = {_fmt_e(df + wf)}"
+        bytes_str = f"(m×k+k×n+m×n)×bpe = ({mm}×{kk}+{kk}×{nn}+{mm}×{nn})×{bpe} = {_fmt_e(bytes_val)}"
+        return fwd_str, bwd_str, bytes_str, bytes_str
+
+    if op.kind in ("attn_core", "sparse_attn", "hca_attn", "swa_attn"):
+        b = m.get("b", 1)
+        s = m.get("s", 0)
+        h = m.get("heads", 0)
+        d = m.get("head_dim", 0)
+        topk = m.get("sparse_topk", 0)
+        cr = m.get("compress_ratio", 0)
+        swa = m.get("swa_window", 0)
+
+        if topk > 0:
+            eff = topk + swa
+            fwd_str = f"2×b×s×(topk+swa)×h×d = 2×{b}×{s}×{eff}×{h}×{d} = {_fmt_e(ff)}"
+        elif cr > 0:
+            c_len = max(1, s // cr)
+            eff = c_len + swa
+            fwd_str = f"2×b×s×(s/r+swa)×h×d = 2×{b}×{s}×{eff}×{h}×{d} = {_fmt_e(ff)}"
+        elif swa > 0:
+            fwd_str = f"2×b×s×swa×h×d = 2×{b}×{s}×{swa}×{h}×{d} = {_fmt_e(ff)}"
+        else:
+            fwd_str = f"2×b×s²×h×d = 2×{b}×{s}²×{h}×{d} = {_fmt_e(ff)}"
+        bwd_str = f"2.5×fwd (FlashAttn internal recompute) = {_fmt_e(df)}"
+        kv_len = (topk + swa) if topk > 0 else (max(1, s // cr) + swa if cr > 0 else (swa if swa > 0 else s))
+        bytes_str = f"(2×b×h×s×d + 2×b×h×kv_len×d)×bpe = (2×{b}×{h}×{s}×{d} + 2×{b}×{h}×{kv_len}×{d})×bpe = {_fmt_e(cost.fwd_bytes)}"
+        bwd_bytes_str = f"(3×b×h×s×d + 4×b×h×kv_len×d)×bpe = {_fmt_e(cost.dx_bytes)}"
+        return fwd_str, bwd_str, bytes_str, bwd_bytes_str
+
+    if op.kind in ("rmsnorm", "ln"):
+        n = sum(t.num_elements() for t in op.outputs) if op.outputs else 0
+        fpe = 5 if op.kind == "rmsnorm" else 7
+        fwd_str = f"{fpe}×N = {fpe}×{n} = {_fmt_e(ff)}"
+        bwd_str = f"2.5×fwd = {_fmt_e(df)}"
+        bytes_str = f"fwd_bytes = {_fmt_e(cost.fwd_bytes)}"
+        bwd_bytes_str = f"dx_bytes = {_fmt_e(cost.dx_bytes)}"
+        return fwd_str, bwd_str, bytes_str, bwd_bytes_str
+
+    if op.kind == "rope":
+        n = sum(t.num_elements() for t in op.outputs) if op.outputs else 0
+        fwd_str = f"2×N (sin/cos mul) = 2×{n} = {_fmt_e(ff)}"
+        bwd_str = f"2.5×fwd = {_fmt_e(df)}"
+        bytes_str = f"tensor I/O = {_fmt_e(cost.fwd_bytes)}"
+        bwd_bytes_str = f"dx_bytes = {_fmt_e(cost.dx_bytes)}"
+        return fwd_str, bwd_str, bytes_str, bwd_bytes_str
+
+    if op.kind == "swiglu":
+        n = sum(t.num_elements() for t in op.outputs) if op.outputs else 0
+        fwd_str = f"5×N (sig+mul) = 5×{n} = {_fmt_e(ff)}"
+        bwd_str = f"2.5×fwd = {_fmt_e(df)}"
+        bytes_str = f"tensor I/O = {_fmt_e(cost.fwd_bytes)}"
+        bwd_bytes_str = f"dx_bytes = {_fmt_e(cost.dx_bytes)}"
+        return fwd_str, bwd_str, bytes_str, bwd_bytes_str
+
+    if op.kind == "add":
+        n = sum(t.num_elements() for t in op.outputs) if op.outputs else 0
+        fwd_str = f"1×N (add) = {n} = {_fmt_e(ff)}"
+        bwd_str = f"2.5×fwd = {_fmt_e(df)}"
+        bytes_str = f"tensor I/O = {_fmt_e(cost.fwd_bytes)}"
+        bwd_bytes_str = f"dx_bytes = {_fmt_e(cost.dx_bytes)}"
+        return fwd_str, bwd_str, bytes_str, bwd_bytes_str
+
+    if op.kind == "softmax":
+        n = sum(t.num_elements() for t in op.outputs) if op.outputs else 0
+        fwd_str = f"4×N (max/sub/exp/div) = 4×{n} = {_fmt_e(ff)}"
+        bwd_str = f"2.5×fwd = {_fmt_e(df)}"
+        bytes_str = f"tensor I/O = {_fmt_e(cost.fwd_bytes)}"
+        bwd_bytes_str = f"dx_bytes = {_fmt_e(cost.dx_bytes)}"
+        return fwd_str, bwd_str, bytes_str, bwd_bytes_str
+
+    if op.kind == "indexer_topk":
+        s = m.get("s", 0)
+        kv = m.get("kv_len", s)
+        ih = m.get("ih_local", m.get("ih", 0))
+        id_ = m.get("id", 0)
+        fwd_str = f"2×s×kv_len×ih×id_ = 2×{s}×{kv}×{ih}×{id_} = {_fmt_e(ff)}"
+        bwd_str = f"2×fwd (idx_q grad only) = {_fmt_e(df)}"
+        bytes_str = f"fwd_bytes = {_fmt_e(cost.fwd_bytes)}"
+        bwd_bytes_str = f"dx_bytes = - (grad via matmul bwd)"
+        return fwd_str, bwd_str, bytes_str, bwd_bytes_str
+
+    if op.kind == "compressor_pool":
+        s = m.get("s", 0)
+        mm_ = m.get("m", 4)
+        co = m.get("coff", 1)
+        dd = m.get("d_local", m.get("d", 0))
+        fwd_str = f"4×(s/m)×coff×m×d = 4×({s}//{mm_})×{co}×{mm_}×{dd} = {_fmt_e(ff)}"
+        bwd_str = f"= fwd = {_fmt_e(df)}"
+        bytes_str = f"bytes = {_fmt_e(cost.fwd_bytes)}"
+        bwd_bytes_str = f"dx_bytes = {_fmt_e(cost.dx_bytes)}"
+        return fwd_str, bwd_str, bytes_str, bwd_bytes_str
+
+    if op.kind == "embed":
+        s = m.get("m", 0)
+        h = m.get("n", 0)
+        fwd_str = f"0 (gather, no FLOPs)"
+        bwd_str = f"0 (scatter, no FLOPs)"
+        bytes_str = f"s×h×bpe = {s}×{h}×bpe = {_fmt_e(cost.fwd_bytes)}"
+        bwd_bytes_str = f"same as fwd = {_fmt_e(cost.dx_bytes)}"
+        return fwd_str, bwd_str, bytes_str, bwd_bytes_str
+
+    if op.kind in ("mhc_pre", "mhc_post", "mhc_head"):
+        fwd_str = f"fwd = {_fmt_e(ff)}"
+        bwd_str = f"2.5×fwd = {_fmt_e(df + wf)}"
+        bytes_str = f"= {_fmt_e(cost.fwd_bytes)}"
+        bwd_bytes_str = f"= {_fmt_e(cost.dx_bytes + cost.dw_bytes)}"
+        return fwd_str, bwd_str, bytes_str, bwd_bytes_str
+
+    if op.kind == "hash_route":
+        return "negligible", "negligible", "negligible", "negligible"
+
+    # Fallback
+    return f"fwd = {_fmt_e(ff)}", f"bwd = {_fmt_e(df + wf)}", \
+           f"bytes = {_fmt_e(cost.fwd_bytes)}", f"dx_bytes = {_fmt_e(cost.dx_bytes + cost.dw_bytes)}"
+
+
+def _bpe_from_op(op) -> int:
+    """Bytes per element from op tensors."""
+    if op.inputs:
+        return op.inputs[0].dtype.bytes
+    if op.outputs:
+        return op.outputs[0].dtype.bytes
+    return 2
+
+
+def _fmt_e(v: float) -> str:
+    """Format a number in scientific notation."""
+    if v <= 0:
+        return "-"
+    if v >= 1e15:
+        return f"{v/1e15:.2f}P"
+    if v >= 1e12:
+        return f"{v/1e12:.2f}T"
+    if v >= 1e9:
+        return f"{v/1e9:.2f}G"
+    if v >= 1e6:
+        return f"{v/1e6:.2f}M"
+    if v >= 1e3:
+        return f"{v/1e3:.2f}K"
+    return f"{v:.0f}"
+
+
+def _fwd_flops(cost) -> float:
+    return cost.fwd_cube_flops + cost.fwd_vector_flops
+
+def _dx_flops(cost) -> float:
+    return cost.dx_cube_flops + cost.dx_vector_flops
+
+def _dw_flops(cost) -> float:
+    return cost.dw_cube_flops + cost.dw_vector_flops
+
+def _op_detail(op, cost):
+    """Return a dict with full op info for Excel/HTML."""
+    inputs_info = _tensor_list_info(op.inputs, "input")
+    outputs_info = _tensor_list_info(op.outputs, "output")
+    fwd_formula, bwd_formula, fwd_bytes_formula, bwd_bytes_formula = _op_formula(op, cost)
+    return {
+        "inputs": inputs_info,
+        "outputs": outputs_info,
+        "fwd_formula": fwd_formula,
+        "bwd_formula": bwd_formula,
+        "fwd_bytes_formula": fwd_bytes_formula,
+        "bwd_bytes_formula": bwd_bytes_formula,
+    }
+
+
 def _classify_ops_in_layer(ops: list[Op], layer_kind: str) -> list[dict]:
     """Split a layer's ops into logical blocks using explicit name markers."""
     if layer_kind == "moe":
@@ -68,12 +278,14 @@ def _op_to_dict(op: Op, cost: OpCost, system) -> dict:
     dx_t = _cost_phase_time(cost, "dx", system, gpu_name, overlap)
     dw_t = _cost_phase_time(cost, "dw", system, gpu_name, overlap)
 
+    detail = _op_detail(op, cost)
+
     return {
         "name": op.name,
         "kind": op.kind,
-        "fwd_flops": cost.fwd_flops,
-        "dx_flops": cost.dx_flops,
-        "dw_flops": cost.dw_flops,
+        "fwd_flops": _fwd_flops(cost),
+        "dx_flops": _dx_flops(cost),
+        "dw_flops": _dw_flops(cost),
         "fwd_bytes": cost.fwd_bytes,
         "dx_bytes": cost.dx_bytes,
         "dw_bytes": cost.dw_bytes,
@@ -82,6 +294,12 @@ def _op_to_dict(op: Op, cost: OpCost, system) -> dict:
         "dx_ms": dx_t * 1000,
         "dw_ms": dw_t * 1000,
         "total_ms": (fwd_t + dx_t + dw_t) * 1000,
+        "inputs": detail["inputs"],
+        "outputs": detail["outputs"],
+        "fwd_formula": detail["fwd_formula"],
+        "bwd_formula": detail["bwd_formula"],
+        "fwd_bytes_formula": detail["fwd_bytes_formula"],
+        "bwd_bytes_formula": detail["bwd_bytes_formula"],
     }
 
 
@@ -667,13 +885,21 @@ function filterOps() {{
 
 function showTooltip(e, op) {{
   const tip = document.getElementById('tooltip');
+  let formulaRows = '';
+  if (op.fwd_formula && op.fwd_formula !== 'negligible') {{
+    formulaRows += `<div class="row"><span class="k">FWD FLOPs</span><span class="v">${{op.fwd_formula}}</span></div>`;
+    formulaRows += `<div class="row"><span class="k">BWD FLOPs</span><span class="v">${{op.bwd_formula}}</span></div>`;
+    formulaRows += `<div class="row"><span class="k">FWD Bytes</span><span class="v">${{op.fwd_bytes_formula}}</span></div>`;
+    formulaRows += `<div class="row"><span class="k">BWD Bytes</span><span class="v">${{op.bwd_bytes_formula}}</span></div>`;
+  }}
   tip.innerHTML = `
     <div style="font-weight:bold;margin-bottom:6px;color:#fff">${{op.name}}</div>
     <div class="row"><span class="k">Kind</span><span class="v">${{op.kind}}</span></div>
     <div class="row"><span class="k">Bound</span><span class="v">${{op.bound}}</span></div>
-    <div class="row"><span class="k">FWD FLOPs</span><span class="v">${{fmtFlops(op.fwd_flops)}}</span></div>
-    <div class="row"><span class="k">BWD FLOPs</span><span class="v">${{fmtFlops(op.dx_flops + op.dw_flops)}}</span></div>
-    <div class="row"><span class="k">FWD Bytes</span><span class="v">${{fmtFlops(op.fwd_bytes)}}</span></div>
+    <div class="row"><span class="k">Input</span><span class="v">${{op.inputs}}</span></div>
+    <div class="row"><span class="k">Output</span><span class="v">${{op.outputs}}</span></div>
+    ${{formulaRows}}
+    <div style="border-top:1px solid var(--border);margin-top:6px;padding-top:4px"></div>
     <div class="row"><span class="k">FWD Time</span><span class="v">${{fmtMs(op.fwd_ms)}}</span></div>
     <div class="row"><span class="k">DX Time</span><span class="v">${{fmtMs(op.dx_ms)}}</span></div>
     <div class="row"><span class="k">DW Time</span><span class="v">${{fmtMs(op.dw_ms)}}</span></div>

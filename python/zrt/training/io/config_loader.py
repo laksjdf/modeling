@@ -121,7 +121,7 @@ def _parse_model(d: dict) -> ModelSpec:
         swiglu_clamp=d.get("swiglu_clamp", 0.0),
         # MoE
         num_experts=d.get("num_experts", 0),
-        moe_ffn=d.get("moe_ffn", 0),
+        moe_ffn=d.get("moe_ffn") or d.get("route_expert_hidden", 0),
         top_k=d.get("top_k", 0),
         capacity_factor=d.get("capacity_factor", 1.0),
         expert_imbalance=d.get("expert_imbalance", 0.0),
@@ -161,6 +161,7 @@ def _parse_system(d: dict) -> SystemSpec:
         cube_tflops=hw.compute.cube_bf16_tflops,
         vector_tflops=hw.compute.vector_bf16_tflops,
         overlap_ratio=dict(hw.compute.overlap_ratio),
+        sram_kb_per_sm=hw.compute.sram_kb_per_sm,
     )
     return SystemSpec(
         gpu=gpu,

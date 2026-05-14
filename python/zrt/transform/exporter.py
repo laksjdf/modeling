@@ -23,32 +23,140 @@ from python.zrt.transform.context import TransformContext, ParallelConfig
 logger = logging.getLogger(__name__)
 
 
-def _layer_sort_key(node: OpNode) -> tuple:
-    """Primary sort key for layer-sequential Excel display.
+_PRE_LAYER_KEY = -1_000_000
+_POST_LAYER_KEY = 1_000_000
+_UNKNOWN_LAYER_BASE = 999_999
 
-    Non-layer ops (embedding, lm_head) get key -1 so they appear before
-    layer-0 ops.  Unknown non-integer layers sort after all numbered layers.
-    """
-    layer = node.layer
+
+def _parse_layer(layer: str) -> int | None:
     if not layer:
-        return (-1, "")
+        return None
     try:
-        return (int(layer), "")
+        return int(layer)
     except (ValueError, TypeError):
-        return (999999, layer)
+        return None
 
 
-def layer_stable_sort(nodes: list) -> list:
-    """Sort nodes by (layer_number, original_topo_index) for readable Excel output.
+def _effective_layer_map(graph, nodes: list) -> dict[str, float]:
+    """Assign each node a sortable float representing its execution-order layer.
 
-    Preserves topological order within each layer while ensuring all ops
-    of layer N appear before any op of layer N+1.  This corrects the
-    interleaved output that Kahn's algorithm produces when target_layers
-    skips intermediate layers (e.g. [0, 3]), making those layers appear
-    as independent parallel chains.
+    Algorithm:
+
+    1. Numeric ``layer`` → that integer (seed).
+    2. Phase-aware predecessor BFS: untagged nodes inherit ``max(prev) + 0.5``
+       — only same-phase edges are followed.  Stitched fwd→bwd cross-edges
+       are ignored, otherwise a fwd head op would be pulled into the bwd
+       subgraph's layer range.
+    3. Phase-aware successor BFS: ``min(succ) - 0.5`` for the still-unseeded.
+    4. Scope-based fallback for fully isolated nodes (no same-phase edges
+       connect them to any tagged layer):
+         * scope contains ``embed`` → pre-layer bucket.
+         * top-level ``head`` / ``norm`` (not inside ``layers.N.*``) → post-layer.
+         * else → pre-layer bucket (capture-order fallback).
+    """
+    by_id = {n.id: n for n in nodes}
+
+    def _phase_of(node):
+        return node.annotations.get("phase", "") if node.annotations else ""
+
+    preds: dict[str, list[str]] = {n.id: [] for n in nodes}
+    succs: dict[str, list[str]] = {n.id: [] for n in nodes}
+    for e in graph.edges:
+        if e.src not in by_id or e.dst not in by_id:
+            continue
+        ps = _phase_of(by_id[e.src])
+        pd = _phase_of(by_id[e.dst])
+        # Drop cross-phase edges (fwd ↔ bwd) so the BFS stays within one phase.
+        if ps and pd and ps != pd:
+            continue
+        preds[e.dst].append(e.src)
+        succs[e.src].append(e.dst)
+
+    eff: dict[str, float] = {}
+    unknown_label: dict[str, str] = {}
+
+    # 1) seed with explicit numeric layer
+    for n in nodes:
+        v = _parse_layer(n.layer)
+        if v is not None:
+            eff[n.id] = float(v)
+        elif n.layer:
+            unknown_label[n.id] = n.layer  # non-numeric label, tail bucket
+
+    max_numeric = max(eff.values(), default=0.0)
+
+    # 2) backward BFS: pull from max predecessor (+0.5)
+    changed = True
+    while changed:
+        changed = False
+        for n in nodes:
+            if n.id in eff:
+                continue
+            prev_vals = [eff[p] for p in preds[n.id] if p in eff]
+            if prev_vals:
+                eff[n.id] = max(prev_vals) + 0.5
+                changed = True
+
+    # 3) forward BFS: pull from min successor (-0.5) for nodes still unseeded
+    changed = True
+    while changed:
+        changed = False
+        for n in nodes:
+            if n.id in eff or n.id in unknown_label:
+                continue
+            succ_vals = [eff[s] for s in succs[n.id] if s in eff]
+            if succ_vals:
+                eff[n.id] = min(succ_vals) - 0.5
+                changed = True
+
+    # 4) isolated nodes: classify by scope.
+    post_layer_default = max_numeric + 1.0
+    for n in nodes:
+        if n.id in eff or n.id in unknown_label:
+            continue
+        scope = (n.scope or "").lower()
+        is_per_layer = "layers." in scope
+        if "embed" in scope and not is_per_layer:
+            eff[n.id] = float(_PRE_LAYER_KEY)
+        elif not is_per_layer and any(kw in scope for kw in (".head", "head_module", ".norm")):
+            eff[n.id] = post_layer_default
+        elif not is_per_layer and scope.endswith("norm"):
+            eff[n.id] = post_layer_default
+        else:
+            eff[n.id] = float(_PRE_LAYER_KEY)
+    return eff
+
+
+def layer_stable_sort(nodes: list, graph: OpGraph | None = None) -> list:
+    """Sort nodes for readable Excel output.
+
+    Primary key is the *effective* layer (numeric ``layer`` for tagged ops,
+    propagated from neighbors otherwise — see :func:`_effective_layer_map`).
+    Secondary key is the original topo index so order within a layer is
+    preserved.  When ``graph`` is omitted, falls back to a pure topo sort
+    using only the ``layer`` field (legacy behaviour).
     """
     topo_index = {n.id: i for i, n in enumerate(nodes)}
-    return sorted(nodes, key=lambda n: (_layer_sort_key(n), topo_index[n.id]))
+
+    if graph is None:
+        # Legacy path: numeric layer only, non-numeric → tail bucket.
+        def _legacy_key(node: OpNode) -> tuple[float, int]:
+            v = _parse_layer(node.layer)
+            if v is not None:
+                return (float(v), topo_index[node.id])
+            return (float(_UNKNOWN_LAYER_BASE), topo_index[node.id])
+        return sorted(nodes, key=_legacy_key)
+
+    eff = _effective_layer_map(graph, nodes)
+    tail_bucket = float(_UNKNOWN_LAYER_BASE)
+
+    def _key(node: OpNode) -> tuple[float, int]:
+        if node.id in eff:
+            return (eff[node.id], topo_index[node.id])
+        # non-numeric layer label → tail
+        return (tail_bucket, topo_index[node.id])
+
+    return sorted(nodes, key=_key)
 
 
 def infer_pipeline_stage(node: OpNode, layer_to_stage: Optional[Dict[str, int]] = None) -> str:
@@ -246,7 +354,7 @@ class TransformedGraphExcelWriter:
             for i, layer in enumerate(sorted_layers):
                 layer_to_stage[layer] = i % ctx.parallel.pp
 
-        nodes_to_write = list(layer_stable_sort(graph.topo_sort()))
+        nodes_to_write = list(layer_stable_sort(graph.topo_sort(), graph=graph))
         if graph.phase == "train" or graph.metadata.get("fwd_bwd_stitched"):
             nodes_to_write = [n for n in nodes_to_write if n.annotations.get("phase") != "bwd"]
 
@@ -1159,7 +1267,7 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
 
         _recompute_fill = PatternFill(start_color="fce4ec", end_color="fce4ec", fill_type="solid")
 
-        nodes_to_write = list(layer_stable_sort(graph.topo_sort()))
+        nodes_to_write = list(layer_stable_sort(graph.topo_sort(), graph=graph))
         if graph.phase == "train" or graph.metadata.get("fwd_bwd_stitched"):
             nodes_to_write = [n for n in nodes_to_write if n.annotations.get("phase") == "bwd"]
 
@@ -1358,7 +1466,7 @@ def _graph_to_fused_records(graph: OpGraph,
     """
     arrow = " → "
     records: List[Dict[str, Any]] = []
-    nodes = layer_stable_sort(graph.topo_sort())
+    nodes = layer_stable_sort(graph.topo_sort(), graph=graph)
     if phase_filter is not None and (graph.phase == "train"
                                      or graph.metadata.get("fwd_bwd_stitched")):
         nodes = [n for n in nodes if n.annotations.get("phase") == phase_filter]

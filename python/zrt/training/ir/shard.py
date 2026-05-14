@@ -471,19 +471,24 @@ def _apply_tp_sharding(
 
             if col_parallel:
                 n_local = n // shard.tp
-                op.meta["n_local"] = n_local
+                updated = False
                 for t in op.outputs:
                     if t.shape_logical and t.shape_logical[-1] == n:
                         t.shape_local = (t.shape_logical[0], n_local)
+                        updated = True
+                if not updated:
+                    op.meta["n_local"] = n_local
             elif row_parallel:
                 k_local = k // shard.tp
-                op.meta["k_local"] = k_local
+                updated = False
                 for t in op.inputs:
                     if t.shape_logical and t.shape_logical[-1] == k:
                         t.shape_local = (t.shape_logical[0], k_local)
+                        updated = True
+                if not updated:
+                    op.meta["k_local"] = k_local
             elif "router" in op.name:
                 n_local = n // shard.tp
-                op.meta["n_local"] = n_local
                 for t in op.outputs:
                     if t.shape_logical and t.shape_logical[-1] == n:
                         t.shape_local = (t.shape_logical[0], n_local)
@@ -567,8 +572,6 @@ def _apply_tp_sharding(
                 if "bytes_fwd" in op.meta:
                     op.meta["bytes_fwd"] = op.meta["bytes_fwd"] // shard.tp
         elif op.kind in ("ln", "rope", "swiglu", "add"):
-            if "bytes_fwd" in op.meta:
-                op.meta["bytes_fwd"] = int(op.meta["bytes_fwd"]) // shard.tp
             for t in op.inputs + op.outputs:
                 if t.shape_logical and t.shape_logical[-1] in (h, h_attn, h_kv, ffn):
                     t.shape_local = (t.shape_logical[0], max(1, t.shape_logical[-1] // shard.tp))
@@ -579,14 +582,12 @@ def _apply_cp_sharding(
 ) -> None:
     """Adjust tensor shape_local for CP sharding.
 
-    Ulysses-CP: sequence split by cp, heads multiplied by cp for attention.
-    Ring-CP: sequence split by cp, heads unchanged (KV chunks sent round-robin).
-    Hybrid-CP: both sequence and heads adjustments apply.
-
-    For attention core:
-      - Ulysses: heads_local = heads_tp * cp (heads gathered by A2A)
-      - Ring: heads_local = heads_tp (unchanged)
-      - seq_local = seq / cp for all CP kinds
+    Ulysses-CP: A2A scatters heads, gathers seq.
+      Per-rank attn work: s_local = full_seq, heads_local = heads_tp // cp.
+    Ring-CP: seq split across cp ranks, KV chunks streamed via P2P.
+      s_local = seq / cp, heads_local = heads_tp.
+    Hybrid-CP: Ulysses head sharding plus Ring sequence tiling.
+      s_local = seq / cp, heads_local = heads_tp // cp, cp_tiles = cp.
     """
     if not shard.has_cp:
         return
@@ -599,25 +600,42 @@ def _apply_cp_sharding(
         for t in op.inputs + op.outputs:
             if t.shape_logical and len(t.shape_logical) > 0:
                 if t.shape_logical[0] == seq:
-                    t.shape_local = (seq_local,) + t.shape_logical[1:]
+                    t.shape_local = (seq_local,) + t.shape_local[1:]
 
         if op.kind == "matmul":
-            if "m" in op.meta:
+            # For meta-authoritative matmuls (grouped/fused where meta k != input shape),
+            # _matmul_cost reads m from meta — must divide it here.
+            meta_k = op.meta.get("k", 0)
+            if "m" in op.meta and meta_k > 0 and op.inputs and op.inputs[0].shape_logical[-1] != meta_k:
                 op.meta["m"] = op.meta["m"] // shard.cp
         elif op.kind in ("attn_core", "sparse_attn", "hca_attn", "swa_attn"):
-            if "s" in op.meta:
-                op.meta["s"] = op.meta["s"] // shard.cp
-            if shard.cp_kind == CPKind.ULYSSES or shard.cp_kind == CPKind.HYBRID:
-                if "heads" in op.meta:
-                    heads_tp = op.meta.get("heads_tp", op.meta["heads"])
-                    op.meta["heads"] = heads_tp * shard.cp
-                    op.meta["heads_gathered_by_cp"] = True
-            if shard.cp_kind == CPKind.RING:
+            heads_tp = op.meta.get("heads_tp", op.meta.get("heads", 0))
+
+            if shard.cp_kind == CPKind.ULYSSES:
+                # Ulysses A2A1: scatter heads across CP ranks, gather seq.
+                # Per-rank attn work: full seq, heads_tp // cp heads.
+                op.meta["heads"] = max(1, heads_tp // shard.cp)
+                op.meta["heads_gathered_by_cp"] = False
+                # NOTE: do NOT divide op.meta["s"] — full seq is on this
+                # rank during attention.
+            elif shard.cp_kind == CPKind.HYBRID:
+                if "s" in op.meta:
+                    op.meta["s"] = op.meta["s"] // shard.cp
+                op.meta["heads"] = max(1, heads_tp // shard.cp)
                 op.meta["heads_gathered_by_cp"] = False
                 op.meta["cp_tiles"] = shard.cp
+            elif shard.cp_kind == CPKind.RING:
+                if "s" in op.meta:
+                    op.meta["s"] = op.meta["s"] // shard.cp
+                # heads unchanged; ring tiles via cp rounds
+                op.meta["heads_gathered_by_cp"] = False
+                op.meta["cp_tiles"] = shard.cp
+            else:
+                # CPKind.NONE / COMPRESSED — preserve existing behavior
+                if "s" in op.meta:
+                    op.meta["s"] = op.meta["s"] // shard.cp
         elif op.kind in ("ln", "rope", "swiglu", "add"):
-            if "bytes_fwd" in op.meta:
-                op.meta["bytes_fwd"] = int(op.meta["bytes_fwd"]) // shard.cp
+            pass  # shape_local already updated by the generic loop above
         elif op.kind == "compressor_pool":
             # Sequence dimension is sharded by CP. Each rank pools its local
             # chunk independently (m=4 pooling is local, no cross-rank comm).

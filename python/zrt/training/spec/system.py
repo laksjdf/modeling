@@ -20,6 +20,10 @@ class GPU:
     vector_tflops: float | None = None    # Scalar/vector peak TFLOP/s (bf16)
     overlap_ratio: dict[str, float] = field(default_factory=dict)
 
+    # SRAM per SM — used for FlashAttention tile-level modeling.
+    # 0 = tile model disabled (preserve current single-read byte formula).
+    sram_kb_per_sm: float = 0.0
+
 
 @dataclass
 class SystemSpec:
