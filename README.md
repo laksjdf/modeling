@@ -113,6 +113,10 @@ python -m python.zrt --model-id hf_models/deepseek_v3 --layers 4 --train --hw nv
 # 启用激活重计算
 python -m python.zrt --model-id Qwen/Qwen2.5-7B-Instruct --layers 4 --train --hw nvidia_h100_sxm --tp 8 --gradient-checkpointing
 
+# 激活重计算策略（none / full / selective）
+python -m python.zrt --model-id deepseek-ai/DeepSeek-V3 --layers 4 --train --hw nvidia_h100_sxm --tp 8 --recompute-policy full
+python -m python.zrt --model-id deepseek-ai/DeepSeek-V3 --layers 4 --train --hw nvidia_h100_sxm --tp 8 --recompute-policy selective
+
 # Spec-based 训练估算（无需抓图，纯分析）→ 默认输出 Excel
 python -m python.zrt --estimate-config python/zrt/training/configs/llama3_70b_3d.yaml
 
@@ -233,6 +237,7 @@ uvicorn server.main:app --reload --host 0.0.0.0 --port 8000
 | `platform` | string | `generic` | `cuda`/`ascend_npu`/`cpu`/`generic` |
 | `graph_mode` | bool | `false` | 使用 `torch.compile` 图模式 |
 | `gradient_checkpointing` | bool | `false` | 启用激活重计算 |
+| `recompute_policy` | string | `none` | 激活重计算策略：`none` / `full` / `selective` |
 | `output_dir` | string | — | 输出目录（默认 `output/<slug>`） |
 | `target_layers` | string | — | 指定层号，逗号分隔（如 `"0,3"`） |
 | `auto_layers` | bool | `true` | 自动选取首个密集层和首个 MoE 层 |
@@ -579,7 +584,8 @@ print(f"捕获算子数: {len(records)}")
 | `--train` | — | flag | `False` | 快捷 flag：等价于 `--phases train_forward train_backward` |
 | `--platform` | — | choice | `generic` | 目标平台：`cuda` / `ascend_npu` / `cpu` / `generic`，影响融合 kernel 命名；指定 `--hw` 时自动推断，无需手动设置 |
 | `--graph-mode` | — | flag | `False` | 使用 `torch.compile` 图模式捕获，替代 `TorchDispatchMode` eager 路径 |
-| `--gradient-checkpointing` | — | flag | `False` | 启用激活重计算（训练阶段） |
+| `--gradient-checkpointing` | — | flag | `False` | 启用激活重计算（训练阶段，等价 `--recompute-policy full`） |
+| `--recompute-policy` | — | choice | `none` | 激活重计算策略：`none`（不重算）/ `full`（全部前向重算）/ `selective`（仅 Attention 算子重算） |
 
 ### 输出
 
@@ -666,6 +672,7 @@ EP 不占用独立 rank，在 DP group 内部运行，不参与上述乘积。
 | `--total-params` | — | float | — | 完整模型参数量（如 `671e9`，用于缩放 traced layers） |
 | `--hidden` | — | int | `7168` | 隐藏层维度（内存估算用） |
 | `--num-layers-full` | — | int | — | 完整模型总层数（默认等于 `--layers`） |
+| `--recompute-policy` | — | choice | `none` | 激活重计算策略：`none`（不重算）、`full`（全部前向重算）、`selective`（仅 Attention 算子重算） |
 
 ### `--layers` 选择建议
 

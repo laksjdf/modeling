@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 def _make_comm_node(node_id: str, collective: str,
                     src_node: OpNode, group_size: int) -> OpNode:
     """Create a comm.* OpNode that wraps src_node's outputs."""
-    return OpNode(
+    node = OpNode(
         id=node_id,
         op_type=f"comm.{collective}",
         inputs=copy.deepcopy(src_node.outputs),
@@ -26,6 +26,15 @@ def _make_comm_node(node_id: str, collective: str,
         layer=src_node.layer,
         category="communication",
     )
+    _propagate_phase(src_node, node)
+    return node
+
+
+def _propagate_phase(src: OpNode, dst: OpNode) -> None:
+    """Copy ``annotations["phase"]`` from src to dst if present."""
+    phase = src.annotations.get("phase", "")
+    if phase:
+        dst.annotations["phase"] = phase
 
 
 def _rewire(g: "OpGraph", src_id: str, comm_node: OpNode) -> None:
@@ -183,6 +192,7 @@ class CommInserterPass(GraphPass):
                     category="communication",
                 )
                 dispatch.annotations["inserted_by"] = "ep_pass"
+                _propagate_phase(first, dispatch)
                 g.add_node(dispatch)
                 # Rewire: in-edges of first → dispatch → first
                 _prepend_comm(g, first.id, dispatch)
@@ -200,6 +210,7 @@ class CommInserterPass(GraphPass):
                     category="communication",
                 )
                 combine.annotations["inserted_by"] = "ep_pass"
+                _propagate_phase(last, combine)
                 g.add_node(combine)
                 _rewire(g, last.id, combine)
 
@@ -255,6 +266,7 @@ class CommInserterPass(GraphPass):
                         category="communication",
                     )
                     pre_comm.annotations["inserted_by"] = "cp_pass"
+                    _propagate_phase(node, pre_comm)
                     g.nodes[pre_comm.id] = pre_comm
                     _prepend_comm(g, node.id, pre_comm)
 
@@ -273,6 +285,7 @@ class CommInserterPass(GraphPass):
                         category="communication",
                     )
                     post_comm.annotations["inserted_by"] = "cp_pass"
+                    _propagate_phase(node, post_comm)
                     _rewire(g, node.id, post_comm)
 
             if cp_kind in ("ring", "hybrid"):
@@ -297,6 +310,7 @@ class CommInserterPass(GraphPass):
                             category="communication",
                         )
                         p2p_comm.annotations["inserted_by"] = "cp_pass"
+                        _propagate_phase(node, p2p_comm)
                         p2p_comm.annotations["overlap_target"] = f"fa_tile:{node.id}"
                         g.nodes[p2p_comm.id] = p2p_comm
                         _prepend_comm(g, node.id, p2p_comm)
@@ -320,6 +334,7 @@ class CommInserterPass(GraphPass):
                         category="communication",
                     )
                     stage1.annotations["inserted_by"] = "cp_pass"
+                    _propagate_phase(node, stage1)
                     stage1.annotations["overlap_target"] = f"fa_tile:{node.id}"
                     g.nodes[stage1.id] = stage1
                     _prepend_comm(g, node.id, stage1)
@@ -339,6 +354,7 @@ class CommInserterPass(GraphPass):
                         category="communication",
                     )
                     stage2.annotations["inserted_by"] = "cp_pass"
+                    _propagate_phase(node, stage2)
                     g.nodes[stage2.id] = stage2
                     _prepend_comm(g, node.id, stage2)
 

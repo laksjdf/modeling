@@ -144,6 +144,14 @@ def main() -> None:
         default=False,
         help="Enable activation checkpointing during training phases.",
     )
+    parser.add_argument(
+        "--recompute-policy",
+        default="none",
+        choices=["none", "full", "selective"],
+        help="Activation recompute policy (default: none). "
+             "full = all forward ops recomputed; "
+             "selective = attention ops only.",
+    )
 
     # ── Output ────────────────────────────────────────────────────────────────
     parser.add_argument("--output-dir", "-o",
@@ -512,7 +520,7 @@ def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
 
     profile = _build_model_profile(model_id, args)
 
-    for phase, (raw_graph, _) in result.graphs.items():
+    for phase, raw_graph in result.graphs.items():
         g = pipe.run(raw_graph, ctx)
 
         # Single call: schedule + simulate + all exports
@@ -600,6 +608,7 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
         muon_ns_steps=args.muon_ns_steps,
         micro_batch=args.micro_batch,
         global_batch=args.global_batch,
+        recompute_policy=args.recompute_policy,
         return_transformed=True,
         quant=args.quant,
         moe_total_experts=_moe_total,

@@ -38,6 +38,8 @@ class FlopsPass(GraphPass):
     @staticmethod
     def _is_expert_scope(scope: str) -> bool:
         s = scope.lower()
+        if "shared_expert" in s:
+            return False
         return any(k in s for k in FlopsPass._EXPERT_KEYWORDS)
 
     def run(self, graph: "OpGraph", ctx: "TransformContext") -> "OpGraph":
@@ -47,6 +49,7 @@ class FlopsPass(GraphPass):
 
         is_train = ctx.training is not None
         moe_scale = graph.metadata.get("moe_active_experts", 1)
+        num_experts_total = graph.metadata.get("moe_total_experts", 0)
 
         for node in g.nodes.values():
             flops, read_b, write_b = sim._fmr(node)
@@ -54,9 +57,15 @@ class FlopsPass(GraphPass):
             # MoE expert scaling: captured graph has only 1 expert's ops,
             # but real model activates moe_active_experts per token.
             if moe_scale > 1 and node.scope and self._is_expert_scope(node.scope):
-                flops = int(flops * moe_scale)
-                read_b = int(read_b * moe_scale)
-                write_b = int(write_b * moe_scale)
+                ep_local = node.annotations.get("ep_experts_local", 0)
+                if ep_local > 0 and num_experts_total > 0:
+                    ep_frac = ep_local / num_experts_total
+                    scale = moe_scale * ep_frac
+                else:
+                    scale = moe_scale
+                flops = int(flops * scale)
+                read_b = int(read_b * scale)
+                write_b = int(write_b * scale)
 
             node.annotations["flops"]       = int(flops)
             node.annotations["read_bytes"]  = int(read_b)
@@ -77,10 +86,11 @@ class FlopsPass(GraphPass):
                 else:
                     dx_flops, dw_flops = self._calculate_grad_flops(node, train_flops)
 
+                # flops_fwd includes recompute overhead (2× for annotated nodes)
                 rec_mult = 2.0 if node.annotations.get("recompute") and not is_bwd else 1.0
-                node.annotations["flops_fwd"] = int(train_flops * rec_mult)
-                node.annotations["flops_dx"]  = int(dx_flops)
-                node.annotations["flops_dw"]  = int(dw_flops)
+                node.annotations["flops_fwd"]  = int(train_flops * rec_mult)
+                node.annotations["flops_dx"]   = int(dx_flops)
+                node.annotations["flops_dw"]   = int(dw_flops)
 
         return g
 
@@ -176,6 +186,19 @@ class RooflinePass(GraphPass):
             write_b = node.annotations.get("write_bytes", 0)
             if flops == 0 and read_b == 0:   # FlopsPass didn't run — fall back
                 flops, read_b, write_b = sim._fmr(node)
+
+            # B1 fix: for backward nodes, add recompute overhead from their
+            # fwd predecessors.  Recompute means the forward op is re-executed
+            # during backward; the cost belongs in the backward phase timeline.
+            phase = node.annotations.get("phase", "fwd")
+            if phase in ("bwd", "backward", "train_backward") and ctx.training:
+                for e in g.in_edges(node.id):
+                    src_id = e.src
+                    if src_id in g.nodes and g.nodes[src_id].annotations.get("recompute"):
+                        src = g.nodes[src_id]
+                        flops  += src.annotations.get("flops", 0)
+                        read_b += src.annotations.get("read_bytes", 0)
+                        write_b += src.annotations.get("write_bytes", 0)
             total_b = read_b + write_b
 
             # Use activation input dtype for compute throughput (INT8/FP8 vs BF16)

@@ -16,6 +16,8 @@ _EXPERT_KEYWORDS = ("experts.", "expert_", ".experts[", "moe_ffn")
 
 def _is_expert_scope(scope: str) -> bool:
     s = scope.lower()
+    if "shared_expert" in s:
+        return False
     return any(k in s for k in _EXPERT_KEYWORDS)
 
 

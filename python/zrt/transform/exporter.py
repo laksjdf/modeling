@@ -334,6 +334,7 @@ class TransformedGraphExcelWriter:
             ("Write Bytes (B)", 14),
             ("Write Formula (sym)", 24),
             ("Write Formula (num)", 32),
+            ("Activation (B)", 16),
             # ── comm volume ───────────────────────────────────────────────────
             ("Comm Volume (B)", 14),
             # ── timing & bound ────────────────────────────────────────────────
@@ -402,7 +403,7 @@ class TransformedGraphExcelWriter:
                 input_dtypes,
                 output_dtypes,
                 # compute
-                node.annotations.get("flops", ""),
+                node.annotations.get("flops_fwd", node.annotations.get("flops", "")),
                 formulas["flops_sym"],
                 formulas["flops_num"],
                 # memory access
@@ -412,6 +413,7 @@ class TransformedGraphExcelWriter:
                 node.annotations.get("write_bytes", ""),
                 formulas["write_sym"],
                 formulas["write_num"],
+                0 if node.annotations.get("recompute") else sum(t.mem_bytes for t in node.outputs),
                 # comm
                 comm_vol,
                 # timing & bound
@@ -1293,7 +1295,7 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
                 ", ".join(str(t.shape) for t in node.inputs),
                 ", ".join(str(t.shape) for t in node.outputs),
                 # compute
-                node.annotations.get("flops", ""),
+                node.annotations.get("flops_fwd", node.annotations.get("flops", "")),
                 formulas["flops_sym"],
                 formulas["flops_num"],
                 # memory access
@@ -1347,7 +1349,7 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
 
         for row_idx, node in enumerate(recompute_nodes, 2):
             lat = node.annotations.get("latency_us", 0) or 0
-            flops = node.annotations.get("flops", 0) or 0
+            flops = node.annotations.get("flops_fwd", node.annotations.get("flops", 0)) or 0
             total_lat   += lat
             total_flops += flops
             values = [
