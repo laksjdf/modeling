@@ -63,6 +63,7 @@ class StepResult:
     memory: MemBreakdown | None = None
     mfu: float = 0.0
     hfu: float = 0.0
+    mfu_native: float = 0.0   # MFU vs op-mix-weighted effective peak
 
     # ── Fwd/Bwd phase breakdown (seconds) ────────────────────────────────
     warmup_fwd: float = 0.0
@@ -694,6 +695,7 @@ def pipeline_step_time(
 
     # HFU
     step.hfu = compute_hfu(model, strategy, system, step.step_time, graph)
+    step.mfu_native = compute_mfu_native(model, strategy, system, step.step_time, graph)
 
     # Add optimizer time to step_time (per §5.5.2 of muon_optimizer_design.md)
     # This must happen after MFU/HFU calculation so MFU excludes optimizer overhead.
@@ -856,3 +858,58 @@ def compute_hfu(
     pp_flops = (actual_flops + rc_overhead) / strategy.pp
 
     return util_from_flops(pp_flops, peak, step_time)
+
+
+def compute_mfu_native(
+    model: ModelSpec, strategy: Strategy,
+    system: SystemSpec, step_time: float,
+    graph: Graph,
+) -> float:
+    """MFU with denominator = effective hardware peak under mixed precision.
+
+    The effective peak is the harmonic-mean of per-dtype peaks weighted
+    by per-dtype FLOPs share, derived from each op's component tag:
+
+      effective_peak = total_flops / Σ (flops_by_dtype[d] / peak_for[d])
+
+    Reduces to ``compute_mfu`` (BF16 peak) when all ops are BF16-typed.
+    Returns 0 when step_time <= 0 or total flops <= 0.
+    """
+    from zrt.training.io.perf_tables import peak_tflops_for
+    from zrt.training.models.flops import op_cost, total_training_flops
+    from zrt.training.compose.stage import _resolve_compute_dtype
+
+    if step_time <= 0:
+        return 0.0
+
+    actual_flops = total_training_flops(graph, model, strategy, system)
+    if actual_flops <= 0:
+        return 0.0
+
+    # Aggregate per-dtype FLOPs by walking the graph
+    flops_by_dtype: dict[Dtype, float] = {}
+    for op in graph.ops:
+        cost = op_cost(op, model, system)
+        op_flops = (cost.fwd_cube_flops + cost.fwd_vector_flops
+                    + cost.dx_cube_flops + cost.dx_vector_flops
+                    + cost.dw_cube_flops + cost.dw_vector_flops)
+        if op_flops <= 0:
+            continue
+        d = _resolve_compute_dtype(op, model)
+        flops_by_dtype[d] = flops_by_dtype.get(d, 0.0) + op_flops
+
+    gpu = system.gpu
+    weighted_time = 0.0
+    total = sum(flops_by_dtype.values())
+    if total <= 0:
+        return 0.0
+    for d, f in flops_by_dtype.items():
+        peak = peak_tflops_for(gpu, d)
+        if peak <= 0:
+            continue
+        weighted_time += f / peak
+    if weighted_time <= 0:
+        return 0.0
+    effective_peak = total / weighted_time
+    pp_flops = actual_flops / strategy.pp
+    return util_from_flops(pp_flops, effective_peak, step_time)
