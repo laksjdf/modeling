@@ -193,7 +193,8 @@ def _parse_model(d: dict) -> ModelSpec:
 def _parse_system(d: dict) -> SystemSpec:
     from zrt.hardware import registry as hw_registry
 
-    hw = hw_registry.load(d["hw"])
+    hw_ref = d["hw"]
+    hw = hw_registry._parse_spec(hw_ref) if isinstance(hw_ref, dict) else hw_registry.load(hw_ref)
 
     gpu = GPU(
         name=hw.name,

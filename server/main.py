@@ -30,6 +30,9 @@ from types import SimpleNamespace
 from typing import Any, List, Optional
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from .schemas import EstimateRequest, JobResponse, JobStatus, SearchRequest, TraceRequest
 
@@ -39,11 +42,34 @@ _python_dir = str(Path(__file__).parent.parent / "python")
 if _python_dir not in sys.path:
     sys.path.insert(0, _python_dir)
 
+# Matches CLI output directory: output/estimate/{config_slug}_{timestamp}.html
+_estimates_dir = Path(__file__).parent.parent / "output" / "estimate"
+_estimates_dir.mkdir(parents=True, exist_ok=True)
+
 app = FastAPI(
     title="ZRT-Sim API",
     description="LLM performance modelling and simulation service.",
     version="1.0.0",
 )
+
+# Allow requests from file:// (origin=null) and any localhost port
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*", "null"],
+    allow_origin_regex=r"https?://localhost(:\d+)?",
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Serve generated HTML reports (mirrors CLI output/estimate/ directory)
+app.mount("/estimate", StaticFiles(directory=str(_estimates_dir)), name="estimate")
+
+_launcher = Path(__file__).parent / "launcher.html"
+
+
+@app.get("/", include_in_schema=False)
+def serve_launcher():
+    return FileResponse(_launcher, media_type="text/html")
 
 # ── In-memory job store ───────────────────────────────────────────────────────
 # Each entry: {id, status, result, error, created_at, finished_at}
@@ -82,16 +108,101 @@ def health():
     return {"status": "ok"}
 
 
+
 @app.get("/hardware", tags=["utility"], summary="List available hardware specs")
 def list_hardware():
     from python.zrt.hardware.registry import list_available
     return {"hardware": list_available()}
 
 
-@app.get("/models", tags=["utility"], summary="List available local model shorthands")
+@app.get("/hardware/{name}", tags=["utility"], summary="Get hardware spec details")
+def get_hardware_spec(name: str):
+    import yaml as _yaml
+    cfg = Path(__file__).parent.parent / "python" / "zrt" / "hardware" / "configs" / f"{name}.yaml"
+    if not cfg.exists():
+        raise HTTPException(404, detail=f"Hardware '{name}' not found")
+    data = _yaml.safe_load(cfg.read_text())
+    compute = data.get("compute", {})
+    memory  = data.get("memory",  {})
+    intra   = data.get("interconnect", {}).get("intra_node", {})
+    inter   = data.get("interconnect", {}).get("inter_node", {})
+    return {
+        "name":       data.get("name", name),
+        "vendor":     data.get("vendor", ""),
+        "bf16_tflops": compute.get("bf16_tflops"),
+        "fp8_tops":    compute.get("fp8_tops"),
+        "memory_gb":   memory.get("capacity_gb"),
+        "hbm_gbps":    memory.get("hbm_bandwidth_gbps"),
+        "intra_type":  intra.get("type", ""),
+        "intra_bw":    intra.get("bandwidth_gbps"),
+        "inter_type":  inter.get("type", ""),
+        "inter_bw":    inter.get("bandwidth_gbps"),
+    }
+
+
+@app.get("/hardware/{name}/raw", tags=["utility"], summary="Get raw hardware YAML content")
+def get_hardware_raw(name: str):
+    cfg = Path(__file__).parent.parent / "python" / "zrt" / "hardware" / "configs" / f"{name}.yaml"
+    if not cfg.exists():
+        raise HTTPException(404, detail=f"Hardware '{name}' not found")
+    return {"content": cfg.read_text()}
+
+
+@app.get("/models", tags=["utility"], summary="List training model configs")
 def list_models():
-    from python.zrt.graph.main import _MODEL_DIRS
-    return {"models": list(_MODEL_DIRS.keys())}
+    import re
+    import yaml as _yaml
+    models_dir = Path(__file__).parent.parent / "python" / "zrt" / "training" / "configs" / "models"
+    result = []
+    for f in sorted(models_dir.glob("*.yaml")):
+        try:
+            d = _yaml.safe_load(f.read_text())
+            # Parse layers string e.g. "[dense]*3+[moe]*57+[mtp]*1"
+            layers_raw = d.get("layers", "")
+            layer_counts: dict = {}
+            if isinstance(layers_raw, str):
+                for m in re.finditer(r'\[(\w+)\]\*(\d+)', layers_raw):
+                    layer_counts[m.group(1)] = int(m.group(2))
+            # Attention type
+            kv_lora = d.get("kv_lora_rank")
+            num_kv  = d.get("num_kv_heads", d.get("num_heads", 1))
+            num_h   = d.get("num_heads", 1)
+            if kv_lora:
+                attn = "MLA"
+            elif num_kv == 1:
+                attn = "MQA"
+            elif num_kv < num_h:
+                attn = "GQA"
+            else:
+                attn = "MHA"
+            result.append({
+                "key":          f.stem,
+                "name":         d.get("name", f.stem),
+                "hidden":       d.get("hidden"),
+                "ffn":          d.get("ffn") if not d.get("num_experts") else d.get("moe_ffn"),
+                "num_heads":    num_h,
+                "num_kv_heads": num_kv,
+                "head_dim":     d.get("head_dim"),
+                "attn":         attn,
+                "vocab":        d.get("vocab"),
+                "seq_len":      d.get("seq_len"),
+                "layer_counts": layer_counts,
+                "num_experts":  d.get("num_experts"),
+                "top_k":        d.get("top_k"),
+                "param_dtype":  d.get("param_dtype"),
+                "is_moe":       bool(d.get("num_experts")),
+            })
+        except Exception:
+            result.append({"key": f.stem, "name": f.stem})
+    return {"models": result}
+
+
+@app.get("/models/{key}/raw", tags=["utility"], summary="Get raw model spec YAML content")
+def get_model_raw(key: str):
+    cfg = Path(__file__).parent.parent / "python" / "zrt" / "training" / "configs" / "models" / f"{key}.yaml"
+    if not cfg.exists():
+        raise HTTPException(404, detail=f"Model '{key}' not found")
+    return {"content": cfg.read_text()}
 
 
 # ── Job polling ───────────────────────────────────────────────────────────────
@@ -114,6 +225,37 @@ def get_job(job_id: str):
     if job is None:
         raise HTTPException(404, detail=f"Job '{job_id}' not found")
     return job
+
+
+@app.get("/jobs/{job_id}/artifacts/{filename}", tags=["jobs"], include_in_schema=False)
+def get_job_artifact(job_id: str, filename: str):
+    artifact = _resolve_job_artifact(job_id, filename)
+    if artifact.suffix == ".xlsx":
+        return FileResponse(
+            artifact,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=artifact.name,
+        )
+    return FileResponse(artifact, media_type="text/html")
+
+
+def _resolve_job_artifact(job_id: str, filename: str) -> Path:
+    with _lock:
+        job = _jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, detail=f"Job '{job_id}' not found")
+    result = job.get("result") or {}
+    candidates = {
+        result.get("html_filename"): result.get("html_path"),
+        result.get("excel_filename"): result.get("excel_path"),
+    }
+    path = candidates.get(filename)
+    if not path:
+        raise HTTPException(404, detail=f"Artifact '{filename}' not found")
+    artifact = Path(path)
+    if not artifact.exists() or artifact.name != filename:
+        raise HTTPException(404, detail=f"Artifact '{filename}' not found")
+    return artifact
 
 
 # ── POST /trace ───────────────────────────────────────────────────────────────
@@ -156,7 +298,7 @@ def _trace_worker(job_id: str, req: TraceRequest) -> None:
 
 
 def _do_trace(req: TraceRequest) -> dict:
-    from python.zrt.graph.main import run_trace_phases, _MODEL_DIRS
+    from python.zrt.pipeline import run_trace_phases, _MODEL_DIRS
 
     # Resolve model_id: 'local:<shorthand>' → absolute hf_models/ path
     if req.model_id.startswith("local:"):
@@ -277,7 +419,7 @@ def submit_estimate(req: EstimateRequest, bg: BackgroundTasks):
 def _estimate_worker(job_id: str, req: EstimateRequest) -> None:
     _update_job(job_id, status=JobStatus.RUNNING)
     try:
-        result = _do_estimate(req)
+        result = _do_estimate(req, job_id)
         _update_job(
             job_id,
             status=JobStatus.DONE,
@@ -293,18 +435,124 @@ def _estimate_worker(job_id: str, req: EstimateRequest) -> None:
         )
 
 
-def _do_estimate(req: EstimateRequest) -> dict:
+def _do_estimate(req: EstimateRequest, job_id: str) -> dict:
     from python.zrt.training.io.config_loader import load_specs
+    from python.zrt.training.ir.builders import build_graph
+    from python.zrt.training.models.flops import op_cost
     from python.zrt.training.search.estimator import estimate
     from python.zrt.training.search.report import report_summary, report_to_dict
+    from python.zrt.training.io.excel_exporter import export_estimate_excel
+    from python.zrt.training.io.html_exporter import export_estimate_html
 
     config_path, tmp = _resolve_yaml(req.config_path, req.config_content)
     try:
         model, system, strategy = load_specs(config_path)
-        report = estimate(model, system, strategy)
+
+        # Build graph once so we can reuse it for op_costs and estimate
+        graph = build_graph(model, strategy)
+
+        op_costs: dict = {}
+        for op in graph.ops:
+            op_costs[op.name] = op_cost(op, model, system)
+
+        report = estimate(model, system, strategy, graph=graph)
+
+        # Mirror CLI naming: {config_slug}_{YYYYMMDD_HHMMSS}.html
+        _slug = Path(req.config_path).stem if req.config_path else "estimate"
+        _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_dir = Path(req.output_dir) if req.output_dir else _estimates_dir
+        _base_name = f"{_slug}_{_ts}"
+        _html_filename = f"{_base_name}.html"
+        _excel_filename = f"{_base_name}.xlsx"
+        excel_path = export_estimate_excel(
+            report=report,
+            graph=graph,
+            model=model,
+            system=system,
+            strategy=strategy,
+            op_costs=op_costs,
+            output_path=out_dir / _excel_filename,
+        )
+        html_path = export_estimate_html(
+            report=report,
+            graph=graph,
+            model=model,
+            system=system,
+            strategy=strategy,
+            op_costs=op_costs,
+            output_path=out_dir / _html_filename,
+        )
+
+        # ── Structured model detail ──────────────────────────────────────
+        from collections import Counter
+        layer_counts = dict(Counter(str(l).split(".")[-1].lower() for l in model.layers))
+        is_mla = model.kv_lora_rank > 0
+        is_mqa = model.num_kv_heads == 1 and not is_mla
+        is_gqa = model.num_kv_heads < model.num_heads and not is_mla
+        attn_type = "MLA" if is_mla else ("MQA" if is_mqa else ("GQA" if is_gqa else "MHA"))
+        model_detail = {
+            "hidden":       model.hidden,
+            "ffn":          model.moe_ffn if model.num_experts else model.ffn,
+            "num_heads":    model.num_heads,
+            "num_kv_heads": model.num_kv_heads,
+            "head_dim":     model.head_dim,
+            "attn_type":    attn_type,
+            "vocab":        model.vocab,
+            "seq_len":      model.seq_len,
+            "num_layers":   len(model.layers),
+            "layer_counts": layer_counts,
+            "num_experts":  model.num_experts,
+            "top_k":        model.top_k,
+            "is_moe":       bool(model.num_experts),
+            "param_dtype":  str(model.param_dtype).split(".")[-1],
+            "total_params": model.total_params(),
+        }
+        # ── Structured hardware detail ────────────────────────────────────
+        gpu = system.gpu
+        try:
+            intra = system.interconnect.intra_node
+            inter = system.interconnect.inter_node
+            intra_info = f"{intra.type}  {intra.bandwidth_gbps} GB/s"
+            inter_info = f"{inter.type}  {inter.bandwidth_gbps} GB/s"
+        except Exception:
+            intra_info, inter_info = "", ""
+        hw_detail = {
+            "name":          gpu.name,
+            "bf16_tflops":   gpu.flops_bf16,
+            "fp8_tops":      gpu.flops_fp8,
+            "hbm_gb":        gpu.hbm_gb,
+            "hbm_bw_gbps":   gpu.hbm_bw_gbps,
+            "nodes":         system.nodes,
+            "gpus_per_node": system.gpus_per_node,
+            "world_size":    system.world_size,
+            "intra":         intra_info,
+            "inter":         inter_info,
+        }
+        # ── Structured strategy detail ────────────────────────────────────
+        strategy_detail = {
+            "tp": strategy.tp, "cp": strategy.cp,
+            "pp": strategy.pp, "ep": strategy.ep, "dp": strategy.dp,
+            "zero_stage":      strategy.zero_stage,
+            "micro_batch":     strategy.micro_batch,
+            "global_batch":    strategy.global_batch,
+            "num_microbatches": strategy.num_microbatches(),
+            "optimizer":       str(strategy.optimizer).split(".")[-1],
+            "tp_overlap":      str(strategy.tp_overlap).split(".")[-1],
+            "pp_schedule":     str(strategy.pp_schedule).split(".")[-1],
+        }
+
         return {
-            "summary": report_summary(report),
-            "data": report_to_dict(report),
+            "summary":         report_summary(report),
+            "data":            report_to_dict(report),
+            "html_filename":   _html_filename,
+            "excel_filename":  _excel_filename,
+            "html_url":        f"/jobs/{job_id}/artifacts/{_html_filename}",
+            "excel_url":       f"/jobs/{job_id}/artifacts/{_excel_filename}",
+            "html_path":       str(html_path),
+            "excel_path":      str(excel_path),
+            "model_detail":    model_detail,
+            "hw_detail":       hw_detail,
+            "strategy_detail": strategy_detail,
         }
     finally:
         if tmp:

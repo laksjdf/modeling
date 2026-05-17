@@ -115,6 +115,10 @@ class EstimateRequest(BaseModel):
         None,
         description="Raw YAML content (alternative to config_path).",
     )
+    output_dir: Optional[str] = Field(
+        None,
+        description="Directory for the generated HTML report. Defaults to output/estimates/.",
+    )
 
 
 class SearchRequest(BaseModel):
