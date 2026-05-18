@@ -43,6 +43,8 @@ class StepResult:
     Strict invariants (all in seconds):
       step_time        = pipeline_time + optimizer_time + optimizer_comm
       pipeline_time    = compute_time + exposed_comm
+      compute_time     = fwd_compute + bwd_compute + recompute_time
+      bubble           = warmup + cooldown   (absolute pipeline idle, seconds)
       exposed_comm     = tp_exposed + cp_exposed + ep_exposed + pp_exposed + dp_exposed
       hidden_comm      = dp_hidden + tp_hidden + ep_hidden
       total_comm_volume = exposed_comm + hidden_comm
@@ -57,6 +59,7 @@ class StepResult:
 
     # ── Pipeline structure (set by composers) ─────────────────────────────
     bubble_fraction: float = 0.0
+    bubble: float = 0.0             # Absolute pipeline-idle time = warmup + cooldown (s)
     warmup: float = 0.0
     steady: float = 0.0
     cooldown: float = 0.0
@@ -84,7 +87,15 @@ class StepResult:
     # ── Compute / comm breakdown (set by pipeline_step_time) ─────────────
     compute_time: float = 0.0       # Pure compute on critical path
     fwd_compute: float = 0.0        # Forward compute only (excludes all comm)
-    bwd_compute: float = 0.0        # Backward compute only (excludes all comm)
+    bwd_compute: float = 0.0        # Backward compute only (excludes comm AND recompute)
+    recompute_time: float = 0.0     # Activation-recompute fwd-redo on critical path.
+                                    # 0 with no recompute policy; >0 for full/selective.
+                                    # Part of compute_time, attributed out of bwd_compute.
+    recompute_time_raw: float = 0.0  # Raw recompute magnitude = M × max-over-stages
+                                    # per-mb recompute. NOT in step_time / compute_time:
+                                    # when the recomputed stage is not the pipeline
+                                    # bottleneck this work is hidden and recompute_time
+                                    # (critical-path) is 0 while this stays > 0.
     exposed_comm: float = 0.0       # Comm on critical path = Σ *_exposed fields
 
     # Per-group exposed comm (Σ = exposed_comm)
@@ -102,6 +113,14 @@ class StepResult:
 
     # Total comm volume = exposed + hidden
     total_comm_volume: float = 0.0  # All comm in step
+
+    def __post_init__(self) -> None:
+        # Absolute pipeline-idle time. Derived once here so every composer
+        # (and the pp=1 path) gets it without duplicating the expression.
+        # The dual-batch branch in pipeline_step_time mutates warmup/cooldown
+        # afterwards and re-derives bubble there explicitly.
+        if self.bubble == 0.0:
+            self.bubble = self.warmup + self.cooldown
 
 
 def _dp_hide_window(
@@ -582,6 +601,7 @@ def pipeline_step_time(
                 tp_exposed=st.tp_exposed,
                 ep_exposed=st.ep_exposed,
                 cp_exposed=st.cp_exposed,
+                recompute=st.recompute,
             )
             for st in stage_times
         ]
@@ -643,6 +663,7 @@ def pipeline_step_time(
         step.step_time = step.step_time - bubble_saved + dp_delta
         step.warmup = residual_bubble / 2.0
         step.cooldown = new_cooldown
+        step.bubble = step.warmup + step.cooldown
         step.dp_exposed = new_dp_exposed
         step.bubble_fraction = residual_bubble / step.step_time if step.step_time > 0 else 0.0
 
@@ -701,6 +722,30 @@ def pipeline_step_time(
     else:
         step.fwd_compute = step.compute_time
         step.bwd_compute = 0.0
+
+    # ── Recompute as its own term, attributed out of bwd_compute ──────────
+    # Recompute (activation-recompute fwd redo) is physically on the backward
+    # critical path, so the composer timeline and step_time already include
+    # it (it lives inside StageTime.bwd). Here we split it back OUT of
+    # bwd_compute into its own term so the report shows it explicitly.
+    #   compute_time = fwd_compute + bwd_compute + recompute_time   (exact)
+    # 0 when no recompute policy (s_bot.recompute == 0); >0 for full/selective.
+    if bwd_compute_per_mb > 0 and s_bot.recompute > 0:
+        rc_frac = min(1.0, s_bot.recompute / bwd_compute_per_mb)
+        step.recompute_time = step.bwd_compute * rc_frac
+        step.bwd_compute -= step.recompute_time
+    else:
+        step.recompute_time = 0.0
+
+    # Raw recompute magnitude: M × the heaviest recomputed stage's per-mb
+    # recompute. This is what recompute "costs" in compute regardless of
+    # whether the pipeline hides it. When the recomputed stage is NOT the
+    # bottleneck, recompute_time (critical path, above) is 0 while this is
+    # > 0 — the work runs inside a faster stage and adds nothing to
+    # step_time. Intentionally NOT part of step_time / compute_time.
+    step.recompute_time_raw = M * max(
+        (st.recompute for st in stage_times), default=0.0
+    )
 
     # ── Hidden comm ───────────────────────────────────────────────────────
     # DP AR hidden in pipeline bubble — independent, exact.

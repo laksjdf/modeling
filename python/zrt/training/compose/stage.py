@@ -32,6 +32,10 @@ class StageTime:
     tp_exposed: float = 0.0  # TP comm exposed after CoC/MC2 (fwd + bwd combined)
     ep_exposed: float = 0.0  # EP comm exposed after wave-overlap (fwd + bwd combined)
     cp_exposed: float = 0.0  # CP comm exposed — no overlap mechanism (fwd + bwd combined)
+    recompute: float = 0.0  # activation-recompute fwd-redo time. Kept inside `bwd`
+                            # for the pipeline timeline (it is on the bwd critical
+                            # path); tracked separately so it can be reported as
+                            # its own step-time term instead of hidden in bwd.
 
 
 def ep_imbalance_factor(num_experts: int, ep: int, topk: int = 1) -> float:
@@ -185,9 +189,15 @@ def stage_time(
         t_bwd_dx += dx_t
         t_bwd_dw += dw_t
 
-    # Recompute: re-do forward for selected ops before backward
+    # Recompute: re-do forward for selected ops before backward. It stays
+    # inside t_bwd_dx (it IS on the backward critical path, so the pipeline
+    # timeline and step_time are unchanged), but we also track it separately
+    # so the report can surface it as its own term instead of burying it in
+    # backward compute. t_recompute is carried through the same EP-imbalance
+    # scaling as bwd below, keeping the two consistent.
     recompute_t = _recompute_time(stage_ops, model, system, strategy, gpu_name)
     t_bwd_dx += recompute_t
+    t_recompute = recompute_t
 
     t_comm_fwd = 0.0
     t_comm_bwd = 0.0
@@ -274,6 +284,8 @@ def stage_time(
             t_fwd = t_fwd * (1 - ep_frac) + t_fwd * ep_frac * imb
             t_bwd_dx = t_bwd_dx * (1 - ep_frac) + t_bwd_dx * ep_frac * imb
             t_bwd_dw = t_bwd_dw * (1 - ep_frac) + t_bwd_dw * ep_frac * imb
+            # Keep tracked recompute consistent with the scaled bwd it lives in.
+            t_recompute = t_recompute * (1 - ep_frac) + t_recompute * ep_frac * imb
             # Apply imbalance to EP comm only (CP and TP are not EP-parallel)
             # Track the EP comm before imbalance to compute the delta
             ep_comm_fwd_before = t_ep_raw_comm_fwd
@@ -392,6 +404,7 @@ def stage_time(
         tp_exposed=t_tp_exposed_fwd + t_tp_exposed_bwd,
         ep_exposed=t_ep_exposed_fwd + t_ep_exposed_bwd,
         cp_exposed=t_cp_comm_fwd + t_cp_comm_bwd,
+        recompute=t_recompute,
     )
 
 

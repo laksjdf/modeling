@@ -664,6 +664,9 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 <script>
 const DATA = {json_data};
 const STEP_MS = {step_time_ms};
+const BUBBLE_MS = {bubble_ms};
+const RECOMPUTE_MS = {recompute_ms};
+const RECOMPUTE_RAW_MS = {recompute_raw_ms};
 
 function fmtF(v) {{
   if (v <= 0) return '—';
@@ -698,9 +701,13 @@ function buildMetrics() {{
   document.getElementById('hdr-meta').innerHTML =
     `<div class="hdr-stat">step <b>${{fmtMs(STEP_MS)}}</b></div>` +
     `<div class="hdr-stat">layers <b>${{DATA.layers.length}}</b></div>` +
-    `<div class="hdr-stat">ops <b>${{DATA.total_ops}}</b></div>`;
+    `<div class="hdr-stat">ops <b>${{DATA.total_ops}}</b></div>` +
+    `<div class="hdr-stat">bubble <b>${{fmtMs(BUBBLE_MS)}}</b></div>`;
   return `<div class="metrics">
     <div class="metric"><div class="metric-lbl">Step Time</div><div class="metric-val">${{fmtMs(STEP_MS)}}</div></div>
+    <div class="metric"><div class="metric-lbl">Bubble (abs)</div><div class="metric-val">${{fmtMs(BUBBLE_MS)}}</div></div>
+    <div class="metric"><div class="metric-lbl">Recompute (crit. path)</div><div class="metric-val">${{RECOMPUTE_MS>0?fmtMs(RECOMPUTE_MS):'0'}}</div></div>
+    <div class="metric"><div class="metric-lbl">Recompute (raw${{RECOMPUTE_RAW_MS>RECOMPUTE_MS+1e-9?', pipeline-hidden':''}})</div><div class="metric-val">${{RECOMPUTE_RAW_MS>0?fmtMs(RECOMPUTE_RAW_MS):'0'}}</div></div>
     <div class="metric"><div class="metric-lbl">Layers</div><div class="metric-val">${{DATA.layers.length}}</div></div>
     <div class="metric"><div class="metric-lbl">Dense</div><div class="metric-val">${{nD}}</div></div>
     <div class="metric"><div class="metric-lbl">MoE</div><div class="metric-val">${{nM}}</div></div>
@@ -892,6 +899,9 @@ def export_estimate_html(
     html = html.replace("{title}", f"{model.hidden}d {len(model.layers)}L")
     html = html.replace("{json_data}", json_data)
     html = html.replace("{step_time_ms}", str(report.step_time_ms))
+    html = html.replace("{bubble_ms}", str(report.bubble_ms))
+    html = html.replace("{recompute_ms}", str(report.recompute_time_ms))
+    html = html.replace("{recompute_raw_ms}", str(report.recompute_time_raw_ms))
 
     output_path.write_text(html, encoding="utf-8")
     return output_path
