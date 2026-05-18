@@ -248,3 +248,28 @@ def test_search_report_surfaces_bubble_and_recompute():
              if "Recompute" in l or "pre-hide" in l or "Bubble:" in l]
     for line in added:
         assert all(ord(c) < 0x2E80 for c in line), f"CJK in: {line!r}"
+
+
+def test_search_results_table_has_recompute_columns():
+    """grid-search results DataFrame (training_search_util.format_results)
+    must expose recompute critical + raw alongside bubble.
+
+    Regression guard for the columns added in PR #109 — keeps the search
+    results table (results_summary.csv / printed top-5 / best-config Excel
+    grouping) from silently dropping recompute time again.
+    """
+    from zrt.training.search.estimator import estimate
+    from zrt.training.search.training_search_util import format_results
+
+    model, system = _model(), _system()
+    strategy = Strategy(
+        tp=1, cp=1, pp=2, ep=1, dp=4, micro_batch=1, global_batch=8,
+        recompute=RecomputePolicy(per_layer={"dense": {"full"}}),
+    )
+    report = estimate(model, system, strategy)
+    df = format_results([report], [{"model": "m"}])
+
+    for col in ("recompute_time_ms", "recompute_time_raw_ms",
+                "bubble_time_ms", "bubble_fraction"):
+        assert col in df.columns, f"{col} missing from results table"
+    assert df.iloc[0]["recompute_time_raw_ms"] > 0.0
