@@ -822,7 +822,7 @@ if __name__ == "__main__":
 
     training_param_grid = {
         "model": ["deepseek_v4_pro"],
-        "hw": ["nvidia_h100_sxm"],
+        "hw": ["nvidia_b300"],
         "world_size": [8192],
         "tp": [1, 2, 4, 8, 16],
         "cp": [1, 2, 4, 8, 16],
