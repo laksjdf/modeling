@@ -543,6 +543,11 @@ def format_results(reports: List[TrainingReport], configs: List[Dict]) -> pd.Dat
 
         d["fwd_compute_ms"] = round(report.fwd_compute_ms, 2)
         d["bwd_compute_ms"] = round(report.bwd_compute_ms, 2)
+        # Recompute split out of bwd_compute: critical = on critical path
+        # (counts toward step_time); raw = M × heaviest recomputed stage
+        # (NOT in step_time; > critical when pipeline-hidden).
+        d["recompute_time_ms"] = round(report.recompute_time_ms, 2)
+        d["recompute_time_raw_ms"] = round(report.recompute_time_raw_ms, 2)
         d["exposed_comm_ms"] = round(report.exposed_comm_ms, 2)
         d["tp_total_ms"] = round(report.tp_total_ms, 2)
         d["tp_exposed_ms"] = round(report.tp_exposed_ms, 2)
@@ -581,7 +586,8 @@ def format_results(reports: List[TrainingReport], configs: List[Dict]) -> pd.Dat
     if not df.empty:
         df = df.sort_values("mfu", ascending=False)
 
-    metric_cols = ["fwd_compute_ms", "bwd_compute_ms", "exposed_comm_ms",
+    metric_cols = ["fwd_compute_ms", "bwd_compute_ms",
+                   "recompute_time_ms", "recompute_time_raw_ms", "exposed_comm_ms",
                    "tp_total_ms", "tp_exposed_ms", "cp_total_ms", "cp_exposed_ms",
                    "ep_total_ms", "ep_exposed_ms", "pp_total_ms", "pp_exposed_ms",
                    "dp_total_ms", "dp_exposed_ms",
