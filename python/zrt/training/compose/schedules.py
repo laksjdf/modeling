@@ -342,14 +342,13 @@ class Interleaved1F1BComposer(PipelineComposer):
 
 
 class DualPipeComposer(PipelineComposer):
-    """DualPipe schedule — forward and backward on different stages in parallel.
+    """DualPipe schedule — two anti-parallel micro-batch streams.
 
-    Key insight: in standard 1F1B, each stage alternates F then B.
-    DualPipe splits the pipeline so that while stage S does forward,
-    stage S+1 does backward, reducing bubble.
-
-    Bubble fraction ≈ (pp - 1) / (2 * M + pp - 1)
-    Step time ≈ (M + (pp-1)/2) * t_stage + dp_exposed
+    Reference: DualPipe README bubble formula (PP/2−1)(F&B+B−3W)
+      F&B = max(F,B): execution time of two mutually overlapped F+B chunks
+      B:   one additional full backward exposed per warmup/cooldown slot
+      3W:  three bwd_dw chunks deferred out of each bubble slot
+    pp=2: factor = 0 → zero bubble (both streams start simultaneously).
     """
 
     def compose(
@@ -366,11 +365,11 @@ class DualPipeComposer(PipelineComposer):
         t_fwd_max = max((st.fwd for st in stage_times), default=0.0)
         t_bwd_max = max((st.bwd for st in stage_times), default=0.0)
         t_stage_max = t_fwd_max + t_bwd_max
+        t_fb = max(t_fwd_max, t_bwd_max)                              # F&B = max(F,B)
+        t_w  = max((st.bwd_dw for st in stage_times), default=0.0)   # W = bwd_dw
 
-        # Reference: DualPipe README formula (PP/2-1)*t_stage
-        # pp=2: two anti-parallel streams perfectly fill each other → zero bubble
-        # pp=3: half-stage bubble (not floored to zero)
-        bubble = max(pp / 2 - 1, 0) * t_stage_max
+        # (PP/2-1)(F&B+B-3W) — DualPipe README
+        bubble = max(pp / 2 - 1, 0) * max(t_fb + t_bwd_max - 3 * t_w, 0.0)
         warmup = bubble / 2.0
         cooldown = bubble / 2.0
         steady = M * t_stage_max
@@ -407,7 +406,8 @@ class DualPipeVComposer(PipelineComposer):
     """DualPipeV — DualPipe with virtual stage splitting.
 
     Combines DualPipe's F/B parallelism with VPP's virtual stages.
-    Bubble ≈ (pp - 1) / (2 * V * M + pp - 1)
+    Reference: DualPipe README bubble formula (PP/2−1)(F&B+B−3W)/V
+    Same per-slot cost as DualPipe, reduced by V virtual-stage chunks.
     """
 
     def compose(
@@ -427,11 +427,11 @@ class DualPipeVComposer(PipelineComposer):
         t_fwd_max = max((st.fwd for st in stage_times), default=0.0)
         t_bwd_max = max((st.bwd for st in stage_times), default=0.0)
         t_stage_max = t_fwd_max + t_bwd_max
+        t_fb = max(t_fwd_max, t_bwd_max)                              # F&B = max(F,B)
+        t_w  = max((st.bwd_dw for st in stage_times), default=0.0)   # W = bwd_dw
 
-        # Reference: DualPipeV README formula (PP/2-1)/V*t_stage
-        # pp=2: two anti-parallel streams perfectly fill each other → zero bubble
-        # pp=3: half-stage bubble (not floored to zero)
-        bubble = max(pp / 2 - 1, 0) / V * t_stage_max
+        # (PP/2-1)(F&B+B-3W)/V — DualPipe README (V-chunk variant)
+        bubble = max(pp / 2 - 1, 0) / V * max(t_fb + t_bwd_max - 3 * t_w, 0.0)
         warmup = bubble / 2.0
         cooldown = bubble / 2.0
         steady = M * t_stage_max
