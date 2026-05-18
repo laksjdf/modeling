@@ -357,3 +357,40 @@ PYTHONPATH=python pytest tests/training/anchors/test_anchors.py -v
 2. ✅ `OpGraph.from_model_spec(model, strategy)` 产生节点数和类型与 `build_graph()` 一致的 OpGraph
 3. ✅ 所有现有训练测试通过（无回归）
 4. ✅ Stack A 和 Stack B 保持独立执行路径 —— 互不强依赖对方的运行时
+
+---
+
+## TrainingReport 通信时间字段说明（2026-05-15 更新）
+
+`TrainingReport` 提供两种通信时间视角：
+
+### 按可见性分类（exposed / hidden）
+
+- **暴露通信（exposed）**：位于关键路径上，直接增加步骤时间
+  - `tp_exposed_ms`: TP RS/AG（经 CoC/MC2 减缩后的暴露部分）
+  - `cp_exposed_ms`: CP A2A
+  - `ep_exposed_ms`: EP A2A（经 wave-overlap 减缩后）
+  - `pp_exposed_ms`: PP P2P
+  - `dp_exposed_ms`: DP AR/RS
+  - `exposed_comm_ms` = Σ 以上字段
+
+- **隐藏通信（hidden）**：与计算重叠运行，不在关键路径
+  - `tp_hidden_ms`: TP 被 CoC/MC2 隐藏
+  - `ep_hidden_ms`: EP 被 wave-overlap 隐藏
+  - `dp_hidden_ms`: DP AR 吸收在流水线气泡中
+  - `hidden_comm_ms` = Σ 以上字段
+
+### 按策略汇总（total）
+
+- **各策略总通信时间** = exposed + hidden
+  - `tp_total_ms` = tp_exposed_ms + tp_hidden_ms
+  - `cp_total_ms` = cp_exposed_ms（CP 无隐藏）
+  - `ep_total_ms` = ep_exposed_ms + ep_hidden_ms
+  - `pp_total_ms` = pp_exposed_ms（PP 无隐藏）
+  - `dp_total_ms` = dp_exposed_ms + dp_hidden_ms
+  - `total_comm_volume_ms` = Σ 以上字段（与 exposed_comm_ms + hidden_comm_ms 相同）
+
+### 使用场景
+
+- **搜索表格汇总**：`training_search_util.py` 使用 `*_total_ms` 字段展示各策略通信开销
+- **性能诊断**：`*_exposed_ms` 识别瓶颈，`*_hidden_ms` 评估重叠效率

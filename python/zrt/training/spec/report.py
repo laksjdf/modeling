@@ -67,6 +67,7 @@ class TrainingReport:
     # Efficiency metrics
     mfu: float = 0.0
     hfu: float = 0.0
+    mfu_native: float = 0.0   # MFU vs dtype-weighted effective peak
 
     # FLOPs breakdown
     total_flops: float = 0.0  # [Stack A]
@@ -135,6 +136,13 @@ class TrainingReport:
     # Total comm volume = exposed + hidden
     total_comm_volume_ms: float = 0.0
 
+    # Per-strategy total comm (exposed + hidden)
+    tp_total_ms: float = 0.0
+    cp_total_ms: float = 0.0
+    ep_total_ms: float = 0.0
+    pp_total_ms: float = 0.0
+    dp_total_ms: float = 0.0
+
     # Config info
     config_summary: str | dict = ""  # [Stack B] uses str, [Stack A] uses dict
     warnings: list[str] = field(default_factory=list)  # [Stack A]
@@ -199,6 +207,11 @@ class TrainingReport:
             "tp_hidden_ms": self.tp_hidden_ms,
             "ep_hidden_ms": self.ep_hidden_ms,
             "total_comm_volume_ms": self.total_comm_volume_ms,
+            "tp_total_ms": self.tp_total_ms,
+            "cp_total_ms": self.cp_total_ms,
+            "ep_total_ms": self.ep_total_ms,
+            "pp_total_ms": self.pp_total_ms,
+            "dp_total_ms": self.dp_total_ms,
         }
 
         # Add optional fields if present

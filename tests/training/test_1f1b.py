@@ -40,7 +40,9 @@ def test_single_stage_no_bubble():
 
 
 def test_single_stage_dp_allreduce_overlaps_backward_when_enabled():
-    """PP=1 has no pipeline bubble, but DDP buckets can overlap backward."""
+    """PP=1: DP grad reduce overlaps backward via steady-BWD window.
+    bwd=2.0, M=4 → steady_bwd_total=8.0. With default ratio=0.5,
+    window=0+0.5*8.0=4.0. dp_ar_time=3.0 < 4.0 → fully hidden."""
     stage = [StageTime(fwd=1.0, bwd=2.0)]
     strategy = Strategy(tp=1, pp=1, dp=4, micro_batch=1, global_batch=4)
 

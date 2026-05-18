@@ -10,8 +10,10 @@ compute:
   int8_tops: 1978
   int4_tops: 3958
   fp8_tops: 3958
+  fp4_tops: 0       # H800 has no native FP4; falls back to FP8 peak at runtime
 
   sram_kb_per_sm: 228  # Same SM as H100: 228 KB shared memory/L1 per SM
+  ep_overlap_waves: 4   # K-wave EP A2A overlap (CUDA stream-based, DeepSeek-style)
 
 memory:
   capacity_gb: 80

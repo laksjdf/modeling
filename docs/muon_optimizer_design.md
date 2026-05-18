@@ -185,37 +185,58 @@ Step 3 — ReduceScatter 结果（或直接按行切片）
 
 ## 4. 现状分析
 
-### 4.1 已有代码路径
+> **2026-05-15 更新**：P1–P6 全部已修复并通过测试（38/38 单元测试通过）。
+> 本节保留为历史记录，标注各问题的修复状态。
+
+### 4.1 代码路径（当前状态）
 
 ```
 python/zrt/training/spec/strategy.py
   └── OptKind(Enum): ADAM | MUON         ✅ 枚举已定义
+  └── MuonConfig(dataclass)              ✅ ns_steps / muon_param_fraction / rotation 等字段
 
 python/zrt/training/models/memory.py
-  └── _optimizer_state_bytes()           ⚠️  Muon: int(P * 4 * 2.1) 占位符
+  └── _optimizer_state_bytes()           ✅ int(P × (12 - f_muon × 4))，混合参数正确分离
 
 python/zrt/transform/training/optimizer.py
-  └── OptimizerPass._opt_state_bytes()   ⚠️  Muon: params * 4 + params * 2 错误
-  └── OptimizerPass._opt_step_flops()    ⚠️  Muon: params * 16 占位符（无 NS 建模）
+  └── OptimizerPass._opt_state_bytes()   ✅ int(params × (12 - f_muon × 4))，与 memory.py 一致
+  └── OptimizerPass._opt_step_flops()    ✅ 调用 muon_optimizer_step_flops()，含 NS 矩阵乘法建模
 
 python/zrt/transform/analysis/training.py
-  └── TrainingMemoryPass                 ⚠️  opt_bytes_per_param = 8 if muon（正确但无混合参数支持）
-  └── TrainingPipelinePass               ⚠️  optimizer step time 未计入 step_time
+  └── TrainingMemoryPass                 ✅ 使用 muon_param_fraction 正确分离 Muon/Adam 参数
+  └── TrainingPipelinePass               ✅ optimizer step time 已计入 step_time
 
 python/zrt/training/models/comm.py
-  └── total_comm_time()                  ❌  Muon 优化器步骤 AllGather 完全未建模
+  └── total_comm_time()                  ✅ 调用 optimizer_comm_time()，建模 Muon AG+RS
+
+python/zrt/training/compose/schedules.py
+  └── _compute_optimizer_time()          ✅ EP 和 ZeRO-1/2 分片均已正确应用（a4a6d25）
+  └── StepResult.optimizer_comm          ✅ Muon AG+RS 通信单独列出
 ```
 
-### 4.2 问题清单
+### 4.2 问题清单（历史）
 
-| # | 位置 | 问题 |
-|---|------|------|
-| P1 | `memory.py:_optimizer_state_bytes` | 2.1 系数无根据，应为 2.0 |
-| P2 | `optimizer.py:_opt_state_bytes` | `params * 4 + params * 2 = 6B/param`，应为 8B/param |
-| P3 | `optimizer.py:_opt_step_flops` | 16 FLOPs/param 未建模 NS 矩阵乘法（差距可达 1000×） |
-| P4 | `comm.py:total_comm_time` | Muon ZeRO AllGather 未建模 |
-| P5 | 全局 | 无 Muon 参数覆盖范围配置（embed/head 必须用 Adam） |
-| P6 | `pipeline.py:StepResult` | optimizer step time 未加入 step_time |
+| # | 位置 | 原问题 | 状态 |
+|---|------|--------|------|
+| P1 | `memory.py:_optimizer_state_bytes` | 2.1 系数无根据 | ✅ 修复：`int(P × (12 - f_muon × 4))` |
+| P2 | `optimizer.py:_opt_state_bytes` | `6B/param` 计算错误 | ✅ 修复：`int(params × (12 - f_muon × 4))` |
+| P3 | `optimizer.py:_opt_step_flops` | `16 FLOPs/param` 无 NS 建模 | ✅ 修复：接入 `muon_optimizer_step_flops()` |
+| P4 | `comm.py:total_comm_time` | Muon ZeRO AllGather 未建模 | ✅ 修复：新增 `optimizer_comm_time()` |
+| P5 | 全局 | 无 Muon 参数覆盖范围配置 | ✅ 修复：`MuonConfig.muon_param_fraction` |
+| P6 | `schedules.py:StepResult` | optimizer step time 未计入 step_time | ✅ 修复：`step_time += optimizer_time + optimizer_comm` |
+
+### 4.3 验证结果（2026-05-15）
+
+对 LLaMA-3 70B（TP=4, PP=4, DP=4, ZeRO-2, H100×64）运行内存验证，所有指标通过（≤10% 误差）：
+
+| 指标 | 期望值 | 实测误差 | 结论 |
+|------|--------|---------|------|
+| 优化器状态内存（Muon, ZeRO-2） | `P_rank × 8.6B / DP` | 0.0% | ✅ |
+| 峰值阶段（激活主导，peak = backward） | `peak_overall == peak_backward` | — | ✅ |
+| 梯度内存（FP32, ZeRO-2） | `P_rank × 4B / DP` | 0.0% | ✅ |
+| Muon vs Adam 内存节省 | 28.3%（预期 25–31%） | — | ✅ |
+
+> 注：`grad_dtype` 默认为 **FP32（4B/param）**，非 fp16。验证脚本见 `.omc/specs/deep-dive-investigate-memory-consumption-muon-optimizer.md`。
 
 ---
 
@@ -419,6 +440,66 @@ if optimizer in ("adam", "adamw"):
 elif optimizer == "muon":
     opt_bytes = (P_muon * 8 + P_adam * 12) / opt_shard
 ```
+
+#### 5.2.3 时序阶段排序与 PP 并行注意事项 (Temporal Phase Ordering and PP In-Flight Caveat)
+
+训练内存模型采用**顺序阶段假设**：单个 microbatch 的前向、反向、优化器步骤在时间上不重叠。
+
+##### 阶段内存组成
+
+```
+[Forward:  weights + activations + comm_buffers]
+    ↓
+[Backward:  weights + activations + grads + comm_buffers]
+    ↓
+[Optimizer: weights + grads + opt_state]
+```
+
+**关键原则**：`peak_overall = max(peak_forward, peak_backward, peak_optimizer)`，而非三者之和。每个阶段展示的是**单个 microbatch 同时驻留的内存分量**。
+
+##### PP In-Flight 注意事项
+
+在 `PP > 1` 的 steady-state 管线中（如 1F1B 调度），`PP` 个 microbatches 同时在不同 stage 中执行。`_pp_in_flight()` 返回最坏负载 rank 上同时进行的 microbatch 数量（对于 1F1B 为 `PP`）。
+
+**激活内存已缩放**：`peak_backward` 中的激活内存已经乘以此数量（`memory.py:376-379`）。因此 `peak_backward` 反映的是 steady-state 重叠后的实际峰值，而非单个 microbatch 的贡献。
+
+```
+# memory.py 中的实现（简化示意）
+num_inflight = _pp_in_flight(model, strategy)
+peak_backward = weights + (activations * num_inflight) + grads + comm_buffers
+```
+
+**sequential 阶段标签**描述的是**单个 microbatch 的驻留语义**，而非 steady-state 重叠现实。
+
+##### ZeRO 分级对峰值的影响
+
+| ZeRO Stage | 权重 (weights) | 梯度 (grads) | 优化器状态 (opt_state) |
+|------------|----------------|--------------|----------------------|
+| ZeRO-0     | 复制 (replicated) | 复制 | 复制 |
+| ZeRO-1     | 复制 | 复制 | **DP 分片** |
+| ZeRO-2     | 复制 | **DP 分片** | **DP 分片** |
+| ZeRO-3     | **DP 分片** | **DP 分片** | **DP 分片** |
+
+**`peak_optimizer` 不包含激活内存**：优化器步骤在反向完成后运行，此时激活已释放。因此 `peak_optimizer = weights + grads + opt_state`（无 activations）。
+
+**验证**：对于 LLaMA-3 70B 规模（激活 >> 优化器状态），`peak_overall == peak_backward` 恒成立（参见验证报告 `.omc/specs/deep-dive-muon-verification-report.md`）。
+
+##### NS 执行期间的瞬时内存峰值
+
+`peak_optimizer` 还需计入两类仅在优化器步骤期间存在的瞬时缓冲：
+
+| 来源 | 大小 | 触发条件 |
+|------|------|---------|
+| AllGather 动量缓冲 | `P_muon × 4B × (DP-1)/DP` | ZeRO-1/2/3 且 DP > 1 |
+| 中间矩阵 A = XₖᵀXₖ | `max_short_dim² × 4B`（最大权重矩阵，逐矩阵计算）| 始终存在 |
+
+**为何不计入 `total`**：这两项是瞬时缓冲（NS 步骤结束即释放），
+`total` 仅对各常驻分量求和作为保守上界。
+
+**影响范围**：对大 DP（如 DP=64）模型，AllGather 缓冲趋近于 `P_muon × 4B`（接近完整动量），
+而 ZeRO 分片后的 `opt_state` 仅为 `P_muon × 4B / 64`——差距约 63×。
+在序列长度较短或全量重计算场景下，`peak_optimizer` 可能超过 `peak_backward`，
+进而影响 `peak_overall`（即 OOM 相关的约束性峰值）。
 
 ### 5.3 FLOPs 模型
 

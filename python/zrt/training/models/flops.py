@@ -604,10 +604,20 @@ def recompute_overhead_flops(
     appears in ``RecomputePolicy.per_layer`` are counted.
 
     Only counts compute-bound ops, consistent with total_training_flops.
+
+    FlashAttention-family kernels (``attn_core``/``sparse_attn``/``hca_attn``/
+    ``swa_attn``) have a backward FLOPs convention of ``2.5×fwd`` — the extra
+    ``0.5×fwd`` already represents FA's mandatory internal recompute of
+    scores. Adding their forward FLOPs here again would triple-count
+    attention. So we skip those op kinds from the overhead; non-FA targets
+    (QKV/O linear projections, indexer/compressor, swiGLU, ln) keep their
+    existing accounting.
     """
     rc = strategy.recompute
     if not rc.per_layer:
         return 0.0
+
+    FA_KERNEL_KINDS = {"attn_core", "sparse_attn", "hca_attn", "swa_attn"}
 
     extra = 0.0
     for op in graph.ops:
@@ -621,29 +631,53 @@ def recompute_overhead_flops(
 
         op_cats = _op_recompute_categories(op)
         if "full" in cats or (op_cats & cats):
+            if op.kind in FA_KERNEL_KINDS:
+                continue
             cost = op_cost(op, model, system)
-            if _is_compute_bound(cost, "fwd", system):
-                extra += _accounted_flops(cost, "fwd")
+            # Mirror _recompute_time (compose/stage.py) which counts the
+            # actual recompute time including memory-bound ops. The previous
+            # _is_compute_bound gate dropped low-AI ops like mhc_pre /
+            # mhc_post (AI<10 vs B300 ridge=625), so HFU stayed equal to MFU
+            # while step time grew — accounting drift between the two sides.
+            extra += _accounted_flops(cost, "fwd")
 
     M = strategy.num_microbatches()
     return extra * M
 
 
 def _op_recompute_categories(op: Op) -> set[str]:
-    """Map an op to its recompute category set."""
+    """Map an op to its recompute category set.
+
+    Recompute categories:
+
+    - ``"attn_core"`` — FA-kernel attention ops + indexer / compressor pool
+      (selective recompute, Megatron-LM ``selective`` flavor).
+    - ``"attn_block"`` — everything in ``"attn_core"`` *plus* the QKV / O
+      linear projections (block recompute, the heavier flavor).
+    - ``"attn"`` — deprecated alias of ``"attn_block"``. Returned alongside
+      ``"attn_block"`` on every op that matches the heavier scope so that
+      legacy YAML configurations keep working unchanged.
+    - ``"ffn_swiglu"`` — FFN up / gate / down projections + SwiGLU.
+    - ``"ln"`` — LayerNorm / RMSNorm.
+    - ``"hc"`` — DeepSeek-V4 mhc_pre / mhc_post / mhc_head.
+    """
     if op.kind in ("attn_core", "sparse_attn", "hca_attn", "swa_attn"):
-        return {"attn"}
+        # FA kernel: in scope for both selective ("attn_core") and block
+        # recompute ("attn_block"). Note: FA kernel forwards are still
+        # skipped from overhead by recompute_overhead_flops (FA dedup).
+        return {"attn_core", "attn_block", "attn"}
     if op.kind == "matmul":
         name = op.name.lower()
         if any(k in name for k in ("qkv", "q_a_proj", "q_b_proj", "kv_a_proj",
                                     "kv_b_proj", "o_proj", "wq_a", "wq_b",
                                     "wkv", "wo_a", "wo_b")):
-            return {"attn"}
+            # QKV / O linear projections: NOT selective-scope; only block.
+            return {"attn_block", "attn"}
         if "up_proj" in name or "gate_proj" in name or "down_proj" in name:
             return {"ffn_swiglu"}
         return set()
     if op.kind in ("compressor_pool", "indexer_topk"):
-        return {"attn"}
+        return {"attn_core", "attn_block", "attn"}
     if op.kind == "swiglu":
         return {"ffn_swiglu"}
     if op.kind == "ln":

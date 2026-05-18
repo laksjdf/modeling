@@ -282,6 +282,50 @@ class TestFormatResults:
         assert df.iloc[1]["mfu"] == 0.4
         assert df.iloc[2]["mfu"] == 0.3
 
+    def test_format_results_includes_comm_totals(self):
+        """验证 format_results 包含各策略的通信总时间字段，且列按策略分组."""
+        report = TrainingReport(
+            step_time_ms=100.0,
+            mfu=0.45,
+            tp_exposed_ms=5.0,
+            tp_hidden_ms=2.0,
+            tp_total_ms=7.0,
+            cp_exposed_ms=3.0,
+            cp_total_ms=3.0,
+            ep_exposed_ms=4.0,
+            ep_hidden_ms=1.0,
+            ep_total_ms=5.0,
+            pp_exposed_ms=2.0,
+            pp_total_ms=2.0,
+            dp_exposed_ms=6.0,
+            dp_hidden_ms=3.0,
+            dp_total_ms=9.0,
+        )
+        config = {"model": "test", "tp": 8, "cp": 2, "ep": 64, "pp": 4}
+
+        df = format_results([report], [config])
+
+        assert "tp_total_ms" in df.columns
+        assert "tp_exposed_ms" in df.columns
+        assert "cp_total_ms" in df.columns
+        assert "cp_exposed_ms" in df.columns
+        assert "ep_total_ms" in df.columns
+        assert "ep_exposed_ms" in df.columns
+        assert "pp_total_ms" in df.columns
+        assert "pp_exposed_ms" in df.columns
+        assert "dp_total_ms" in df.columns
+        assert "dp_exposed_ms" in df.columns
+        assert df.iloc[0]["tp_total_ms"] == 7.0
+        assert df.iloc[0]["tp_exposed_ms"] == 5.0
+        assert df.iloc[0]["cp_total_ms"] == 3.0
+        assert df.iloc[0]["cp_exposed_ms"] == 3.0
+        assert df.iloc[0]["ep_total_ms"] == 5.0
+        assert df.iloc[0]["ep_exposed_ms"] == 4.0
+        assert df.iloc[0]["pp_total_ms"] == 2.0
+        assert df.iloc[0]["pp_exposed_ms"] == 2.0
+        assert df.iloc[0]["dp_total_ms"] == 9.0
+        assert df.iloc[0]["dp_exposed_ms"] == 6.0
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

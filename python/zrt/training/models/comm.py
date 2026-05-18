@@ -5,6 +5,8 @@ Per-collective cost using topology-aware latency and bandwidth.
 
 from __future__ import annotations
 
+import math
+
 from zrt.hardware.spec import LinkSpec
 from zrt.training.ir.training_graph import Collective, Graph
 from zrt.training.spec.model import ModelSpec
@@ -49,6 +51,14 @@ def collective_time(c: Collective, group_size: int, link: LinkSpec) -> float:
         return 2 * (N - 1) * (alpha + (S / N) * beta)
 
     if c.kind == "A2A":
+        if full_connectivity:
+            # NVSwitch-class: single-step A2A
+            return alpha + (S / N) * beta
+        # NCCL/HCCL use Bruck (log2 rounds) above ~16 ranks; below that,
+        # pairwise-exchange is competitive and matches the legacy formula.
+        if N > 16:
+            rounds = max(1, math.ceil(math.log2(N)))
+            return rounds * alpha + ((N - 1) / N) * S * beta
         return (N - 1) * (alpha + (S / N) * beta)
 
     if c.kind == "P2P":
@@ -91,7 +101,16 @@ def total_comm_time(
     # DP gradient reduction (at step end)
     if strategy.dp > 1:
         P = _params_on_rank_for_dp(model, strategy)
-        grad_bytes = P * model.grad_dtype.bytes
+        # Routed expert grads stay in the EP group (no DP AR) when EP > 1.
+        # Subtract their per-rank contribution so the DP volume reflects only
+        # non-expert + shared-expert grads.
+        if strategy.ep > 1 and model.num_experts > 0:
+            from zrt.training.models.memory import _routed_expert_params_on_rank
+            P_expert_on_rank = _routed_expert_params_on_rank(model, strategy)
+            P_dp = max(0, P - P_expert_on_rank)
+        else:
+            P_dp = P
+        grad_bytes = int(P_dp * model.grad_dtype.bytes)
         dp_c = Collective(
             name="dp_grad_reduce", kind="AR" if strategy.zero_stage == 0 else "RS",
             group="DP", bytes_=grad_bytes, inserted_after="optimizer_step",
@@ -272,6 +291,10 @@ def _params_on_rank_for_dp(model: ModelSpec, strategy: Strategy) -> int:
         non_embed = int(non_embed * (n_layers / strategy.pp) / n_layers)
         total = non_embed + embed_params // strategy.pp
 
-    if strategy.zero_stage >= 2:
-        total //= strategy.dp
+    # NOTE: do NOT divide by dp here. The alpha-beta formula
+    #   T_RS = (N-1)·(α + S/N·β)
+    # in collective_time() already divides S by N. Passing S = full_per_rank
+    # gradient volume is what the textbook expects. ZeRO stage only changes
+    # whether the collective is AR (zero=0) or RS (zero>=1); the input volume
+    # to the collective is the same per-rank gradient produced by backward.
     return total

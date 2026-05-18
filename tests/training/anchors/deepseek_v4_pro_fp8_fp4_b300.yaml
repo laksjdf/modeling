@@ -1,0 +1,32 @@
+# V4-Pro under deepseek_v4_fp8_fp4 quant preset on B300 (Blackwell, native FP4).
+# Calibration mode: no published MFU baseline.
+
+name: deepseek_v4_pro_fp8_fp4_b300
+description: "DeepSeek-V4-Pro 1.6T, B300, TP8 PP4 EP64 DP4, FP8+FP4 mixed quant"
+model:
+  base: deepseek_v4_pro
+  quant_preset: deepseek_v4_fp8_fp4
+system:
+  hw: nvidia_b300
+  nodes: 8
+  gpus_per_node: 8
+  host_mem_gb: 2048
+config:
+  tp: 8
+  pp: 4
+  ep: 64
+  dp: 2
+  zero_stage: 1
+  micro_batch: 1
+  global_batch: 512
+  pp_schedule: dualpipev
+  optimizer: muon
+  muon_config:
+    ns_steps: 10
+    rotation: true
+    adam_param_types: ["embed", "lm_head", "router", "bias"]
+    muon_param_fraction: 0.85
+targets:
+  mfu: 0.40
+  tolerance: 0.50
+  strict_mfu_check: false

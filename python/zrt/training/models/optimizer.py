@@ -127,3 +127,94 @@ def muon_optimizer_step_flops(
     adam_flops = adam_step_flops(P_adam)
 
     return muon_flops + adam_flops
+
+
+def _ns_pair_flops(m: int, n: int, K: int) -> int:
+    """Per-matrix NS budget: 80% stage-1 (6·max·min²) + 20% stage-2 (4·max·min²)."""
+    k1 = max(1, int(K * 0.8))
+    k2 = max(1, K - k1)
+    return ns_flops(m, n, k1) + ns_flops_stage2(m, n, k2)
+
+
+def muon_step_flops_from_arch(
+    model,
+    strategy,
+    K: int,
+    muon_fraction: float = 0.85,
+) -> int:
+    """Architecture-driven per-rank Muon NS FLOPs.
+
+    Walks the explicit weight-matrix inventory instead of inferring count
+    from per-rank P. The legacy ``num_matrices = P // hidden²`` path clamps
+    to 1 once ZeRO + EP shrink P below hidden², which makes optimizer time
+    a constant across the entire search grid.
+
+    Sharding model (matches the rest of the simulator):
+      * Routed experts are placed across the EP dimension; the remaining
+        DP/EP replica factor (``dp // ep``, clamped to ≥1) further splits
+        per-expert NS work under ZeRO-1/3.
+      * Attention + shared experts + dense FFN replicate across EP and are
+        ZeRO-sharded across the **full** DP group.
+      * All weight matrices are TP-column-sharded (NS still operates on the
+        TP-Gathered row dim = ``hidden``, col dim = sharded).
+      * PP shards layers across the ``pp`` stages.
+    """
+    h = model.hidden
+    tp = max(1, strategy.tp)
+    ep = max(1, strategy.ep)
+    pp = max(1, strategy.pp)
+    dp = max(1, strategy.dp)
+
+    n_moe = sum(1 for l in model.layers if l.value == "moe")
+    n_dense = sum(1 for l in model.layers if l.value == "dense")
+    n_mtp = sum(1 for l in model.layers if l.value == "mtp")
+
+    moe_ffn_col = max(1, model.moe_ffn // tp) if model.moe_ffn else 0
+    ffn_col = max(1, model.ffn // tp) if model.ffn else 0
+    attn_col = max(1, h // tp)
+
+    ns_attn = _ns_pair_flops(h, attn_col, K)
+    ns_moe_ffn = _ns_pair_flops(h, moe_ffn_col, K) if moe_ffn_col else 0
+    ns_dense_ffn = _ns_pair_flops(h, ffn_col, K) if ffn_col else 0
+
+    # ── Cluster-wide per-layer NS FLOPs ───────────────────────────────
+    n_shared = max(1, getattr(model, "n_shared_experts", 1) or 1)
+
+    # Attention: ~5 NS-eligible weight matrices per layer (V3 MLA / V4
+    # grouped-MQA both fit this envelope: q_a / q_b / k_a-or-wkv / wo_a / wo_b).
+    attn_layer_full = 5 * ns_attn
+
+    routed_layer_full = 3 * model.num_experts * ns_moe_ffn if ns_moe_ffn else 0
+    shared_layer_full = 3 * n_shared * ns_moe_ffn if ns_moe_ffn else 0
+    dense_ffn_layer_full = 3 * ns_dense_ffn
+
+    # ── Per-rank split ────────────────────────────────────────────────
+    # Routed expert work lands on ``ep`` distinct ranks; within an EP rank,
+    # remaining DP replicas (``dp // ep``) further parallelize NS.
+    ep_dp_replica = max(1, dp // ep) if ep > 1 else dp
+    routed_per_rank_per_layer = routed_layer_full // (ep * ep_dp_replica)
+
+    # Non-routed weights replicate across EP and split across full DP.
+    non_routed_dp_div = dp if strategy.zero_stage >= 1 and dp > 1 else 1
+    attn_per_rank_per_layer = attn_layer_full // non_routed_dp_div
+    shared_per_rank_per_layer = shared_layer_full // non_routed_dp_div
+    dense_ffn_per_rank_per_layer = dense_ffn_layer_full // non_routed_dp_div
+
+    per_moe_layer = (
+        attn_per_rank_per_layer
+        + routed_per_rank_per_layer
+        + shared_per_rank_per_layer
+    )
+    per_dense_layer = attn_per_rank_per_layer + dense_ffn_per_rank_per_layer
+    per_mtp_layer = per_moe_layer if n_moe > 0 else per_dense_layer
+
+    total = (
+        n_moe * per_moe_layer
+        + n_dense * per_dense_layer
+        + n_mtp * per_mtp_layer
+    )
+
+    # PP: each rank owns 1/pp layers.
+    total //= pp
+
+    return int(total * muon_fraction)

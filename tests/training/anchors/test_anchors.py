@@ -230,3 +230,69 @@ def test_anchor_step_time_strict():
         f"{len(failures)} anchor(s) failed strict step_time check:\n" +
         "\n".join(failures)
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 13: V4-Pro FP8/FP4 behavioral anchors (calibration mode)
+# ---------------------------------------------------------------------------
+
+_FP8_FP4_H100_ANCHOR = ANCHOR_DIR / "deepseek_v4_pro_fp8_fp4_h100.yaml"
+_FP8_FP4_B300_ANCHOR = ANCHOR_DIR / "deepseek_v4_pro_fp8_fp4_b300.yaml"
+_BF16_BASELINE_ANCHOR = ANCHOR_DIR / "deepseek_v4_pro.yaml"
+
+
+def test_anchor_fp8_fp4_h100_faster_than_bf16():
+    """V4-Pro FP8+FP4 path should be measurably faster than BF16 baseline.
+
+    Both anchors share TP/PP/EP/DP/optimizer; the only diff is the quant
+    preset overlay. Mixed-quant compute must shrink step_time.
+    """
+    from zrt.training.io.config_loader import load_anchor_config
+    from zrt.training.search.estimator import estimate
+
+    m_q, s_q, st_q = load_anchor_config(_FP8_FP4_H100_ANCHOR)
+    m_b, s_b, st_b = load_anchor_config(_BF16_BASELINE_ANCHOR)
+    rep_q = estimate(m_q, s_q, st_q)
+    rep_b = estimate(m_b, s_b, st_b)
+    assert rep_q.step_time_ms < rep_b.step_time_ms, (
+        f"FP8/FP4 step_time ({rep_q.step_time_ms:.2f} ms) should be "
+        f"smaller than BF16 baseline ({rep_b.step_time_ms:.2f} ms)"
+    )
+
+
+def test_anchor_fp8_fp4_h100_peak_memory_lower():
+    """Mixed-quant peak memory must not exceed the BF16 baseline.
+
+    V4-Pro baseline already stores routed-expert weights in FP4 (legacy
+    ``routed_expert_dtype: fp4``), so the overlay only changes compute
+    dtypes — weight residency is essentially identical. We assert
+    direction-only (peak_overall ≤ baseline), not a magnitude target.
+    """
+    from zrt.training.io.config_loader import load_anchor_config
+    from zrt.training.search.estimator import estimate
+
+    m_q, s_q, st_q = load_anchor_config(_FP8_FP4_H100_ANCHOR)
+    m_b, s_b, st_b = load_anchor_config(_BF16_BASELINE_ANCHOR)
+    rep_q = estimate(m_q, s_q, st_q)
+    rep_b = estimate(m_b, s_b, st_b)
+    peak_q = rep_q.memory.peak_overall
+    peak_b = rep_b.memory.peak_overall
+    assert peak_q <= peak_b, (
+        f"Mixed-quant peak memory ({peak_q:,.0f}) should not exceed "
+        f"BF16 baseline ({peak_b:,.0f})"
+    )
+
+
+def test_anchor_fp8_fp4_b300_faster_than_h100():
+    """B300 (native FP4) should be faster than H100 (FP4 falls back to FP8)."""
+    from zrt.training.io.config_loader import load_anchor_config
+    from zrt.training.search.estimator import estimate
+
+    m_h, s_h, st_h = load_anchor_config(_FP8_FP4_H100_ANCHOR)
+    m_b, s_b, st_b = load_anchor_config(_FP8_FP4_B300_ANCHOR)
+    rep_h = estimate(m_h, s_h, st_h)
+    rep_b = estimate(m_b, s_b, st_b)
+    assert rep_b.step_time_ms < rep_h.step_time_ms, (
+        f"B300 step_time ({rep_b.step_time_ms:.2f} ms) should be smaller "
+        f"than H100 step_time ({rep_h.step_time_ms:.2f} ms) for FP8/FP4"
+    )

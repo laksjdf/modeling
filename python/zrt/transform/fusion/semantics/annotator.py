@@ -334,10 +334,14 @@ def annotate_fused_node(
       - ``sem_flops``        : ``float | None``
       - ``sem_memory_bytes`` : ``float | None``
       - ``sem_dtype``        : main activation dtype (``activation`` view if
-                                present, else ``output``).
+                                 present, else ``output``).
 
     Plus a flattened convenience layer (``batch_size``, ``seq_len``, ...)
     so simple downstream consumers don't need to dig through ``sem_shape``.
+
+    **CP Shape Adjustment**:
+    If `cp_split` annotation exists, adjust `seq_len` by dividing by CP factor.
+    This ensures sem_shape reflects the actual split shapes after ContextParallelPass.
 
     Existing annotations (e.g. those already written by ``rule.annotations``
     or upstream passes) are NOT overwritten on the flat layer.
@@ -354,6 +358,43 @@ def annotate_fused_node(
         namespace: dict[str, Any] = {}
         namespace.update(io_views)
         namespace.update(shape_axes)
+
+        # Apply CP shape adjustment if cp_split annotation exists
+        cp_split = ann.get("cp_split", {})
+        if cp_split and "seq_len" in shape_axes:
+            cp = cp_split.get("cp", 1)
+            if cp > 1:
+                # Adjust seq_len for context parallel
+                original_seq_len = shape_axes["seq_len"]
+                shape_axes["seq_len"] = original_seq_len // cp
+                
+                # Also adjust sem_io shapes that contain seq_len
+                # TensorView is frozen, so create new instances
+                for role, view in list(io_views.items()):
+                    shape = view.shape
+                    if len(shape) >= 2 and shape[1] == original_seq_len:
+                        # Replace seq_len in shape
+                        new_shape = list(shape)
+                        new_shape[1] = original_seq_len // cp
+                        new_shape_tuple = tuple(new_shape)
+                        
+                        # Create new TensorView with adjusted shape
+                        new_numel = prod(new_shape_tuple) if new_shape_tuple else 1
+                        new_bytes = int(new_numel * view.itemsize)
+                        
+                        new_view = TensorView(
+                            shape=new_shape_tuple,
+                            dtype=view.dtype,
+                            bytes=new_bytes,
+                            numel=int(new_numel),
+                            itemsize=view.itemsize,
+                        )
+                        io_views[role] = new_view
+
+                # Recalculate namespace with adjusted shapes for FLOPs calculation
+                namespace = {}
+                namespace.update(io_views)
+                namespace.update(shape_axes)
 
         flops = compute_flops(rule, namespace, child_ops)
         memory_bytes = compute_memory(rule, namespace, child_ops)

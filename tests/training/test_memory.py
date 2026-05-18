@@ -125,3 +125,188 @@ def test_activation_memory_scales_with_microbatch():
     m2 = memory_breakdown(g2, model, system, s2)
 
     assert m2.activations == pytest.approx(m1.activations * 2, rel=0.01)
+
+
+# ============================================================================
+# Recompute / Korthikanti-formula corrections
+# ============================================================================
+
+from zrt.training.spec.strategy import RecomputePolicy
+
+
+def test_activation_memory_includes_attention_scores_term():
+    """Korthikanti: long-seq activation must include 5·a·s²·bytes term.
+
+    Without the scores term, a 2048×4096 dense model with bf16 has
+    activation ≈ s·h·bytes·coeff = 2048*4096*2*10 ≈ 168 MB/layer.
+    With scores: + 5·32·2048²·2 = 1.34 GB/layer.
+    """
+    model = _make_model()  # hidden=4096, num_heads=32, seq_len=2048, 4 dense layers
+    system = _make_system()
+    strategy = Strategy(tp=1, pp=1, dp=1, micro_batch=1,
+                        recompute=RecomputePolicy())
+
+    graph = build_graph(model, strategy)
+    mem = memory_breakdown(graph, model, system, strategy)
+
+    # Per-layer scores term: 5·a·s²·bytes = 5·32·2048²·2 ≈ 1.34 GB
+    per_layer_scores = 5 * model.num_heads * model.seq_len * model.seq_len * model.act_dtype.bytes
+    n_dense_layers = sum(1 for lk in model.layers if lk == LayerKind.DENSE)
+    expected_min = per_layer_scores * n_dense_layers
+    assert mem.activations >= expected_min, (
+        f"activation memory missing s²·a term: got {mem.activations}, "
+        f"expected ≥ {expected_min}"
+    )
+
+
+def test_attn_recompute_eliminates_scores_term():
+    """When attn recompute is set, the s²·a term must drop."""
+    model = _make_model()
+    system = _make_system()
+    strat_off = Strategy(tp=1, pp=1, dp=1, micro_batch=1,
+                         recompute=RecomputePolicy())
+    strat_on = Strategy(tp=1, pp=1, dp=1, micro_batch=1,
+                        recompute=RecomputePolicy(per_layer={"dense": {"attn_core"}}))
+
+    g_off = build_graph(model, strat_off)
+    g_on = build_graph(model, strat_on)
+    m_off = memory_breakdown(g_off, model, system, strat_off)
+    m_on = memory_breakdown(g_on, model, system, strat_on)
+
+    per_layer_scores = 5 * model.num_heads * model.seq_len * model.seq_len * model.act_dtype.bytes
+    n_dense_layers = sum(1 for lk in model.layers if lk == LayerKind.DENSE)
+    expected_scores_total = per_layer_scores * n_dense_layers
+
+    saved = m_off.activations - m_on.activations
+    assert saved >= expected_scores_total * 0.9, (
+        f"attn_core recompute should drop ≥ Σ s²·a (={expected_scores_total}), "
+        f"got saved={saved}"
+    )
+
+
+# ============================================================================
+# PP in-flight schedule-aware sizing
+# ============================================================================
+
+from zrt.training.spec.strategy import PPSched
+
+
+def _act_only(model, strategy):
+    """Run memory_breakdown and return just the activations field."""
+    graph = build_graph(model, strategy)
+    return memory_breakdown(graph, model, _make_system(), strategy).activations
+
+
+def _strat_pp(pp, sched, vpp=1):
+    return Strategy(
+        tp=1, cp=1, pp=pp, ep=1, dp=1,
+        micro_batch=1, global_batch=pp * 4,
+        pp_schedule=sched, vpp_chunks=vpp,
+        recompute=RecomputePolicy(),
+    )
+
+
+def test_1f1b_in_flight_at_least_pp_minus_one():
+    """1F1B worst-rank activation ≈ pp microbatches in flight, not pp/2.
+    For pp=4, in-flight should be 4 (rank-0 warmup peak), not 2.
+    """
+    model = _make_model()
+    a_pp1 = _act_only(model, _strat_pp(1, PPSched.ONE_F_ONE_B))   # baseline 1 mb
+    a_pp4 = _act_only(model, _strat_pp(4, PPSched.ONE_F_ONE_B))
+    # Old formula: pp//2 = 2 ⇒ ratio 2.0. New formula: pp = 4 ⇒ ratio ~4.0
+    # (Note: per-rank graph still covers all layers; a_pp4 / a_pp1 isolates
+    # the in-flight multiplier.)
+    assert a_pp4 >= a_pp1 * 3.5, (
+        f"1F1B with pp=4 should multiply activations by ≥ pp-1 (=3); "
+        f"got ratio = {a_pp4 / a_pp1:.2f}"
+    )
+
+
+def test_interleaved_in_flight_scales_with_vpp():
+    """Interleaved (VPP) in-flight ≈ pp · (vpp+1)/2 — vpp=2 must use more
+    memory than vpp=1.
+    """
+    model = _make_model()
+    a_v1 = _act_only(model, _strat_pp(4, PPSched.INTERLEAVED, vpp=1))
+    a_v2 = _act_only(model, _strat_pp(4, PPSched.INTERLEAVED, vpp=2))
+    # vpp=1 → factor pp·2/2 = 4 ; vpp=2 → factor pp·3/2 = 6. Ratio ≈ 1.5.
+    assert a_v2 >= a_v1 * 1.3, (
+        f"Interleaved vpp=2 should bump activations by ~1.5×; "
+        f"got ratio = {a_v2 / a_v1:.2f}"
+    )
+
+
+def test_dualpipev_in_flight_at_least_1f1b():
+    """DualPipeV holds two-direction chunks per rank, so its activation
+    footprint is at least the 1F1B worst-rank value (no smaller).
+    """
+    model = _make_model()
+    a_1f1b = _act_only(model, _strat_pp(4, PPSched.ONE_F_ONE_B))
+    a_dpv = _act_only(model, _strat_pp(4, PPSched.DUALPIPE_V))
+    assert a_dpv >= a_1f1b * 0.95, (
+        f"DualPipeV in-flight ≥ 1F1B worst-rank; got "
+        f"DPV={a_dpv}, 1F1B={a_1f1b}"
+    )
+
+
+# ============================================================================
+# Phase-aware peak memory (sum != peak; opt_state and activations
+# do not coexist).
+# ============================================================================
+
+
+def test_phase_peak_is_max_not_sum():
+    """MemBreakdown must expose phase peaks where:
+      peak_forward   = weights + activations + comm_buffers
+      peak_backward  = weights + activations + grads + comm_buffers
+      peak_optimizer = weights + grads + opt_state
+      peak_overall   = max of the three.
+
+    For ZeRO=0 with non-trivial grads/opt_state/activations, peak_overall
+    must be strictly less than the algebraic sum (.total).
+    """
+    model = _make_model()
+    system = _make_system()
+    strategy = Strategy(
+        tp=1, pp=1, dp=1, micro_batch=1, global_batch=1,
+        zero_stage=0, recompute=RecomputePolicy(),
+    )
+    graph = build_graph(model, strategy)
+    mb = memory_breakdown(graph, model, system, strategy)
+
+    # Phase peaks must equal the documented compositions.
+    assert mb.peak_forward == mb.weights + mb.activations + mb.comm_buffers
+    assert mb.peak_backward == (
+        mb.weights + mb.activations + mb.grads + mb.comm_buffers
+    )
+    assert mb.peak_optimizer == mb.weights + mb.grads + mb.opt_state
+
+    # peak_overall = max(...)
+    expected_peak = max(mb.peak_forward, mb.peak_backward, mb.peak_optimizer)
+    assert mb.peak_overall == expected_peak
+
+    # And: peak < component sum (activations and opt_state do not coexist).
+    assert mb.grads > 0 and mb.opt_state > 0 and mb.activations > 0
+    assert mb.peak_overall < mb.total, (
+        f"peak ({mb.peak_overall}) must be < component sum ({mb.total}) — "
+        f"activations and opt_state should not coexist in any phase"
+    )
+
+
+def test_to_gb_includes_peak_keys():
+    """to_gb() must expose peak_gb and the three phase peaks so the
+    Excel/HTML/search-CSV consumers can render them without reaching into
+    private fields."""
+    model = _make_model()
+    system = _make_system()
+    strategy = Strategy(
+        tp=1, pp=1, dp=1, micro_batch=1, global_batch=1,
+        recompute=RecomputePolicy(),
+    )
+    graph = build_graph(model, strategy)
+    gb = memory_breakdown(graph, model, system, strategy).to_gb()
+    for key in ("peak_gb", "peak_forward_gb", "peak_backward_gb",
+                "peak_optimizer_gb"):
+        assert key in gb, f"to_gb() missing {key!r}; got keys {sorted(gb)}"
+    # Sanity: peak_gb < total_gb.
+    assert gb["peak_gb"] < gb["total_gb"]

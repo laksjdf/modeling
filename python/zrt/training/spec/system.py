@@ -13,6 +13,8 @@ class GPU:
     hbm_gb: float
     hbm_bw_gbps: float  # aggregate HBM bandwidth (GB/s)
 
+    flops_fp4: float = 0.0    # peak TFLOP/s (Blackwell B200/B300+); 0 = unsupported
+
     # Heterogeneous-core fields (None = homogeneous, use flops_bf16 for all ops).
     # "cube" is the matrix/Tensor/Cube peak; both peaks must be set to enable
     # heterogeneous timing.
@@ -23,6 +25,10 @@ class GPU:
     # SRAM per SM — used for FlashAttention tile-level modeling.
     # 0 = tile model disabled (preserve current single-read byte formula).
     sram_kb_per_sm: float = 0.0
+
+    # Number of EP A2A overlap waves. 0 = hardware does not support K-wave EP
+    # overlap (e.g. Ascend HCCS). Mirrors HardwareSpec.compute.ep_overlap_waves.
+    ep_overlap_waves: int = 0
 
 
 @dataclass

@@ -1,4 +1,5 @@
-# DeepSeek-V4-Pro 3D parallel training — H100 SXM
+# Variant with tp=4 so tp_overlap actually inserts TP collectives.
+# tp*cp*pp*dp = 4*1*2*1024 = 8192 (matches world_size)
 model: deepseek_v4_pro
 
 system:
@@ -8,19 +9,19 @@ system:
   host_mem_gb: 2048
 
 strategy:
-  tp: 1
-  cp: 8
+  tp: 4                     # ← bumped from 1 → 4
+  cp: 1                     # ← removed CP to keep the example focused on TP
   pp: 2
   ep: 384
-  dp: 512
+  dp: 1024
   micro_batch: 1
-  global_batch: 512
+  global_batch: 1024        # 1024 % (1 * 1024) == 0
   pp_schedule: dualpipev
   zero_stage: 3
   recompute:
     per_layer:
       moe: ["attn"]
-  tp_overlap: none
+  tp_overlap: coc           # ← now meaningful (tp>1)
   optimizer: muon
   muon_config:
     ns_steps: 10

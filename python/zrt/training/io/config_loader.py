@@ -2,9 +2,52 @@
 
 from __future__ import annotations
 
+import warnings as _warnings
 from pathlib import Path
 
 import yaml
+
+# Canonical recompute categories. Updating here propagates to the loader's
+# validation. Keep in sync with the docstring in
+# ``zrt/training/spec/strategy.py::RecomputePolicy``.
+_CANONICAL_RECOMPUTE_CATS = {
+    "full", "attn_core", "attn_block", "ffn_swiglu", "ln", "hc",
+}
+
+# Deprecated → canonical alias map. We resolve at load time and emit a
+# DeprecationWarning so users have time to migrate their YAMLs.
+_RECOMPUTE_ALIASES = {"attn": "attn_block"}
+
+
+def _normalize_recompute_categories(layer_kind: str, raw) -> set[str]:
+    """Validate + alias-resolve a YAML recompute spec for one layer kind.
+
+    Accepts either a single string or a list of strings. Unknown categories
+    raise ``ValueError`` rather than being silently ignored.
+    """
+    if isinstance(raw, str):
+        raw = [raw]
+    out: set[str] = set()
+    for cat in raw:
+        if cat in _RECOMPUTE_ALIASES:
+            new = _RECOMPUTE_ALIASES[cat]
+            _warnings.warn(
+                f"recompute category {cat!r} is deprecated; use {new!r}. "
+                f"(layer kind: {layer_kind!r})",
+                DeprecationWarning,
+                stacklevel=4,
+            )
+            out.add(new)
+        elif cat in _CANONICAL_RECOMPUTE_CATS:
+            out.add(cat)
+        else:
+            raise ValueError(
+                f"Unknown recompute category {cat!r} for layer kind "
+                f"{layer_kind!r}. Valid: "
+                f"{sorted(_CANONICAL_RECOMPUTE_CATS)} "
+                f"(plus deprecated alias 'attn' → 'attn_block')."
+            )
+    return out
 
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import LayerKind, ModelSpec
@@ -48,8 +91,9 @@ def load_anchor_config(yaml_path: str | Path) -> tuple[ModelSpec, SystemSpec, St
         # Reference to model config in configs/models/
         model = _resolve_model(model_ref)
     elif isinstance(model_ref, dict):
-        # Inline model spec
-        model = _parse_model(model_ref)
+        # Either an inline spec or an overlay form ({base: <name>, ...}).
+        # Dispatch through _resolve_model so the overlay branch is honored.
+        model = _resolve_model(model_ref)
     else:
         raise ValueError(
             f"Anchor {yaml_path}: 'model' must be a string (reference) "
@@ -82,10 +126,26 @@ def _resolve_model(model_ref: str | dict) -> ModelSpec:
         with open(path, encoding="utf-8") as f:
             model_d = yaml.safe_load(f)
         return _parse_model(model_d)
+    if isinstance(model_ref, dict) and "base" in model_ref:
+        # Overlay form: {base: <name>, <override keys>}.
+        # Load the named base spec from configs/models/ and merge the
+        # remaining keys on top (caller wins).
+        base_name = model_ref["base"]
+        path = _MODELS_DIR / f"{base_name}.yaml"
+        if not path.exists():
+            raise KeyError(
+                f"Model {base_name!r} not found in {_MODELS_DIR}. "
+                f"Available: {[p.stem for p in sorted(_MODELS_DIR.glob('*.yaml'))]}"
+            )
+        with open(path, encoding="utf-8") as f:
+            base_d = yaml.safe_load(f)
+        merged = {**base_d, **{k: v for k, v in model_ref.items() if k != "base"}}
+        return _parse_model(merged)
     return _parse_model(model_ref)
 
 
 def _parse_model(d: dict) -> ModelSpec:
+    d = _expand_quant_preset(d)
     layers_str = d.get("layers", [])
     layers = _parse_layers(layers_str)
 
@@ -140,6 +200,14 @@ def _parse_model(d: dict) -> ModelSpec:
         grad_dtype=_parse_dtype(d.get("grad_dtype", "fp32")),
         master_dtype=_parse_dtype(d.get("master_dtype", "fp32")),
         act_dtype=_parse_dtype(d.get("act_dtype", "bf16")),
+        # NEW per-component dtypes (Task 3 added the ModelSpec fields)
+        attn_compute_dtype=_parse_dtype(d.get("attn_compute_dtype", "bf16")),
+        shared_expert_compute_dtype=_parse_dtype(d.get("shared_expert_compute_dtype", "bf16")),
+        routed_expert_compute_dtype=_parse_dtype(d.get("routed_expert_compute_dtype", "bf16")),
+        routed_expert_weight_dtype=_parse_dtype(d["routed_expert_weight_dtype"]) if "routed_expert_weight_dtype" in d else None,
+        attn_act_dtype=_parse_dtype(d["attn_act_dtype"]) if "attn_act_dtype" in d else None,
+        moe_act_dtype=_parse_dtype(d["moe_act_dtype"]) if "moe_act_dtype" in d else None,
+        routed_expert_grad_dtype=_parse_dtype(d.get("routed_expert_grad_dtype", "fp32")),
         # normalization
         norm_kind=d.get("norm_kind", "rmsnorm"),
         model_type=d.get("model_type", "default"),
@@ -156,12 +224,14 @@ def _parse_system(d: dict) -> SystemSpec:
         name=hw.name,
         flops_bf16=hw.compute.bf16_tflops,
         flops_fp8=hw.compute.fp8_tops or hw.compute.bf16_tflops * 2,
+        flops_fp4=hw.compute.fp4_tops,   # 0 -> peak_tflops_for falls back to fp8
         hbm_gb=hw.memory.capacity_gb,
         hbm_bw_gbps=hw.memory.hbm_bandwidth_gbps,
         cube_tflops=hw.compute.cube_bf16_tflops,
         vector_tflops=hw.compute.vector_bf16_tflops,
         overlap_ratio=dict(hw.compute.overlap_ratio),
         sram_kb_per_sm=hw.compute.sram_kb_per_sm,
+        ep_overlap_waves=hw.compute.ep_overlap_waves,
     )
     return SystemSpec(
         gpu=gpu,
@@ -178,7 +248,7 @@ def _parse_strategy(d: dict) -> Strategy:
         rc = d["recompute"]
         per_layer = {}
         for kind_str, tiers in rc.get("per_layer", {}).items():
-            per_layer[kind_str] = set(tiers) if isinstance(tiers, list) else {tiers}
+            per_layer[kind_str] = _normalize_recompute_categories(kind_str, tiers)
         recompute = RecomputePolicy(per_layer=per_layer)
 
     offload = OffloadPolicy()
@@ -220,6 +290,7 @@ def _parse_strategy(d: dict) -> Strategy:
         ep_overlap=d.get("ep_overlap", False),
         dualbatch=d.get("dualbatch", False),
         dp_overlap_in_bubble=d.get("dp_overlap_in_bubble", True),
+        dp_steady_overlap_ratio=float(d.get("dp_steady_overlap_ratio", 0.5)),
         optimizer=OptKind(d.get("optimizer", "adam")),
         muon_config=muon_config,
     )
@@ -260,12 +331,76 @@ def _parse_layers(layers_spec) -> list[LayerKind]:
     return []
 
 
+_QUANT_PRESETS: dict[str, dict[str, str]] = {
+    "bf16_baseline": {
+        "attn_compute_dtype": "bf16",
+        "routed_expert_compute_dtype": "bf16",
+        "routed_expert_weight_dtype": "bf16",
+        "shared_expert_compute_dtype": "bf16",
+        "routed_expert_grad_dtype": "fp32",
+        "act_dtype": "bf16",
+    },
+    "fp8_mixed": {   # DeepSeek-V3 style
+        "attn_compute_dtype": "bf16",
+        "routed_expert_compute_dtype": "fp8_e4m3",
+        "routed_expert_weight_dtype": "bf16",
+        "shared_expert_compute_dtype": "bf16",
+        "routed_expert_grad_dtype": "fp32",
+        "act_dtype": "bf16",
+        "moe_act_dtype": "fp8_e4m3",
+    },
+    "deepseek_v4_fp8_fp4": {   # V4 main path
+        "attn_compute_dtype": "bf16",
+        "routed_expert_compute_dtype": "fp8_e4m3",
+        "routed_expert_weight_dtype": "fp4",
+        "shared_expert_compute_dtype": "bf16",
+        "routed_expert_grad_dtype": "fp32",
+        "act_dtype": "bf16",
+        "moe_act_dtype": "fp8_e4m3",
+    },
+    "deepseek_v4_full_fp8": {   # V4 with FP8 shared experts
+        "attn_compute_dtype": "bf16",
+        "routed_expert_compute_dtype": "fp8_e4m3",
+        "routed_expert_weight_dtype": "fp4",
+        "shared_expert_compute_dtype": "fp8_e4m3",
+        "routed_expert_grad_dtype": "fp32",
+        "act_dtype": "bf16",
+        "moe_act_dtype": "fp8_e4m3",
+        "attn_act_dtype": "bf16",
+    },
+}
+
+
+def _expand_quant_preset(d: dict) -> dict:
+    """Expand a ``quant_preset`` shorthand into explicit dtype fields.
+
+    Explicit fields in ``d`` override preset values. Removes the
+    ``quant_preset`` key from the returned mapping. Returns a new dict
+    (does not mutate input).
+    """
+    preset_name = d.get("quant_preset")
+    out = {k: v for k, v in d.items() if k != "quant_preset"}
+    if preset_name is None:
+        return out
+    if preset_name not in _QUANT_PRESETS:
+        raise KeyError(
+            f"unknown quant_preset {preset_name!r}; "
+            f"valid options: {sorted(_QUANT_PRESETS)}"
+        )
+    for key, val in _QUANT_PRESETS[preset_name].items():
+        out.setdefault(key, val)
+    return out
+
+
 def _parse_dtype(s: str) -> Dtype:
     s = s.lower().strip()
     mapping = {
         "fp32": Dtype.FP32, "float32": Dtype.FP32,
         "bf16": Dtype.BF16, "bfloat16": Dtype.BF16,
         "fp16": Dtype.FP16, "float16": Dtype.FP16,
-        "fp8": Dtype.FP8, "float8": Dtype.FP8,
+        "fp8": Dtype.FP8_E4M3, "float8": Dtype.FP8_E4M3,
+        "fp8_e4m3": Dtype.FP8_E4M3,
+        "fp8_e5m2": Dtype.FP8_E5M2,
+        "fp4": Dtype.FP4, "mxfp4": Dtype.FP4, "nvfp4": Dtype.FP4,
     }
     return mapping.get(s, Dtype.BF16)

@@ -171,9 +171,13 @@ def main() -> None:
         help="Context-parallel degree (default: 1).",
     )
     parser.add_argument(
-        "--cp-kind", default="ulysses",
-        choices=["ulysses", "ring", "hybrid", "compressed", "none"],
-        help="Context-parallel strategy for graph-native training modelling.",
+        "--cp-kind",
+        default="none",
+        choices=["none", "ulysses", "ring", "hybrid", "compressed"],
+        metavar="KIND",
+        help="Context parallel strategy (default: auto-select by model type). "
+             "DSV4: 'compressed' only. "
+             "Other models: 'ulysses' (default), 'ring', or 'hybrid'.",
     )
     parser.add_argument(
         "--quant", default=None,
@@ -323,6 +327,10 @@ def main() -> None:
         gradient_checkpointing=args.gradient_checkpointing,
     )
 
+    if args.cp_kind != "none" or args.cp > 1:
+        resolved_cp_kind = _validate_cp_kind(model_id, args.cp_kind, args.cp)
+        args.cp_kind = resolved_cp_kind
+
     if args.hw:
         import python.zrt.hardware.registry as hw_registry
         hw = hw_registry.load(args.hw)
@@ -440,6 +448,43 @@ def _build_model_profile(model_id: str, args) -> "SimpleNamespace":
         dense_layer_indices=_dense_indices,
         sparse_layer_indices=_sparse_indices,
     )
+
+
+def _validate_cp_kind(model_id: str, cp_kind: str, cp: int) -> str:
+    """Validate and resolve cp_kind based on model type and CLI input.
+    
+    Args:
+        model_id: Model identifier (HF Hub ID or local path)
+        cp_kind: User-specified cp_kind from CLI
+        cp: Context parallel degree
+    
+    Returns:
+        Resolved cp_kind string
+    
+    Raises:
+        ValueError: On constraint violation
+    """
+    if cp <= 1:
+        return "none"
+    
+    model_slug = _make_model_slug(model_id).lower()
+    is_dsv4 = any(x in model_slug for x in ["deepseek_v4", "dsv4"])
+    
+    if is_dsv4:
+        if cp_kind not in ("none", "compressed"):
+            raise ValueError(
+                f"Model '{model_id}' only supports cp_kind='compressed'. "
+                f"Got '{cp_kind}'. Use --cp-kind compressed or remove flag."
+            )
+        return "compressed" if cp_kind == "none" else cp_kind
+    
+    if cp_kind == "compressed":
+        raise ValueError(
+            f"cp_kind='compressed' is reserved for DeepSeek-V4. "
+            f"Model '{model_id}' should use 'ulysses', 'ring', or 'hybrid'."
+        )
+    
+    return "ulysses" if cp_kind == "none" else cp_kind
 
 
 def _list_fusion_rules() -> None:

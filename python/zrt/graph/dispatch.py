@@ -79,22 +79,29 @@ def _collect_extra_args(func, args, kwargs) -> str:
 class TensorTracker:
     """Assign stable unique IDs to tensors seen during tracing.
 
-    id(tensor) is not reliable on meta device, so we maintain our own counter.
+    Uses tensor object as key instead of id(tensor) to avoid ID collision
+    when tensors are GC'd and new tensors reuse the same memory address.
     """
 
     def __init__(self):
         self._counter = 0
-        self._id_map: Dict[int, int] = {}
+        self._id_map: Dict[int, int] = {}  # maps id(tensor) to stable ID
+        self._tensor_refs: Dict[int, torch.Tensor] = {}  # weak refs would be better but FakeTensor doesn't support it
 
     def reset(self):
         self._counter = 0
         self._id_map.clear()
+        self._tensor_refs.clear()
 
     def get_id(self, t: torch.Tensor) -> int:
         oid = id(t)
-        if oid not in self._id_map:
-            self._id_map[oid] = self._counter
-            self._counter += 1
+        if oid in self._id_map:
+            cached_t = self._tensor_refs.get(oid)
+            if cached_t is t:
+                return self._id_map[oid]
+        self._id_map[oid] = self._counter
+        self._tensor_refs[oid] = t
+        self._counter += 1
         return self._id_map[oid]
 
 
@@ -143,16 +150,12 @@ class RecordingDispatch(TorchDispatchMode):
         output_ids = [self.tensor_tracker.get_id(t) for t in output_tensors]
 
         if self._skip_reshapes and func_name in SKIP_OPS:
-            # Alias the SKIP op's output tensor IDs to its first input ID.
-            # Without this, the view/reshape/_to_copy produces a fresh tracker
-            # ID that has no record, so records_to_opgraph cannot wire the
-            # downstream consumer back to the upstream producer — every edge
-            # crossing a SKIP op gets dropped.  Aliasing keeps the dataflow
-            # chain intact across un-recorded transparent ops.
             if input_tensors and output_tensors:
                 anchor_id = self.tensor_tracker.get_id(input_tensors[0])
                 for t in output_tensors:
-                    self.tensor_tracker._id_map[id(t)] = anchor_id
+                    oid = id(t)
+                    self.tensor_tracker._id_map[oid] = anchor_id
+                    self.tensor_tracker._tensor_refs[oid] = t
             return out
 
         module_path = ""

@@ -420,3 +420,179 @@ def test_layer_kind_scoped_recompute():
     # Dense layer and MoE layer have different op counts; should differ
     # At minimum, both should be non-negative and not equal if layer sizes differ
     assert overhead_dense >= 0
+
+
+# ============================================================================
+# FlashAttention recompute-overhead dedup
+# ============================================================================
+
+
+def _make_model_t2():
+    """Standard MHA model — graph builder produces attn_core ops."""
+    return ModelSpec(
+        hidden=4096, ffn=16384, num_heads=32, num_kv_heads=32,
+        head_dim=128, vocab=32000, seq_len=2048,
+        layers=[LayerKind.DENSE] * 2,
+    )
+
+
+def _make_system_t2():
+    return SystemSpec(
+        gpu=GPU(name="h100", flops_bf16=989, flops_fp8=1979, hbm_gb=80, hbm_bw_gbps=3350),
+        host_mem_gb=256,
+        interconnect=InterconnectSpec(
+            intra_node=LinkSpec(type="NVLink", bandwidth_gbps=900, latency_us=1.0, topology="all_to_all", num_devices=8),
+            inter_node=LinkSpec(type="IB", bandwidth_gbps=400, latency_us=5.0, topology="fat_tree"),
+        ),
+        nodes=1, gpus_per_node=8,
+    )
+
+
+def _fa_kernel_fwd_flops(graph, model, system, M):
+    """Forward FLOPs of FA-kernel ops in the graph (×microbatches)."""
+    from zrt.training.models.flops import _accounted_flops, _is_compute_bound
+    FA_KINDS = {"attn_core", "sparse_attn", "hca_attn", "swa_attn"}
+    total = 0.0
+    for op in graph.ops:
+        if op.kind in FA_KINDS:
+            cost = op_cost(op, model)
+            if _is_compute_bound(cost, "fwd", system):
+                total += _accounted_flops(cost, "fwd")
+    return total * M
+
+
+def _qkv_o_fwd_flops(graph, model, system, M):
+    """Forward FLOPs of QKV/O projection matmuls in the graph (×microbatches)."""
+    from zrt.training.models.flops import _accounted_flops, _is_compute_bound
+    NAMES = ("qkv", "q_a_proj", "q_b_proj", "kv_a_proj", "kv_b_proj",
+             "o_proj", "wq_a", "wq_b", "wkv", "wo_a", "wo_b")
+    total = 0.0
+    for op in graph.ops:
+        if op.kind == "matmul" and any(k in op.name.lower() for k in NAMES):
+            cost = op_cost(op, model)
+            if _is_compute_bound(cost, "fwd", system):
+                total += _accounted_flops(cost, "fwd")
+    return total * M
+
+
+def test_recompute_overhead_excludes_fa_kernel_forward(monkeypatch):
+    """FA kernel forward FLOPs must NOT appear in recompute overhead — FA's
+    backward already pays this cost via the 2.5×fwd convention. Adding it as
+    overhead would triple-count attention.
+
+    We force ``_is_compute_bound`` to True so the test exercises the explicit
+    FA skip regardless of the roofline classifier (on today's H100 spec the
+    FA ops happen to be memory-bound, so the bug is invisible; the skip is
+    defensive for hardware/cost-formula changes that would flip them).
+    """
+    model = _make_model_t2()
+    system = _make_system_t2()
+    strategy = Strategy(
+        tp=1, pp=1, dp=1, micro_batch=1, global_batch=1,
+        recompute=RecomputePolicy(per_layer={"dense": {"attn"}}),
+    )
+    graph = build_graph(model, strategy)
+
+    monkeypatch.setattr(
+        "zrt.training.models.flops._is_compute_bound",
+        lambda *_args, **_kw: True,
+    )
+
+    M = strategy.num_microbatches()
+    fa_fwd = _fa_kernel_fwd_flops(graph, model, system, M)
+    qkv_o_fwd = _qkv_o_fwd_flops(graph, model, system, M)
+    assert fa_fwd > 0, "test precondition: graph must contain FA kernel ops"
+    assert qkv_o_fwd > 0, "test precondition: graph must contain QKV/O matmuls"
+
+    overhead = recompute_overhead_flops(graph, model, strategy, system)
+
+    # Standard MHA dense block has only FA kernel + QKV/O matmul in the
+    # "attn" category. After FA dedup, overhead == sum(QKV/O fwd) only.
+    assert overhead == pytest.approx(qkv_o_fwd, rel=0.01), (
+        f"After FA dedup, overhead should equal QKV/O proj fwd FLOPs only. "
+        f"Got overhead={overhead:.3e}, expected ≈ {qkv_o_fwd:.3e} "
+        f"(FA kernel fwd that should be excluded = {fa_fwd:.3e})"
+    )
+
+
+def test_attn_core_only_excludes_qkv_o_matmuls(monkeypatch):
+    """attn_core targets ONLY the FA kernel + indexer + compressor pool
+    (Megatron-LM 'selective recompute' scope). QKV/O matmuls must NOT
+    contribute, and FA kernel ops are still skipped via FA dedup."""
+    model = _make_model_t2()
+    system = _make_system_t2()
+    strategy = Strategy(
+        tp=1, pp=1, dp=1, micro_batch=1, global_batch=1,
+        recompute=RecomputePolicy(per_layer={"dense": {"attn_core"}}),
+    )
+    graph = build_graph(model, strategy)
+
+    monkeypatch.setattr(
+        "zrt.training.models.flops._is_compute_bound",
+        lambda *_args, **_kw: True,
+    )
+    M = strategy.num_microbatches()
+
+    overhead = recompute_overhead_flops(graph, model, strategy, system)
+    qkv_o_fwd = _qkv_o_fwd_flops(graph, model, system, M)
+
+    # For a plain dense block (no indexer / compressor): attn_core should
+    # match ONLY the FA kernel, which is then skipped → overhead ≈ 0.
+    # qkv_o_fwd is large and must NOT be in overhead.
+    assert overhead < qkv_o_fwd * 0.05, (
+        f"attn_core must not pull in QKV/O matmuls. "
+        f"Got overhead={overhead:.3e}, qkv_o_fwd={qkv_o_fwd:.3e}"
+    )
+
+
+def test_attn_block_includes_qkv_o_matmuls(monkeypatch):
+    """attn_block (= the heavier 'rerun attention block' policy) DOES pull
+    in QKV/O matmul fwd FLOPs, on top of FA kernels (which are still
+    skipped via FA dedup)."""
+    model = _make_model_t2()
+    system = _make_system_t2()
+    strategy = Strategy(
+        tp=1, pp=1, dp=1, micro_batch=1, global_batch=1,
+        recompute=RecomputePolicy(per_layer={"dense": {"attn_block"}}),
+    )
+    graph = build_graph(model, strategy)
+
+    monkeypatch.setattr(
+        "zrt.training.models.flops._is_compute_bound",
+        lambda *_args, **_kw: True,
+    )
+    M = strategy.num_microbatches()
+
+    overhead = recompute_overhead_flops(graph, model, strategy, system)
+    qkv_o_fwd = _qkv_o_fwd_flops(graph, model, system, M)
+
+    assert overhead == pytest.approx(qkv_o_fwd, rel=0.01), (
+        f"attn_block overhead must equal QKV/O matmul fwd FLOPs (FA kernel "
+        f"skipped). Got overhead={overhead:.3e}, expected≈{qkv_o_fwd:.3e}"
+    )
+
+
+def test_legacy_attn_alias_matches_attn_block(monkeypatch):
+    """The deprecated 'attn' label keeps its historical semantic = attn_block."""
+    model = _make_model_t2()
+    system = _make_system_t2()
+    strat_legacy = Strategy(
+        tp=1, pp=1, dp=1, micro_batch=1, global_batch=1,
+        recompute=RecomputePolicy(per_layer={"dense": {"attn"}}),
+    )
+    strat_new = Strategy(
+        tp=1, pp=1, dp=1, micro_batch=1, global_batch=1,
+        recompute=RecomputePolicy(per_layer={"dense": {"attn_block"}}),
+    )
+    graph_l = build_graph(model, strat_legacy)
+    graph_n = build_graph(model, strat_new)
+
+    monkeypatch.setattr(
+        "zrt.training.models.flops._is_compute_bound",
+        lambda *_args, **_kw: True,
+    )
+    o_legacy = recompute_overhead_flops(graph_l, model, strat_legacy, system)
+    o_new = recompute_overhead_flops(graph_n, model, strat_new, system)
+    assert o_legacy == o_new, (
+        f"Legacy 'attn' must equal 'attn_block': {o_legacy} vs {o_new}"
+    )

@@ -49,7 +49,23 @@ class FlopsPass(GraphPass):
         moe_scale = graph.metadata.get("moe_active_experts", 1)
 
         for node in g.nodes.values():
-            flops, read_b, write_b = sim._fmr(node)
+            # Priority: use sem_flops (from fusion semantics) if available
+            # sem_flops already includes CP shape split adjustment
+            sem_flops = node.annotations.get("sem_flops")
+            if sem_flops is not None:
+                # Use sem_flops directly (already scaled by CP if cp_split exists)
+                flops = float(sem_flops)
+                sem_io = node.annotations.get("sem_io", {})
+                read_b = sum(v.get("bytes", 0) for v in sem_io.values() if v.get("role") != "output")
+                write_b = sum(v.get("bytes", 0) for v in sem_io.values() if v.get("role") == "output")
+                # If sem_io has explicit roles
+                if "activation" in sem_io:
+                    read_b = sem_io["activation"].get("bytes", 0)
+                if "output" in sem_io:
+                    write_b = sem_io["output"].get("bytes", 0)
+            else:
+                # Fallback to roofline formula
+                flops, read_b, write_b = sim._fmr(node)
 
             # MoE expert scaling: captured graph has only 1 expert's ops,
             # but real model activates moe_active_experts per token.

@@ -52,3 +52,37 @@ def achieved_bandwidth_efficiency(gpu_name: str, bytes_: float) -> float:
         return 0.70
     else:
         return 0.85
+
+
+_FALLBACK_WARNED: set[str] = set()
+
+
+def _warn_once(key: str, msg: str) -> None:
+    """Emit a UserWarning at most once per process for a given key."""
+    if key in _FALLBACK_WARNED:
+        return
+    _FALLBACK_WARNED.add(key)
+    import warnings
+    warnings.warn(msg, UserWarning, stacklevel=3)
+
+
+def peak_tflops_for(gpu, dtype: Dtype) -> float:
+    """Return hardware peak FLOP/s (not TFLOP/s) for ``dtype`` on ``gpu``.
+
+    Fallbacks (each emits a one-shot warning):
+      FP4  → FP8 peak when gpu.flops_fp4 == 0
+      FP8* → BF16 peak when gpu.flops_fp8 == 0
+    BF16/FP16/FP32 all use gpu.flops_bf16 (no separate FP16 field).
+    """
+    if dtype is Dtype.FP4:
+        if getattr(gpu, "flops_fp4", 0.0) > 0:
+            return gpu.flops_fp4 * 1e12
+        _warn_once(f"fp4_fallback_{gpu.name}",
+                   f"GPU {gpu.name!r} declares no fp4_tops; falling back to FP8 peak")
+        dtype = Dtype.FP8_E4M3
+    if dtype in (Dtype.FP8_E4M3, Dtype.FP8_E5M2):
+        if getattr(gpu, "flops_fp8", 0.0) > 0:
+            return gpu.flops_fp8 * 1e12
+        _warn_once(f"fp8_fallback_{gpu.name}",
+                   f"GPU {gpu.name!r} declares no fp8_tops; falling back to BF16 peak")
+    return gpu.flops_bf16 * 1e12

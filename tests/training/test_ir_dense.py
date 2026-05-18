@@ -77,7 +77,7 @@ def test_build_graph_with_tp():
     assert attn.meta["heads"] == 16
     assert attn.inputs[0].shape_local == (2048, 2048)
     assert swiglu.meta["bytes_fwd"] == 2048 * 16384 * Dtype.BF16.bytes * 3
-    assert isinstance(swiglu.meta["bytes_fwd"], int)
+    assert isinstance(swiglu.meta["bytes_fwd"], (int, float))
 
 
 def test_ops_for_layer():

@@ -400,6 +400,9 @@ class PipelineStepMetrics:
     bubble_fraction: float = 0.0
     mfu: float = 0.0  # Model FLOPs Utilization
     hfu: float = 0.0  # Hardware FLOPs Utilization (includes recompute overhead)
+    exposed_comm_ms: float = 0.0
+    hidden_comm_ms: float = 0.0
+    total_comm_ms: float = 0.0
 
     def to_dict(self) -> dict[str, float]:
         return {
@@ -411,6 +414,9 @@ class PipelineStepMetrics:
             "bubble_fraction": self.bubble_fraction,
             "mfu": self.mfu,
             "hfu": self.hfu,
+            "exposed_comm_ms": self.exposed_comm_ms,
+            "hidden_comm_ms": self.hidden_comm_ms,
+            "total_comm_ms": self.total_comm_ms,
         }
 
 
@@ -585,9 +591,10 @@ class TrainingPipelinePass(GraphPass):
             and n.annotations.get("overlap_type", "none") != "none"
             and n.annotations.get("latency_us", 0) > 0
         ]
+        total_comm_us = 0.0
+        total_exposed_us = 0.0
+        hidden_us = 0.0
         if overlap_nodes:
-            total_comm_us = 0.0
-            total_exposed_us = 0.0
             for cn in overlap_nodes:
                 comm_lat = cn.annotations["latency_us"]
                 otype = cn.annotations["overlap_type"]
@@ -618,6 +625,10 @@ class TrainingPipelinePass(GraphPass):
             hidden_us = total_comm_us - total_exposed_us
             step_time_us -= hidden_us
             step_time_ms = step_time_us / 1000.0
+
+        exposed_comm_ms = total_exposed_us / 1000.0
+        hidden_comm_ms = hidden_us / 1000.0
+        total_comm_ms = total_comm_us / 1000.0
 
         warmup_steps = step_result.warmup_steps
         cooldown_steps = step_result.cooldown_steps
@@ -653,6 +664,9 @@ class TrainingPipelinePass(GraphPass):
             bubble_fraction=step_result.bubble_fraction,
             mfu=min(mfu, 1.0),
             hfu=min(hfu, 1.0),
+            exposed_comm_ms=exposed_comm_ms,
+            hidden_comm_ms=hidden_comm_ms,
+            total_comm_ms=total_comm_ms,
         )
 
         g.metadata["pipeline_metrics"] = metrics

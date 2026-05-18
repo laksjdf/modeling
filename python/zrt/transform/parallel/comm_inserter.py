@@ -1,11 +1,21 @@
-"""CommInserterPass: insert communication nodes at parallel split boundaries."""
+"""CommInserterPass: insert communication nodes at parallel split boundaries.
+
+Context Parallel (CP) communication insertion uses **block boundary** strategy:
+- Group CP nodes by layer (forward and backward separately)
+- Each group (layer block) only inserts ONE set of communication nodes
+- Communication nodes positioned at block entry/exit (not per-op)
+
+Reference: docs/superpowers/specs/2025-05-12-cp-shape-split-design.md (Lines 362-697)
+"""
 from __future__ import annotations
 
 import copy
-from typing import TYPE_CHECKING
+from collections import defaultdict
+from typing import TYPE_CHECKING, Dict, List
 
 from python.zrt.ir.edge import Edge
 from python.zrt.ir.node import OpNode
+from python.zrt.ir.types import TensorMeta, DType
 from python.zrt.transform.base import GraphPass
 
 if TYPE_CHECKING:
@@ -34,18 +44,13 @@ def _rewire(g: "OpGraph", src_id: str, comm_node: OpNode) -> None:
     Before: src → [s1, s2, ...]
     After:  src → comm → [s1, s2, ...]
     """
-    # Collect out-edges of src that we need to reroute
     old_out = [e for e in g.edges if e.src == src_id]
-
-    # Remove those edges from the graph
     g.edges = [e for e in g.edges if e.src != src_id]
 
-    # Add the comm node
     g.nodes[comm_node.id] = comm_node
     g._succ[comm_node.id] = []
     g._pred[comm_node.id] = []
 
-    # src → comm (one edge per output slot of src)
     src_node = g.nodes[src_id]
     for i, out_tensor in enumerate(src_node.outputs):
         g.edges.append(Edge(
@@ -54,7 +59,6 @@ def _rewire(g: "OpGraph", src_id: str, comm_node: OpNode) -> None:
             tensor=out_tensor,
         ))
 
-    # comm → old successors
     for e in old_out:
         g.edges.append(Edge(
             src=comm_node.id, src_idx=e.src_idx,
@@ -76,6 +80,10 @@ class CommInserterPass(GraphPass):
         For the first expert op in each MoE block, insert a dispatch A2A before it.
         For the last expert op, insert a combine A2A after it.
         (Simplified: annotates boundary nodes; full MoE block detection is heuristic.)
+
+    CP block boundary:
+        Group by layer, insert communication at block boundaries (not per-op).
+        Supports Ulysses, Ring, Hybrid, Compressed strategies.
     """
 
     name = "comm_inserter"
@@ -87,14 +95,11 @@ class CommInserterPass(GraphPass):
         self._insert_cp_comm(g, ctx)
         return g
 
-    # ── TP: all_reduce after row-parallel linears ─────────────────────────────
-
     def _insert_tp_comm(self, g: "OpGraph", ctx: "TransformContext") -> None:
         tp = ctx.parallel.tp
         if tp <= 1:
             return
 
-        # Iterate over a snapshot; we'll mutate g.nodes during the loop
         tp_nodes = [
             n for n in list(g.topo_sort())
             if n.annotations.get("tp_split", {}).get("comm_after") == "all_reduce"
@@ -107,14 +112,11 @@ class CommInserterPass(GraphPass):
             comm_node.annotations["inserted_by"] = "tp_pass"
             _rewire(g, node.id, comm_node)
 
-    # ── EP: all-to-all dispatch/combine around expert blocks ──────────────────
-
     def _insert_ep_comm(self, g: "OpGraph", ctx: "TransformContext") -> None:
         ep = ctx.parallel.ep
         if ep <= 1:
             return
 
-        # Find nodes that need A2A
         ep_nodes = [
             n for n in g.topo_sort()
             if n.annotations.get("ep_needs_a2a")
@@ -123,23 +125,14 @@ class CommInserterPass(GraphPass):
         if not ep_nodes:
             return
 
-        # Message-size parameters from graph metadata and training config
         seq_len = g.metadata.get("seq_len", 2048)
         hidden = g.metadata.get("hidden", 4096)
-        dtype_bytes = 2  # BF16
+        dtype_bytes = 2
         micro_batch = ctx.training.micro_batch if ctx.training else 1
         topk = ctx.profile.moe_active if ctx.profile else 8
 
-        # EP dispatch/combine: A2A distributes routed tokens across EP ranks
-        # Each rank sends/receives 1/EP of the total routed data
-        # Message size = batch * seq_len * hidden * topk / EP * dtype_bytes
         ep_msg_bytes = micro_batch * seq_len * hidden * topk * dtype_bytes // ep
 
-        # Import TensorMeta for creating correct tensor shapes
-        from python.zrt.ir.types import TensorMeta, DType
-
-        # Create tensor metadata with correct message size
-        # Shape: [batch, seq_len, hidden] for dispatch/combine
         dispatch_tensor = TensorMeta.from_shape_dtype(
             "ep_dispatch_hidden",
             shape=(micro_batch, seq_len, hidden),
@@ -151,10 +144,6 @@ class CommInserterPass(GraphPass):
             dtype=DType.BF16,
         )
 
-        # Group by scope prefix (everything up to "experts")
-        # Insert one dispatch A2A before the first expert node in the block
-        # and one combine A2A after the last expert node in the block.
-        # Simple heuristic: treat all ep_nodes as one block per scope root.
         processed_scopes: set[str] = set()
         for node in ep_nodes:
             scope_root = _moe_scope_root(node.scope)
@@ -162,11 +151,9 @@ class CommInserterPass(GraphPass):
                 continue
             processed_scopes.add(scope_root)
 
-            # Nodes in this scope
             block = [n for n in ep_nodes if _moe_scope_root(n.scope) == scope_root]
             first, last = block[0], block[-1]
 
-            # dispatch A2A: insert before first expert node (as a predecessor)
             dispatch_id = f"comm_a2a_dispatch_{first.id}"
             combine_id  = f"comm_a2a_combine_{last.id}"
 
@@ -184,7 +171,6 @@ class CommInserterPass(GraphPass):
                 )
                 dispatch.annotations["inserted_by"] = "ep_pass"
                 g.add_node(dispatch)
-                # Rewire: in-edges of first → dispatch → first
                 _prepend_comm(g, first.id, dispatch)
 
             if combine_id not in g.nodes:
@@ -206,141 +192,433 @@ class CommInserterPass(GraphPass):
             for n in block:
                 n.annotations["ep_a2a_inserted"] = True
 
-    # ── CP: all-to-all for Ulysses, P2P for Ring ─────────────────────────────
-
     def _insert_cp_comm(self, g: "OpGraph", ctx: "TransformContext") -> None:
+        """插入CP通信算子，按layer分组，每组只插入一组通信（block boundary策略）。
+
+        Design principles:
+        1. Collect all cp_split nodes
+        2. Group by layer (区分forward和backward)
+        3. Each group only inserts communication at first/last node
+        4. Topological sort within each group to identify entry/exit
+
+        """
         cp = ctx.parallel.cp
         if cp <= 1:
             return
 
-        # Message-size parameters from graph metadata and training config
-        seq_len = g.metadata.get("seq_len", 2048)
-        hidden = g.metadata.get("hidden", 4096)
-        dtype_bytes = 2  # BF16
+        seq_len = ctx.training.seq_len if ctx.training else 2048
+        hidden = ctx.training.hidden if ctx.training else 7168
         micro_batch = ctx.training.micro_batch if ctx.training else 1
+        
+        # Resolve cp_kind based on model type
+        if ctx.training:
+            cp_kind_resolved = ctx.training.resolve_cp_kind(ctx.model_id, cp)
+        else:
+            cp_kind_resolved = "ulysses"
 
-        # Ulysses A2A: each rank gets seq_len/cp tokens, full hidden dim
-        ulysses_msg_bytes = micro_batch * (seq_len // cp) * hidden * dtype_bytes
-        # Ring P2P: each round sends a KV chunk of seq_len/cp tokens
-        ring_msg_bytes = micro_batch * (seq_len // cp) * hidden * dtype_bytes
+        cp_nodes = [n for n in g.topo_sort() if n.annotations.get("cp_split")]
 
-        # Iterate over nodes with CP split annotations
-        cp_nodes = [
-            n for n in list(g.topo_sort())
-            if n.annotations.get("cp_split")
-        ]
+        if not cp_nodes:
+            return
+
+        topo_order = {node.id: i for i, node in enumerate(g.topo_sort())}
+
+        layer_fwd_groups: Dict[str, List[OpNode]] = defaultdict(list)
+        layer_bwd_groups: Dict[str, List[OpNode]] = defaultdict(list)
 
         for node in cp_nodes:
-            cp_split = node.annotations.get("cp_split", {})
-            cp_kind = cp_split.get("kind", "none")
+            layer = node.layer or "root"
+            phase = node.annotations.get("phase", "fwd")
+            if phase == "bwd":
+                layer_bwd_groups[f"bwd_{layer}"].append(node)
+            else:
+                layer_fwd_groups[layer].append(node)
 
-            if cp_kind in ("ulysses", "hybrid"):
-                # Ulysses: A2A scatter-seq/gather-heads BEFORE attn; inverse A2A AFTER
-                pre_comm_id = f"comm_a2a_cp_pre_{node.id}"
-                post_comm_id = f"comm_a2a_cp_post_{node.id}"
-                role_prefix = "cp_ulysses" if cp_kind == "ulysses" else "cp_hybrid_ulysses"
+        for layer, nodes in layer_fwd_groups.items():
+            if not nodes:
+                continue
 
-                if pre_comm_id not in g.nodes:
-                    pre_comm = OpNode(
-                        id=pre_comm_id,
-                        op_type="comm.all_to_all",
-                        inputs=copy.deepcopy(node.inputs),
-                        outputs=copy.deepcopy(node.inputs),
-                        attrs={"group_size": cp, "collective": "all_to_all",
-                               "role": f"{role_prefix}_pre",
-                               "message_size_bytes": ulysses_msg_bytes,
-                               "msg_bytes": ulysses_msg_bytes},
-                        scope=node.scope,
-                        layer=node.layer,
-                        category="communication",
-                    )
-                    pre_comm.annotations["inserted_by"] = "cp_pass"
-                    g.nodes[pre_comm.id] = pre_comm
-                    _prepend_comm(g, node.id, pre_comm)
+            sorted_nodes = sorted(nodes, key=lambda n: topo_order[n.id])
+            first_node = sorted_nodes[0]
+            last_node = sorted_nodes[-1]
 
-                if post_comm_id not in g.nodes:
-                    post_comm = OpNode(
-                        id=post_comm_id,
-                        op_type="comm.all_to_all",
-                        inputs=copy.deepcopy(node.outputs),
-                        outputs=copy.deepcopy(node.outputs),
-                        attrs={"group_size": cp, "collective": "all_to_all",
-                               "role": f"{role_prefix}_post",
-                               "message_size_bytes": ulysses_msg_bytes,
-                               "msg_bytes": ulysses_msg_bytes},
-                        scope=node.scope,
-                        layer=node.layer,
-                        category="communication",
-                    )
-                    post_comm.annotations["inserted_by"] = "cp_pass"
-                    _rewire(g, node.id, post_comm)
+            cp_kind = first_node.annotations.get("cp_split", {}).get("kind", "ulysses")
 
-            if cp_kind in ("ring", "hybrid"):
-                p2p_rounds = cp_split.get("p2p_rounds", cp)
-                for i in range(p2p_rounds):
-                    p2p_prefix = "ring" if cp_kind == "ring" else "hybrid_ring"
-                    p2p_id = f"comm_p2p_cp_{p2p_prefix}_{node.id}_round_{i}"
-                    if p2p_id not in g.nodes:
-                        p2p_comm = OpNode(
-                            id=p2p_id,
-                            op_type="comm.send_recv",
-                            inputs=copy.deepcopy(node.inputs),
-                            outputs=copy.deepcopy(node.inputs),
-                            attrs={"group_size": cp, "collective": "send_recv",
-                                   "role": f"cp_{p2p_prefix}", "round": i,
-                                   "message_size_bytes": ring_msg_bytes,
-                                   "msg_bytes": ring_msg_bytes,
-                                   "cp_rounds": p2p_rounds,
-                                   "scope": node.scope, "layer": node.layer},
-                            scope=node.scope,
-                            layer=node.layer,
-                            category="communication",
-                        )
-                        p2p_comm.annotations["inserted_by"] = "cp_pass"
-                        p2p_comm.annotations["overlap_target"] = f"fa_tile:{node.id}"
-                        g.nodes[p2p_comm.id] = p2p_comm
-                        _prepend_comm(g, node.id, p2p_comm)
+            if cp_kind == "ulysses":
+                pre_comm, post_comm = self._create_ulysses_comm_nodes(
+                    first_node, last_node, seq_len, cp, hidden, micro_batch, phase="fwd"
+                )
+                _prepend_comm(g, first_node.id, pre_comm)
+                self._insert_after(g, last_node, post_comm)
 
-            if cp_kind == "compressed":
-                stage1_id = f"comm_p2p_cp_compressed_stage1_{node.id}"
-                stage2_id = f"comm_ag_cp_compressed_stage2_{node.id}"
-                if stage1_id not in g.nodes:
-                    stage1 = OpNode(
-                        id=stage1_id,
-                        op_type="comm.send_recv",
-                        inputs=copy.deepcopy(node.inputs),
-                        outputs=copy.deepcopy(node.inputs),
-                        attrs={"group_size": cp, "collective": "send_recv",
-                               "role": "cp_compressed_stage1",
-                               "message_size_bytes": ring_msg_bytes,
-                               "msg_bytes": ring_msg_bytes,
-                               "scope": node.scope, "layer": node.layer},
-                        scope=node.scope,
-                        layer=node.layer,
-                        category="communication",
-                    )
-                    stage1.annotations["inserted_by"] = "cp_pass"
-                    stage1.annotations["overlap_target"] = f"fa_tile:{node.id}"
-                    g.nodes[stage1.id] = stage1
-                    _prepend_comm(g, node.id, stage1)
+            elif cp_kind == "ring":
+                ring_comm = self._create_ring_comm_node(
+                    first_node, seq_len, cp, hidden, micro_batch, phase="fwd"
+                )
+                _prepend_comm(g, first_node.id, ring_comm)
 
-                if stage2_id not in g.nodes:
-                    stage2 = OpNode(
-                        id=stage2_id,
-                        op_type="comm.all_gather",
-                        inputs=copy.deepcopy(node.inputs),
-                        outputs=copy.deepcopy(node.inputs),
-                        attrs={"group_size": cp, "collective": "all_gather",
-                               "role": "cp_compressed_stage2",
-                               "message_size_bytes": ulysses_msg_bytes,
-                               "msg_bytes": ulysses_msg_bytes},
-                        scope=node.scope,
-                        layer=node.layer,
-                        category="communication",
-                    )
-                    stage2.annotations["inserted_by"] = "cp_pass"
-                    g.nodes[stage2.id] = stage2
-                    _prepend_comm(g, node.id, stage2)
+            elif cp_kind == "hybrid":
+                a2a_pre, a2a_post, p2p = self._create_hybrid_comm_nodes(
+                    first_node, seq_len, cp, hidden, micro_batch, phase="fwd"
+                )
+                _prepend_comm(g, first_node.id, a2a_pre)
+                self._insert_after(g, last_node, p2p)
+                self._insert_after(g, p2p, a2a_post)
+
+            elif cp_kind == "compressed":
+                self._insert_compressed_cp_comm_block(
+                    g, first_node, last_node, seq_len, cp, hidden, micro_batch, phase="fwd"
+                )
+
+        for layer, nodes in layer_bwd_groups.items():
+            if not nodes:
+                continue
+
+            sorted_nodes = sorted(nodes, key=lambda n: topo_order[n.id])
+            first_node = sorted_nodes[0]
+            last_node = sorted_nodes[-1]
+
+            cp_kind = first_node.annotations.get("cp_split", {}).get("kind", "ulysses")
+
+            if cp_kind == "ulysses":
+                pre_comm, post_comm = self._create_ulysses_comm_nodes(
+                    first_node, last_node, seq_len, cp, hidden, micro_batch, phase="bwd"
+                )
+                _prepend_comm(g, first_node.id, pre_comm)
+                self._insert_after(g, last_node, post_comm)
+
+            elif cp_kind == "ring":
+                ring_comm = self._create_ring_comm_node(
+                    first_node, seq_len, cp, hidden, micro_batch, phase="bwd"
+                )
+                _prepend_comm(g, first_node.id, ring_comm)
+
+            elif cp_kind == "hybrid":
+                a2a_pre, a2a_post, p2p = self._create_hybrid_comm_nodes(
+                    first_node, seq_len, cp, hidden, micro_batch, phase="bwd"
+                )
+                _prepend_comm(g, first_node.id, a2a_pre)
+                self._insert_after(g, last_node, p2p)
+                self._insert_after(g, p2p, a2a_post)
+
+            elif cp_kind == "compressed":
+                self._insert_compressed_cp_comm_block(
+                    g, first_node, last_node, seq_len, cp, hidden, micro_batch, phase="bwd"
+                )
+
+    def _create_ulysses_comm_nodes(
+        self, first_node: OpNode, last_node: OpNode,
+        seq_len: int, cp: int, hidden: int, micro_batch: int, phase: str
+    ) -> tuple[OpNode, OpNode]:
+        """创建Ulysses pre/post A2A通信节点。"""
+        seq_local = seq_len // cp
+        layer = first_node.layer or "root"
+        phase_suffix = phase
+
+        if first_node.inputs:
+            pre_in_shape = first_node.inputs[0].shape
+        else:
+            pre_in_shape = (micro_batch, seq_local, hidden)
+
+        pre_out_shape = pre_in_shape
+        a2a_bytes = micro_batch * seq_local * hidden * 2
+
+        pre_comm = OpNode(
+            id=f"comm_a2a_cp_pre_layer_{layer}_{phase_suffix}",
+            op_type="comm.all_to_all",
+            inputs=[TensorMeta.from_shape_dtype("pre_in", pre_in_shape, DType.BF16)],
+            outputs=[TensorMeta.from_shape_dtype("pre_out", pre_out_shape, DType.BF16)],
+            attrs={
+                "group_size": cp,
+                "collective": "all_to_all",
+                "role": "cp_ulysses_pre",
+                "bytes": a2a_bytes,
+                "layer": layer,
+            },
+            annotations={
+                "phase": phase,
+                "inserted_by": "cp_pass",
+                "mask": False,  # A2A is blocking, cannot overlap
+                "mask_type": "a2a_blocking",
+            },
+            scope=first_node.scope,
+            layer=layer,
+            category="communication",
+        )
+
+        post_comm = OpNode(
+            id=f"comm_a2a_cp_post_layer_{layer}_{phase_suffix}",
+            op_type="comm.all_to_all",
+            inputs=[TensorMeta.from_shape_dtype("post_in", pre_in_shape, DType.BF16)],
+            outputs=[TensorMeta.from_shape_dtype("post_out", pre_in_shape, DType.BF16)],
+            attrs={
+                "group_size": cp,
+                "collective": "all_to_all",
+                "role": "cp_ulysses_post",
+                "bytes": a2a_bytes,
+                "layer": layer,
+            },
+            annotations={
+                "phase": phase,
+                "inserted_by": "cp_pass",
+                "mask": False,  # A2A is blocking, cannot overlap
+                "mask_type": "a2a_blocking",
+            },
+            scope=last_node.scope,
+            layer=layer,
+            category="communication",
+        )
+
+        return pre_comm, post_comm
+
+    def _create_ring_comm_node(
+        self, first_node: OpNode, seq_len: int, cp: int, hidden: int, micro_batch: int, phase: str
+    ) -> OpNode:
+        """创建Ring CP的P2P通信节点。"""
+        seq_local = seq_len // cp
+        p2p_bytes = micro_batch * seq_local * hidden * 2
+        layer = first_node.layer or "root"
+        phase_suffix = phase
+
+        if first_node.inputs:
+            ring_shape = first_node.inputs[0].shape
+        else:
+            ring_shape = (micro_batch, seq_local, hidden)
+
+        ring_comm = OpNode(
+            id=f"comm_p2p_ring_layer_{layer}_{phase_suffix}",
+            op_type="comm.send_recv",
+            inputs=[TensorMeta.from_shape_dtype("ring_in", ring_shape, DType.BF16)],
+            outputs=[TensorMeta.from_shape_dtype("ring_out", ring_shape, DType.BF16)],
+            attrs={
+                "group_size": cp,
+                "collective": "send_recv",
+                "role": "cp_ring",
+                "bytes": p2p_bytes,
+                "rounds": cp,
+                "overlap": True,
+                "layer": layer,
+            },
+            annotations={
+                "overlap_target": "attention_block",
+                "phase": phase,
+                "inserted_by": "cp_pass",
+                "mask": True,
+                "mask_type": "p2p_overlap",
+            },
+            scope=first_node.scope,
+            layer=layer,
+            category="communication",
+        )
+
+        return ring_comm
+
+    def _create_hybrid_comm_nodes(
+        self, first_node: OpNode, seq_len: int, cp: int, hidden: int, micro_batch: int, phase: str
+    ) -> tuple[OpNode, OpNode, OpNode]:
+        """创建Hybrid CP通信节点组（A2A pre + P2P + A2A post）。"""
+        seq_local = seq_len // cp
+        a2a_bytes = micro_batch * seq_local * hidden * 2
+        p2p_bytes = micro_batch * seq_local * hidden * 2
+        layer = first_node.layer or "root"
+        phase_suffix = phase
+
+        if first_node.inputs:
+            shape = first_node.inputs[0].shape
+        else:
+            shape = (micro_batch, seq_local, hidden)
+
+        a2a_pre = OpNode(
+            id=f"comm_a2a_hybrid_pre_layer_{layer}_{phase_suffix}",
+            op_type="comm.all_to_all",
+            inputs=[TensorMeta.from_shape_dtype("a2a_in", shape, DType.BF16)],
+            outputs=[TensorMeta.from_shape_dtype("a2a_out", shape, DType.BF16)],
+            attrs={
+                "group_size": cp,
+                "collective": "all_to_all",
+                "role": "cp_hybrid_a2a_pre",
+                "bytes": a2a_bytes,
+                "layer": layer,
+            },
+            annotations={
+                "phase": phase,
+                "inserted_by": "cp_pass",
+                "mask": False,  # A2A is blocking, cannot overlap
+                "mask_type": "a2a_blocking",
+            },
+            scope=first_node.scope,
+            layer=layer,
+            category="communication",
+        )
+
+        p2p = OpNode(
+            id=f"comm_p2p_hybrid_layer_{layer}_{phase_suffix}",
+            op_type="comm.send_recv",
+            inputs=[TensorMeta.from_shape_dtype("p2p_in", shape, DType.BF16)],
+            outputs=[TensorMeta.from_shape_dtype("p2p_out", shape, DType.BF16)],
+            attrs={
+                "group_size": cp,
+                "collective": "send_recv",
+                "role": "cp_hybrid_p2p",
+                "bytes": p2p_bytes,
+                "rounds": cp,
+                "overlap": True,
+                "layer": layer,
+            },
+            annotations={
+                "overlap_target": "attention_block",
+                "phase": phase,
+                "inserted_by": "cp_pass",
+                "mask": True,
+                "mask_type": "p2p_overlap",
+            },
+            scope=first_node.scope,
+            layer=layer,
+            category="communication",
+        )
+
+        a2a_post = OpNode(
+            id=f"comm_a2a_hybrid_post_layer_{layer}_{phase_suffix}",
+            op_type="comm.all_to_all",
+            inputs=[TensorMeta.from_shape_dtype("a2a_post_in", shape, DType.BF16)],
+            outputs=[TensorMeta.from_shape_dtype("a2a_post_out", shape, DType.BF16)],
+            attrs={
+                "group_size": cp,
+                "collective": "all_to_all",
+                "role": "cp_hybrid_a2a_post",
+                "bytes": a2a_bytes,
+                "layer": layer,
+            },
+            annotations={
+                "phase": phase,
+                "inserted_by": "cp_pass",
+                "mask": False,  # A2A is blocking, cannot overlap
+                "mask_type": "a2a_blocking",
+            },
+            scope=first_node.scope,
+            layer=layer,
+            category="communication",
+        )
+
+        return a2a_pre, a2a_post, p2p
+
+    def _insert_compressed_cp_comm_block(
+        self, g: "OpGraph", first_node: OpNode, last_node: OpNode,
+        seq_len: int, cp: int, hidden: int, micro_batch: int, phase: str
+    ) -> None:
+        """DeepSeek-V4两段式Compressed CP，只在block边界插入。"""
+        layer = first_node.layer or "root"
+
+        cp_split_info = first_node.annotations.get("cp_split", {})
+        if cp_split_info.get("skip_comm", False):
+            return
+
+        if "swa" in layer.lower() or "sliding" in first_node.scope.lower():
+            return
+
+        seq_local = seq_len // cp
+        phase_suffix = phase
+
+        if first_node.inputs:
+            shape = first_node.inputs[0].shape
+        else:
+            shape = (micro_batch, seq_local, hidden)
+
+        compression_ratio = 4
+
+        p2p_bytes = micro_batch * seq_local * hidden * 2
+        p2p_comm = OpNode(
+            id=f"comm_p2p_compressed_stage1_layer_{layer}_{phase_suffix}",
+            op_type="comm.send_recv",
+            inputs=[TensorMeta.from_shape_dtype("p2p_in", shape, DType.BF16)],
+            outputs=[TensorMeta.from_shape_dtype("p2p_out", shape, DType.BF16)],
+            attrs={
+                "group_size": cp,
+                "collective": "send_recv",
+                "role": "cp_compressed_stage1",
+                "stage": "p2p_boundary_exchange",
+                "bytes": p2p_bytes,
+                "layer": layer,
+            },
+            annotations={
+                "phase": phase,
+                "inserted_by": "cp_pass",
+                "mask": True,
+                "mask_type": "p2p_overlap",
+            },
+            scope=first_node.scope,
+            layer=layer,
+            category="communication",
+        )
+        _prepend_comm(g, first_node.id, p2p_comm)
+
+        # Stage 2: AllGather compressed KV (after block)
+        ag_bytes = p2p_bytes // compression_ratio
+        ag_comm = OpNode(
+            id=f"comm_ag_compressed_stage2_layer_{layer}_{phase_suffix}",
+            op_type="comm.all_gather",
+            inputs=[TensorMeta.from_shape_dtype("ag_in", shape, DType.BF16)],
+            outputs=[TensorMeta.from_shape_dtype("ag_out", shape, DType.BF16)],
+            attrs={
+                "group_size": cp,
+                "collective": "all_gather",
+                "role": "cp_compressed_stage2",
+                "stage": "allgather_compressed_kv",
+                "bytes": ag_bytes,
+                "compression_ratio": compression_ratio,
+                "layer": layer,
+            },
+            annotations={
+                "phase": phase,
+                "inserted_by": "cp_pass",
+                "mask": False,  # AllGather is blocking, cannot overlap
+                "mask_type": "ag_blocking",
+            },
+            scope=last_node.scope,
+            layer=layer,
+            category="communication",
+        )
+        self._insert_after(g, last_node, ag_comm)
+
+    def _insert_after(self, graph: "OpGraph", src_node: OpNode, comm_node: OpNode) -> None:
+        """Insert comm_node between src_node and all its current successors."""
+        src_id = src_node.id
+
+        old_out = [e for e in graph.edges if e.src == src_id]
+        if not old_out:
+            graph.nodes[comm_node.id] = comm_node
+            graph._succ[comm_node.id] = []
+            graph._pred[comm_node.id] = []
+            if src_node.outputs:
+                graph.edges.append(Edge(
+                    src=src_id, src_idx=0,
+                    dst=comm_node.id, dst_idx=0,
+                    tensor=src_node.outputs[0],
+                ))
+            graph._rebuild_adjacency()
+            return
+
+        graph.edges = [e for e in graph.edges if e.src != src_id]
+
+        graph.nodes[comm_node.id] = comm_node
+        graph._succ[comm_node.id] = []
+        graph._pred[comm_node.id] = []
+
+        for i, out_tensor in enumerate(src_node.outputs):
+            graph.edges.append(Edge(
+                src=src_id, src_idx=i,
+                dst=comm_node.id, dst_idx=i,
+                tensor=out_tensor,
+            ))
+
+        for e in old_out:
+            graph.edges.append(Edge(
+                src=comm_node.id, src_idx=e.src_idx,
+                dst=e.dst, dst_idx=e.dst_idx,
+                tensor=e.tensor,
+            ))
+
+        graph._rebuild_adjacency()
 
 
 def _moe_scope_root(scope: str) -> str:
@@ -353,24 +631,44 @@ def _moe_scope_root(scope: str) -> str:
 
 
 def _prepend_comm(g: "OpGraph", dst_id: str, comm_node: OpNode) -> None:
-    """Insert comm_node between all predecessors of dst_id and dst_id itself."""
+    """Insert comm_node between all predecessors of dst_id and dst_id itself.
+    
+    Handles two cases:
+    1. dst has predecessors: reroute preds → comm → dst
+    2. dst has no predecessors: add comm as new graph entry node
+    """
+    # Add comm node to graph first
+    g.nodes[comm_node.id] = comm_node
+    g._succ[comm_node.id] = []
+    g._pred[comm_node.id] = []
+    
     in_edges = [e for e in g.edges if e.dst == dst_id]
     g.edges = [e for e in g.edges if e.dst != dst_id]
 
-    # predecessors → comm
-    for e in in_edges:
-        g.edges.append(Edge(
-            src=e.src, src_idx=e.src_idx,
-            dst=comm_node.id, dst_idx=e.dst_idx,
-            tensor=e.tensor,
-        ))
+    if not in_edges:
+        # No predecessors: add comm as entry node, create edge comm → dst
+        dst_node = g.nodes[dst_id]
+        if dst_node.inputs:
+            # Use first input tensor for the edge
+            g.edges.append(Edge(
+                src=comm_node.id, src_idx=0,
+                dst=dst_id, dst_idx=0,
+                tensor=dst_node.inputs[0],
+            ))
+    else:
+        # Has predecessors: reroute
+        for e in in_edges:
+            g.edges.append(Edge(
+                src=e.src, src_idx=e.src_idx,
+                dst=comm_node.id, dst_idx=e.dst_idx,
+                tensor=e.tensor,
+            ))
 
-    # comm → dst: preserve original dst_idx so input slots are not remapped
-    for e in in_edges:
-        g.edges.append(Edge(
-            src=comm_node.id, src_idx=e.dst_idx,
-            dst=dst_id, dst_idx=e.dst_idx,
-            tensor=e.tensor,
-        ))
+        for e in in_edges:
+            g.edges.append(Edge(
+                src=comm_node.id, src_idx=e.dst_idx,
+                dst=dst_id, dst_idx=e.dst_idx,
+                tensor=e.tensor,
+            ))
 
     g._rebuild_adjacency()

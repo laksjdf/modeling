@@ -343,3 +343,53 @@ class TestExpertParallelConstraints:
             if "dp" in w.lower() and "ep" in w.lower() and "divisible" in w.lower()
         ]
         assert ep_dp_warnings == [], f"Unexpected EP/DP warning: {ep_dp_warnings}"
+
+
+class TestTPOverlapNoopWarning:
+    """tp_overlap != NONE has no effect when tp <= 1 because no TP collectives
+    are inserted by ir/shard.py:_insert_tp_collectives (gated on tp > 1).
+    The validator should surface this silent no-op."""
+
+    def test_tp1_with_coc_warns(self):
+        from zrt.training.spec.strategy import TPOverlap
+        model = _model(num_layers=4)
+        system = _system()
+        strategy = Strategy(tp=1, pp=1, dp=1, micro_batch=1, global_batch=4,
+                            tp_overlap=TPOverlap.COC)
+        warnings = validate(model, system, strategy)
+        assert _warnings_contain(warnings, "tp_overlap"), \
+            f"Expected tp_overlap warning, got: {warnings}"
+        assert _warnings_contain(warnings, "tp=1"), \
+            f"Expected mention of tp=1, got: {warnings}"
+
+    def test_tp1_with_mc2_warns(self):
+        from zrt.training.spec.strategy import TPOverlap
+        model = _model(num_layers=4)
+        system = _system()
+        strategy = Strategy(tp=1, pp=1, dp=1, micro_batch=1, global_batch=4,
+                            tp_overlap=TPOverlap.MC2)
+        warnings = validate(model, system, strategy)
+        assert _warnings_contain(warnings, "tp_overlap"), \
+            f"Expected tp_overlap warning, got: {warnings}"
+
+    def test_tp1_with_none_overlap_is_clean(self):
+        """tp_overlap=NONE + tp=1 is the default — no warning."""
+        from zrt.training.spec.strategy import TPOverlap
+        model = _model(num_layers=4)
+        system = _system()
+        strategy = Strategy(tp=1, pp=1, dp=1, micro_batch=1, global_batch=4,
+                            tp_overlap=TPOverlap.NONE)
+        warnings = validate(model, system, strategy)
+        assert not _warnings_contain(warnings, "tp_overlap"), \
+            f"Should not warn when tp_overlap is NONE: {warnings}"
+
+    def test_tp2_with_coc_no_warning(self):
+        """tp > 1 + tp_overlap=COC is the intended use case — no warning."""
+        from zrt.training.spec.strategy import TPOverlap
+        model = _model(num_layers=4, num_heads=8)  # 8 % 2 == 0
+        system = _system()
+        strategy = Strategy(tp=2, pp=1, dp=1, micro_batch=1, global_batch=4,
+                            tp_overlap=TPOverlap.COC)
+        warnings = validate(model, system, strategy)
+        assert not _warnings_contain(warnings, "tp_overlap"), \
+            f"Should not warn when tp>1: {warnings}"

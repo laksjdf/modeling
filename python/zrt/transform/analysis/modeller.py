@@ -111,6 +111,8 @@ def estimate_training_from_graphs(
             global_batch=global_batch,
             pp_schedule=pp_schedule,
             vpp_chunks=vpp_chunks,
+            seq_len=seq_len,
+            hidden=hidden,
             cp_kind=cp_kind,
         ),
         fusion=fusion_config or FusionConfig(),
@@ -194,6 +196,9 @@ def estimate_training_from_graphs(
     cooldown_steps = pipeline_metrics.cooldown_steps if pipeline_metrics else 0
     steady_steps = pipeline_metrics.steady_steps if pipeline_metrics else 0
     bubble_fraction = pipeline_metrics.bubble_fraction if pipeline_metrics else 0.0
+    exposed_comm_ms = pipeline_metrics.exposed_comm_ms if pipeline_metrics else 0.0
+    hidden_comm_ms = pipeline_metrics.hidden_comm_ms if pipeline_metrics else 0.0
+    total_comm_ms = pipeline_metrics.total_comm_ms if pipeline_metrics else 0.0
 
     parallel = ctx.parallel
     training = ctx.training
@@ -223,7 +228,7 @@ def estimate_training_from_graphs(
         per_stage_ms=per_stage_ms,
         mfu=mfu,
         hfu=hfu,
-        total_flops=training_flops,  # Alias for Stack A compatibility
+        total_flops=training_flops,
         training_flops=training_flops,
         forward_flops=forward_flops,
         backward_flops=backward_flops,
@@ -234,6 +239,9 @@ def estimate_training_from_graphs(
         bubble_fraction=bubble_fraction,
         total_params=total_params,
         fused_ops_summary=fused_ops_summary,
+        exposed_comm_ms=exposed_comm_ms,
+        hidden_comm_ms=hidden_comm_ms,
+        total_comm_volume_ms=total_comm_ms,
     )
 
     if return_transformed:

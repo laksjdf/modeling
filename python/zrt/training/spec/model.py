@@ -82,6 +82,25 @@ class ModelSpec:
     master_dtype: Dtype = Dtype.FP32
     act_dtype: Dtype = Dtype.BF16
 
+    # === Per-component compute dtype (DeepSeek-V4 mixed quant) ===
+    attn_compute_dtype: Dtype = Dtype.BF16
+    shared_expert_compute_dtype: Dtype = Dtype.BF16
+    routed_expert_compute_dtype: Dtype = Dtype.BF16
+
+    # === Per-component weight dtype ===
+    # Default is ``None`` (sentinel) which resolves to ``Dtype.BF16`` in
+    # ``__post_init__`` — unless the legacy ``routed_expert_dtype='fp4'``
+    # string is supplied, in which case it syncs to ``Dtype.FP4``. An
+    # explicit user value (including ``Dtype.BF16``) always wins.
+    routed_expert_weight_dtype: Dtype | None = None  # V4 default: FP4
+
+    # === Per-region activation dtype (None → fallback) ===
+    attn_act_dtype: Dtype | None = None
+    moe_act_dtype: Dtype | None = None
+
+    # === Per-component grad dtype ===
+    routed_expert_grad_dtype: Dtype = Dtype.FP32
+
     # normalization kind: "rmsnorm" (DeepSeek) or "layernorm" (LLaMA variants)
     norm_kind: str = "rmsnorm"
 
@@ -105,6 +124,19 @@ class ModelSpec:
                     f"Compressed-CP layer distribution ({total_compressed_layers}) "
                     f"must match total layers ({len(self.layers)})"
                 )
+
+        # Back-compat: legacy ``routed_expert_dtype: str`` syncs into the
+        # new ``routed_expert_weight_dtype`` only when the new field is at
+        # its default (sentinel ``None``). An explicit user value wins.
+        if self.routed_expert_weight_dtype is None:
+            if isinstance(self.routed_expert_dtype, str):
+                legacy = self.routed_expert_dtype.lower().strip()
+                if legacy == "fp4":
+                    self.routed_expert_weight_dtype = Dtype.FP4
+                else:
+                    self.routed_expert_weight_dtype = Dtype.BF16
+            else:
+                self.routed_expert_weight_dtype = Dtype.BF16
 
     @property
     def use_mla(self) -> bool:
@@ -161,6 +193,21 @@ class ModelSpec:
     @property
     def kv_dim(self) -> int:
         return self.num_kv_heads * self.head_dim
+
+    def effective_attn_act_dtype(self) -> Dtype:
+        """Attention region activation dtype; falls back to act_dtype."""
+        return self.attn_act_dtype if self.attn_act_dtype is not None else self.act_dtype
+
+    def effective_moe_act_dtype(self) -> Dtype:
+        """MoE region activation dtype; falls back to routed_expert_compute_dtype.
+
+        Rationale: when a user enables FP8 routed compute via quant preset,
+        the matching forward activations are also FP8 unless explicitly
+        overridden.
+        """
+        if self.moe_act_dtype is not None:
+            return self.moe_act_dtype
+        return self.routed_expert_compute_dtype
 
     # ── Attention parameter helpers ──────────────────────────────────────
 

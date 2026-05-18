@@ -80,6 +80,7 @@ def estimate(
         pipeline_time_ms=s.pipeline_time * 1000,
         mfu=s.mfu,
         hfu=s.hfu,
+        mfu_native=s.mfu_native,
         memory=s.memory,
         per_stage=s.per_stage,
         total_flops=total_flops,
@@ -122,6 +123,12 @@ def estimate(
         tp_hidden_ms=s.tp_hidden * 1000,
         ep_hidden_ms=s.ep_hidden * 1000,
         total_comm_volume_ms=s.total_comm_volume * 1000,
+        # Per-strategy total comm
+        tp_total_ms=(s.tp_exposed + s.tp_hidden) * 1000,
+        cp_total_ms=s.cp_exposed * 1000,
+        ep_total_ms=(s.ep_exposed + s.ep_hidden) * 1000,
+        pp_total_ms=s.pp_exposed * 1000,
+        dp_total_ms=(s.dp_exposed + s.dp_hidden) * 1000,
         # Derived metrics
         tokens_per_sec=tokens_per_sec,
         effective_params=model.effective_params_for_flops(),
@@ -151,8 +158,8 @@ def grid_search(
         try:
             report = estimate(model, system, strategy)
             if report.memory is not None:
-                total_gb = report.memory.total / 1e9
-                if total_gb > space.max_memory_gb:
+                peak_gb = report.memory.peak_overall / 1e9
+                if peak_gb > space.max_memory_gb:
                     continue
             reports.append(report)
         except Exception:

@@ -28,6 +28,7 @@ class ComputeSpec:
     int8_tops:   float = 0.0
     int4_tops:   float = 0.0
     fp8_tops:    float = 0.0   # covers both FP8_E4M3 and FP8_E5M2
+    fp4_tops:    float = 0.0   # Blackwell B200/B300+ (NVFP4/MXFP4); 0 = unsupported
 
     # Heterogeneous-core fields (matrix/Tensor/Cube vs scalar/vector split).
     # None = homogeneous hardware (fall back to unified peak_flops path).
@@ -39,6 +40,11 @@ class ComputeSpec:
     # SRAM per SM for FlashAttention tile-level modeling (KB).
     # 0 = tile model disabled.
     sram_kb_per_sm: float = 0.0
+
+    # Number of EP A2A overlap waves (K-wave technique, e.g. DeepSeek V3).
+    # 0 = hardware does not support K-wave EP overlap (e.g. Ascend HCCS).
+    # NVIDIA CUDA-capable hardware: typically 4.
+    ep_overlap_waves: int = 0
 
 
 @dataclass

@@ -10,7 +10,9 @@ compute:
   int8_tops: 624
   int4_tops: 1248
   fp8_tops: 0       # A100 does not support FP8
+  fp4_tops: 0       # A100 has no native FP4; falls back to FP8 (then BF16) at runtime
   sram_kb_per_sm: 192
+  ep_overlap_waves: 4   # K-wave EP A2A overlap (CUDA stream-based)
 
 memory:
   capacity_gb: 80

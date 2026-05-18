@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from zrt.training.spec.model import LayerKind, ModelSpec
-from zrt.training.spec.strategy import CPKind, Strategy
+from zrt.training.spec.strategy import CPKind, Strategy, TPOverlap
 from zrt.training.spec.system import SystemSpec
 
 
@@ -130,6 +130,14 @@ def validate(model: ModelSpec, system: SystemSpec, strategy: Strategy) -> list[s
         warnings.append(
             f"DP ({strategy.dp}) not divisible by EP ({strategy.ep}); "
             f"Megatron requires EP groups to be subsets of DP groups (DP % EP == 0)"
+        )
+
+    if strategy.tp_overlap != TPOverlap.NONE and strategy.tp <= 1:
+        warnings.append(
+            f"tp_overlap={strategy.tp_overlap.value!r} is set but tp=1; "
+            f"no TP collectives are inserted (ir/shard.py:_insert_tp_collectives "
+            f"is gated on tp > 1), so this setting has no effect. "
+            f"Set tp >= 2 or set tp_overlap='none' to suppress this warning."
         )
 
     if strategy.tp > system.gpus_per_node:

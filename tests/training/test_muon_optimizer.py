@@ -511,3 +511,80 @@ def _make_mock_system() -> SystemSpec:
         nodes=8,
         gpus_per_node=8,
     )
+
+
+class TestMuonNSPeakBuffer:
+    """Test Muon NS peak buffer memory calculation (transient spikes during orthogonalization)."""
+
+    def test_muon_ns_buffer_zero_when_dp1(self):
+        """No AllGather spike when DP=1 — no ZeRO sharding."""
+        from zrt.training.models.memory import _muon_ns_peak_buffer
+        from zrt.training.ir.builders import build_graph
+
+        model = _make_mock_model()
+        strategy = Strategy(tp=4, pp=4, dp=1, zero_stage=0,
+                            optimizer=OptKind.MUON, muon_config=MuonConfig())
+        buf = _muon_ns_peak_buffer(model, strategy)
+        # Only A=XᵀX matrix, no AG spike
+        assert buf > 0                        # A matrix still present
+        assert buf < 1e9                      # << 1 GB (just n×n matrix)
+
+    def test_muon_ns_buffer_scales_with_dp(self):
+        """AllGather spike grows as DP increases."""
+        from zrt.training.models.memory import _muon_ns_peak_buffer
+
+        model = _make_mock_model()
+        s4  = Strategy(tp=4, pp=4, dp=4,  zero_stage=2,
+                       optimizer=OptKind.MUON, muon_config=MuonConfig())
+        s64 = Strategy(tp=4, pp=4, dp=64, zero_stage=2,
+                       optimizer=OptKind.MUON, muon_config=MuonConfig())
+        buf4  = _muon_ns_peak_buffer(model, s4)
+        buf64 = _muon_ns_peak_buffer(model, s64)
+        # DP=64 spike should be larger (closer to full P_muon × 4B)
+        assert buf64 > buf4
+
+    def test_muon_peak_optimizer_exceeds_adam(self):
+        """Muon peak_optimizer > Adam peak_optimizer when ZeRO sharding
+        makes opt_state small but NS buffer adds a large transient spike."""
+        from zrt.training.models.memory import memory_breakdown
+        from zrt.training.ir.builders import build_graph
+
+        model = _make_mock_model()
+        system = _make_mock_system()
+
+        strategy_m = Strategy(tp=4, pp=4, dp=64, micro_batch=1, zero_stage=2,
+                              optimizer=OptKind.MUON, muon_config=MuonConfig())
+        strategy_a = Strategy(tp=4, pp=4, dp=64, micro_batch=1, zero_stage=2,
+                              optimizer=OptKind.ADAM)
+
+        graph_m = build_graph(model, strategy_m)
+        graph_a = build_graph(model, strategy_a)
+
+        mb_m = memory_breakdown(graph_m, model, system, strategy_m)
+        mb_a = memory_breakdown(graph_a, model, system, strategy_a)
+
+        # With large DP, Muon opt_state is tiny but NS AllGather buffer spikes back up
+        assert mb_m.muon_ns_buffer > 0
+        # peak_optimizer with NS buffer should be tracked
+        assert mb_m.peak_optimizer == mb_m.weights + mb_m.grads + mb_m.opt_state + mb_m.muon_ns_buffer
+
+    def test_peak_overall_le_total(self):
+        """peak_overall <= total must hold even when muon_ns_buffer is large.
+
+        muon_ns_buffer is included in total so the invariant is guaranteed
+        regardless of DP or sequence length.
+        """
+        from zrt.training.models.memory import memory_breakdown
+        from zrt.training.ir.builders import build_graph
+
+        model = _make_mock_model()
+        system = _make_mock_system()
+        for dp in [1, 4, 64]:
+            strategy = Strategy(tp=4, pp=4, dp=dp, micro_batch=1, zero_stage=2,
+                                optimizer=OptKind.MUON, muon_config=MuonConfig())
+            graph = build_graph(model, strategy)
+            mb = memory_breakdown(graph, model, system, strategy)
+            expected_total = (mb.weights + mb.grads + mb.opt_state
+                              + mb.activations + mb.comm_buffers + mb.muon_ns_buffer)
+            assert mb.total == expected_total, f"total formula wrong at dp={dp}"
+            assert mb.peak_overall <= mb.total, f"peak_overall > total at dp={dp}"

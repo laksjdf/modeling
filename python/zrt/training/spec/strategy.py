@@ -83,8 +83,19 @@ def resolve_muon_ns_steps(
 
 @dataclass
 class RecomputePolicy:
-    # per-LayerKind value -> set of op categories to recompute
-    # categories: "full" | "attn" | "attn_upscale" | "ffn_swiglu" | "ln"
+    # Per-LayerKind value → set of recompute categories.
+    # Canonical categories:
+    #   "full"        : recompute entire layer (only input + output saved)
+    #   "attn_core"   : selective recompute — only FA kernel + indexer +
+    #                   compressor pool (Megatron-LM 'selective' flavor)
+    #   "attn_block"  : attn_core scope + QKV / O linear projections
+    #                   (the heavier 'rerun attention block' flavor)
+    #   "ffn_swiglu"  : up/gate/down + swiGLU intermediates
+    #   "ln"          : LayerNorm / RMSNorm intermediates
+    #   "hc"          : DeepSeek-V4 mhc_pre / mhc_post / mhc_head
+    # Deprecated alias (kept for backward compatibility, resolved by the
+    # category-matching logic in flops._op_recompute_categories):
+    #   "attn"  → "attn_block"
     per_layer: dict[str, set[str]] = field(default_factory=dict)
 
 
@@ -127,6 +138,10 @@ class Strategy:
     ep_overlap: bool = False
     dualbatch: bool = False
     dp_overlap_in_bubble: bool = True
+    # Fraction of steady-state backward compute that DP grad-reduce can overlap
+    # (FSDP / Megatron grad bucket scheduling). 0.0 = legacy cooldown-only window;
+    # 0.5 = conservative default; 1.0 = idealized full overlap.
+    dp_steady_overlap_ratio: float = 0.5
 
     # optimizer
     optimizer: OptKind = OptKind.ADAM

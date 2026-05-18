@@ -38,6 +38,10 @@ class Op:
     meta: dict[str, Any] = field(default_factory=dict)
     layer_id: int = -1
     layer_kind: LayerKind = LayerKind.DENSE
+    # Component tag used by stage.py::_resolve_compute_dtype to dispatch the
+    # right compute dtype (attention / routed_expert / shared_expert /
+    # embedding / norm). None = fall back to model.act_dtype.
+    component: str | None = None
 
 
 @dataclass

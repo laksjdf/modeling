@@ -10,6 +10,7 @@ compute:
   int8_tops: 640
   int4_tops: 1280
   fp8_tops: 0       # 910B does not support FP8
+  fp4_tops: 0       # 910B has no native FP4; falls back to FP8 (then BF16) at runtime
 
   # Heterogeneous-core (DaVinci Cube/Vector split)
   # Cube: matmul unit peak ~280 TFLOPS bf16 (primary AI-Core throughput)

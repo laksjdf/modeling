@@ -1,0 +1,41 @@
+name: "NVIDIA B300"
+vendor: "nvidia"
+device_type: "gpu"
+
+# Source: NVIDIA Blackwell Ultra (GB300) datasheet, public figures.
+# Per-die dense (no 2:4 sparsity); B300 = ~1.5x B200 compute.
+# Values approximate; refine when authoritative datasheet is committed.
+compute:
+  fp16_tflops: 5000
+  bf16_tflops: 5000
+  fp32_tflops: 250
+  int8_tops:   10000
+  int4_tops:   20000
+  fp8_tops:    10000        # FP8 E4M3 / E5M2
+  fp4_tops:    20000        # NVFP4 / MXFP4 Tensor Cores
+
+  sram_kb_per_sm: 256
+  # B300 retains the cube/vector split implicit in Blackwell; until we
+  # tune anchors, fall back to homogeneous peak.
+
+memory:
+  capacity_gb: 288             # HBM3e per die
+  hbm_bandwidth_gbps: 8000     # ~8 TB/s
+  l2_cache_mb: 64
+  tiers:
+    - { name: "L2",  bandwidth_gbps: 16384, capacity_mb: 64 }
+    - { name: "HBM", bandwidth_gbps: 8000,  capacity_mb: 0  }
+
+interconnect:
+  intra_node:
+    type: "NVLink5"
+    bandwidth_gbps: 1800       # 1.8 TB/s aggregate
+    latency_us: 1
+    topology: "all_to_all"
+    num_devices: 8
+  inter_node:
+    type: "InfiniBand_XDR"
+    bandwidth_gbps: 800        # XDR-class IB / Spectrum-X (placeholder)
+    latency_us: 2
+    topology: "fat_tree"
+    num_devices: 0

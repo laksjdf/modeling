@@ -1457,6 +1457,63 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
         ws.column_dimensions["B"].width = 28
 
 
+def _get_fused_shapes_from_sem_io(node: OpNode, direction: str) -> str:
+    """Get fused shapes from sem_io annotation (includes CP split).
+    
+    Args:
+        node: OpNode to extract shapes from
+        direction: "input" or "output"
+        
+    Returns:
+        Comma-separated string of shapes
+    """
+    sem_io = node.annotations.get("sem_io", {})
+    
+    if direction == "input":
+        # Priority: activation, then all non-output roles
+        if "activation" in sem_io:
+            return str(sem_io["activation"].get("shape", ""))
+        shapes = [str(v.get("shape", "")) for k, v in sem_io.items() 
+                  if k not in ("output",)]
+        return ", ".join(shapes) if shapes else ", ".join(str(t.shape) for t in node.inputs)
+    else:
+        # Output direction
+        if "output" in sem_io:
+            return str(sem_io["output"].get("shape", ""))
+        shapes = [str(v.get("shape", "")) for k, v in sem_io.items() 
+                  if k == "output"]
+        return ", ".join(shapes) if shapes else ", ".join(str(t.shape) for t in node.outputs)
+
+
+def _get_fused_dtypes_from_sem_io(node: OpNode, direction: str) -> str:
+    """Get fused dtypes from sem_io annotation (includes CP split).
+    
+    Args:
+        node: OpNode to extract dtypes from
+        direction: "input" or "output"
+        
+    Returns:
+        Comma-separated string of dtypes
+    """
+    sem_io = node.annotations.get("sem_io", {})
+    sem_dtype = node.annotations.get("sem_dtype", "")
+    
+    if direction == "input":
+        if "activation" in sem_io:
+            dtype = sem_io["activation"].get("dtype", sem_dtype)
+            return str(dtype) if dtype else ""
+        dtypes = [str(v.get("dtype", "")) for k, v in sem_io.items() 
+                  if k not in ("output",)]
+        return ", ".join(dtypes) if dtypes else ", ".join(str(t.dtype) for t in node.inputs)
+    else:
+        if "output" in sem_io:
+            dtype = sem_io["output"].get("dtype", sem_dtype)
+            return str(dtype) if dtype else ""
+        dtypes = [str(v.get("dtype", "")) for k, v in sem_io.items() 
+                  if k == "output"]
+        return ", ".join(dtypes) if dtypes else ", ".join(str(t.dtype) for t in node.outputs)
+
+
 def _graph_to_fused_records(graph: OpGraph,
                             phase_filter: str | None = None) -> List[Dict[str, Any]]:
     """Build fused-record dicts from an OpGraph for the Fused Operators sheet.
@@ -1515,10 +1572,11 @@ def _graph_to_fused_records(graph: OpGraph,
             "input_dtypes": ", ".join(str(t.dtype) for t in node.inputs),
             "output_shapes": ", ".join(str(t.shape) for t in node.outputs),
             "output_dtypes": ", ".join(str(t.dtype) for t in node.outputs),
-            "fused_input_shapes": ", ".join(str(t.shape) for t in node.inputs),
-            "fused_input_dtypes": ", ".join(str(t.dtype) for t in node.inputs),
-            "fused_output_shapes": ", ".join(str(t.shape) for t in node.outputs),
-            "fused_output_dtypes": ", ".join(str(t.dtype) for t in node.outputs),
+            # Use sem_io shapes (includes CP split) if available
+            "fused_input_shapes": _get_fused_shapes_from_sem_io(node, "input"),
+            "fused_input_dtypes": _get_fused_dtypes_from_sem_io(node, "input"),
+            "fused_output_shapes": _get_fused_shapes_from_sem_io(node, "output"),
+            "fused_output_dtypes": _get_fused_dtypes_from_sem_io(node, "output"),
             "fused_input_sources": "",
             "fused_output_sources": "",
         })

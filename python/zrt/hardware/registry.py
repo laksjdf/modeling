@@ -106,10 +106,12 @@ def _parse_compute(c: dict[str, Any]) -> ComputeSpec:
         int8_tops=float(c.get("int8_tops", 0.0)),
         int4_tops=float(c.get("int4_tops", 0.0)),
         fp8_tops=float(c.get("fp8_tops", 0.0)),
+        fp4_tops=float(c.get("fp4_tops", 0.0)),
         cube_bf16_tflops=float(cube_raw) if cube_raw is not None else None,
         vector_bf16_tflops=float(vector_raw) if vector_raw is not None else None,
         overlap_ratio={k: float(v) for k, v in overlap_raw.items()},
         sram_kb_per_sm=float(c.get("sram_kb_per_sm", 0.0)),
+        ep_overlap_waves=int(c.get("ep_overlap_waves", 0)),
     )
 
 

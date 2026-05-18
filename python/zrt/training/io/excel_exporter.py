@@ -147,6 +147,7 @@ def export_estimate_excel(
         ["", "", ""],
         # Efficiency
         ["MFU", f"{report.mfu:.4%}" if report.mfu > 0 else "0.00%", ""],
+        ["MFU (native)", f"{report.mfu_native:.4%}" if report.mfu_native > 0 else "0.00%", ""],
         ["HFU", f"{report.hfu:.4%}" if report.hfu > 0 else "0.00%", ""],
         ["", "", ""],
         # FLOPs

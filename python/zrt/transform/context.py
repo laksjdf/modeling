@@ -96,14 +96,55 @@ class TrainingConfig:
     # the number of traced transformer layers.  None → greedy bin-packing.
     pp_layer_assignment: list[int] | None = None
 
-    # Context parallel strategy
-    cp_kind: str = "ulysses"  # "ulysses", "ring", "hybrid", "none"
+    # Context parallel strategy (auto-set based on model type)
+    # - cp > 1: DeepSeek-V4 → "compressed", others → "ulysses"
+    # - cp <= 1: "none" (no CP)
+    # User can override by setting cp_kind explicitly
+    cp_kind: str = "none"  # Will be auto-set to "ulysses" or "compressed" when cp > 1
 
     # Overlap DP allreduce with PP bubble window
     dp_overlap_in_bubble: bool = True
 
     # Memory offloading (optional, disabled by default)
     offload: OffloadConfig | None = None
+
+    # Model geometry for CP shape split (used by ContextParallelPass)
+    seq_len: int = 2048  # Sequence length (required for seq/cp split)
+    hidden: int = 7168   # Hidden dimension (required for CP communication sizing)
+
+    def resolve_cp_kind(self, model_id: str = "", cp: int = 1) -> str:
+        """Resolve cp_kind based on model type and CP configuration.
+        
+        Rules:
+        - cp <= 1 → "none" (no context parallel)
+        - cp > 1 and user specified cp_kind != "none" → keep user choice
+        - cp > 1 and model is DeepSeek-V4 → "compressed" (two-stage CP)
+        - cp > 1 and other models → "ulysses" (A2A-based CP)
+        
+        Args:
+            model_id: HF model ID (e.g., "deepseek-ai/DeepSeek-V3")
+            cp: Context parallel factor
+            
+        Returns:
+            Resolved cp_kind string
+        """
+        # If user explicitly set cp_kind (not "none"), respect it
+        if self.cp_kind != "none":
+            return self.cp_kind
+        
+        # cp <= 1: no CP needed
+        if cp <= 1:
+            return "none"
+        
+        # cp > 1: auto-select based on model type
+        model_lower = model_id.lower()
+        
+        # DeepSeek-V4 uses compressed (two-stage) CP
+        if "deepseek" in model_lower and ("v4" in model_lower or "v3.2" in model_lower):
+            return "compressed"
+        
+        # All other models use Ulysses (A2A-based) CP
+        return "ulysses"
 
     def effective_ns_steps(self, model_type: str | None = None) -> int:
         """Return effective NS steps, handling None fallback logic.

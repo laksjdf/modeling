@@ -10,6 +10,7 @@ compute:
   int8_tops: 1978
   int4_tops: 3958
   fp8_tops: 3958    # FP8 E4M3 / E5M2 (Transformer Engine)
+  fp4_tops: 0       # H100 has no native FP4; falls back to FP8 peak at runtime
 
   # Heterogeneous-core split:
   # - cube/matrix: dense Tensor Core BF16 peak (no sparsity)
@@ -20,6 +21,7 @@ compute:
   overlap_ratio:
     attn_core: 0.6
   sram_kb_per_sm: 228
+  ep_overlap_waves: 4   # K-wave EP A2A overlap (CUDA stream-based, DeepSeek-style)
 
 memory:
   capacity_gb: 80

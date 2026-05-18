@@ -13,11 +13,15 @@ from zrt.training.ir.training_graph import Graph
 from zrt.training.models.comm import total_comm_time, optimizer_comm_time
 from zrt.training.models.flops import recompute_overhead_flops
 from zrt.training.models.memory import MemBreakdown, memory_breakdown
-from zrt.training.models.optimizer import muon_optimizer_step_flops, adam_step_flops
+from zrt.training.models.optimizer import (
+    muon_optimizer_step_flops,
+    muon_step_flops_from_arch,
+    adam_step_flops,
+)
 from zrt.training.io.perf_tables import achieved_flops_efficiency
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import ModelSpec
-from zrt.training.spec.strategy import PPSched, Strategy, TPOverlap, resolve_muon_ns_steps
+from zrt.training.spec.strategy import PPSched, Strategy, resolve_muon_ns_steps
 from zrt.training.spec.system import SystemSpec
 
 
@@ -63,6 +67,7 @@ class StepResult:
     memory: MemBreakdown | None = None
     mfu: float = 0.0
     hfu: float = 0.0
+    mfu_native: float = 0.0   # MFU vs op-mix-weighted effective peak
 
     # ── Fwd/Bwd phase breakdown (seconds) ────────────────────────────────
     warmup_fwd: float = 0.0
@@ -96,6 +101,31 @@ class StepResult:
 
     # Total comm volume = exposed + hidden
     total_comm_volume: float = 0.0  # All comm in step
+
+
+def _dp_hide_window(
+    cooldown: float,
+    steady_bwd_total: float,
+    strategy: Strategy,
+) -> float:
+    """Time window in which DP grad-reduce can be hidden.
+
+    cooldown      — explicit pipeline drain phase (composer-specific).
+    steady_bwd_total — total steady-state backward compute on the critical path
+                       (for pp=1: bwd · M; for pp>1: bottleneck stage's bwd · M).
+
+    Behavior:
+      - If dp_overlap_in_bubble is False → return 0 (DP fully exposed).
+      - Else return cooldown + ratio · steady_bwd_total, with ratio drawn from
+        strategy.dp_steady_overlap_ratio (default 0.5).
+
+    The caller is responsible for clamping with dp_ar_time:
+        hide = min(_dp_hide_window(...), dp_ar_time)
+    """
+    if not strategy.dp_overlap_in_bubble:
+        return 0.0
+    ratio = max(0.0, min(1.0, strategy.dp_steady_overlap_ratio))
+    return cooldown + ratio * steady_bwd_total
 
 
 class PipelineComposer(ABC):
@@ -134,10 +164,10 @@ class OneF1BComposer(PipelineComposer):
             # No pipeline: just fwd + bwd for single stage
             st = stage_times[0] if stage_times else StageTime()
             step = st.fwd + st.bwd
-            dp_exposed = dp_ar_time
-            if strategy.dp_overlap_in_bubble and dp_ar_time > 0:
-                hidden = min(st.bwd * M, dp_ar_time)
-                dp_exposed = dp_ar_time - hidden
+            steady_bwd_total = st.bwd * M
+            window = _dp_hide_window(0.0, steady_bwd_total, strategy)
+            hidden = min(window, dp_ar_time) if dp_ar_time > 0 else 0.0
+            dp_exposed = dp_ar_time - hidden
 
             ideal_step = M * (st.fwd + st.bwd)
             bubble_frac = 0.0
@@ -174,10 +204,10 @@ class OneF1BComposer(PipelineComposer):
 
         # DP AR: hide in cooldown (backward drain phase) if enabled
         bubble = warmup + cooldown
-        dp_exposed = dp_ar_time
-        if strategy.dp_overlap_in_bubble and dp_ar_time > 0:
-            hidden = min(cooldown, dp_ar_time)
-            dp_exposed = dp_ar_time - hidden
+        steady_bwd_total = M * t_bwd_max
+        window = _dp_hide_window(cooldown, steady_bwd_total, strategy)
+        hidden = min(window, dp_ar_time) if dp_ar_time > 0 else 0.0
+        dp_exposed = dp_ar_time - hidden
 
         step = warmup + steady + cooldown + dp_exposed
         ideal_step = M * t_stage_max
@@ -238,10 +268,10 @@ class Interleaved1F1BComposer(PipelineComposer):
         cooldown = (pp - 1) * t_bwd_max / V
 
         bubble = warmup + cooldown
-        dp_exposed = dp_ar_time
-        if strategy.dp_overlap_in_bubble and dp_ar_time > 0:
-            hidden = min(cooldown, dp_ar_time)
-            dp_exposed = dp_ar_time - hidden
+        steady_bwd_total = M * t_bwd_max
+        window = _dp_hide_window(cooldown, steady_bwd_total, strategy)
+        hidden = min(window, dp_ar_time) if dp_ar_time > 0 else 0.0
+        dp_exposed = dp_ar_time - hidden
 
         step = warmup + steady + cooldown + dp_exposed
         bubble_frac = (warmup + cooldown) / step if step > 0 else 0.0
@@ -296,10 +326,10 @@ class DualPipeComposer(PipelineComposer):
         warmup = bubble / 2.0
         cooldown = bubble / 2.0
         steady = M * t_stage_max
-        dp_exposed = dp_ar_time
-        if strategy.dp_overlap_in_bubble and dp_ar_time > 0:
-            hidden = min(cooldown, dp_ar_time)
-            dp_exposed = dp_ar_time - hidden
+        steady_bwd_total = M * t_stage_max / 2
+        window = _dp_hide_window(cooldown, steady_bwd_total, strategy)
+        hidden = min(window, dp_ar_time) if dp_ar_time > 0 else 0.0
+        dp_exposed = dp_ar_time - hidden
 
         step = warmup + steady + cooldown + dp_exposed
         bubble_frac = bubble / step if step > 0 else 0.0
@@ -353,10 +383,10 @@ class DualPipeVComposer(PipelineComposer):
         warmup = bubble / 2.0
         cooldown = bubble / 2.0
         steady = M * t_stage_max
-        dp_exposed = dp_ar_time
-        if strategy.dp_overlap_in_bubble and dp_ar_time > 0:
-            hidden = min(cooldown, dp_ar_time)
-            dp_exposed = dp_ar_time - hidden
+        steady_bwd_total = M * t_stage_max / 2
+        window = _dp_hide_window(cooldown, steady_bwd_total, strategy)
+        hidden = min(window, dp_ar_time) if dp_ar_time > 0 else 0.0
+        dp_exposed = dp_ar_time - hidden
 
         step = warmup + steady + cooldown + dp_exposed
         bubble_frac = bubble / step if step > 0 else 0.0
@@ -390,7 +420,10 @@ class ZeroBubbleComposer(PipelineComposer):
     be delayed to fill pipeline bubbles, so the exposed bubble is reduced by
     the bottleneck stage's dW time:
 
-        step = M * t_stage + (pp - 1) * max(t_stage - t_w, 0)
+        step = M * t_stage + (pp - 1) * max(t_stage - t_w, ZB_BUBBLE_FLOOR)
+
+    where ZB_BUBBLE_FLOOR represents the residual per-transition P2P latency
+    that ZB-1P/ZB-V cannot eliminate.
     """
 
     def compose(
@@ -408,15 +441,22 @@ class ZeroBubbleComposer(PipelineComposer):
         t_stage = bottleneck.fwd + bottleneck.bwd
         t_w = bottleneck.bwd_dw
 
-        bubble = (pp - 1) * max(t_stage - t_w, 0.0)
+        # ZB-1P/ZB-V keep a residual per-transition bubble even when t_w ≈ t_stage.
+        # The empirical floor is roughly 2 microseconds (P2P latency) per pp-1
+        # transition. We use 1e-6 s here as the minimum unit; callers that want
+        # a hardware-derived floor can pass it in via stage_times comm_bwd already
+        # baked into t_stage. This avoids the "0 bubble" artifact in search.
+        ZB_BUBBLE_FLOOR_PER_TRANSITION = 2e-6  # 2 µs P2P latency per pp transition
+        bubble = max((pp - 1) * max(t_stage - t_w, 0.0),
+                     (pp - 1) * ZB_BUBBLE_FLOOR_PER_TRANSITION)
         warmup = bubble / 2.0
         steady = M * t_stage
         cooldown = bubble / 2.0
 
-        dp_exposed = dp_ar_time
-        if strategy.dp_overlap_in_bubble and dp_ar_time > 0:
-            hidden = min(cooldown, dp_ar_time)
-            dp_exposed = dp_ar_time - hidden
+        steady_bwd_total = M * (t_stage / 2)
+        window = _dp_hide_window(cooldown, steady_bwd_total, strategy)
+        hidden = min(window, dp_ar_time) if dp_ar_time > 0 else 0.0
+        dp_exposed = dp_ar_time - hidden
 
         step = warmup + steady + cooldown + dp_exposed
         bubble_frac = bubble / step if step > 0 else 0.0
@@ -486,8 +526,8 @@ def pipeline_step_time(
         stage_colls = [
             c for c in graph.collectives
             if any(
-                (c.inserted_after and c.inserted_after.startswith(f"L{lid}")) or
-                (c.inserted_before and c.inserted_before.startswith(f"L{lid}"))
+                (c.inserted_after and c.inserted_after.startswith(f"L{lid}.")) or
+                (c.inserted_before and c.inserted_before.startswith(f"L{lid}."))
                 for lid in layer_ids
             )
         ]
@@ -510,6 +550,8 @@ def pipeline_step_time(
                 bwd_dw=st.bwd_dw,
                 comm_fwd=st.comm_fwd + pp_p2p,
                 comm_bwd=st.comm_bwd + pp_p2p,
+                ep_hidden=st.ep_hidden,
+                tp_hidden=st.tp_hidden,
             )
             for st in stage_times
         ]
@@ -530,9 +572,12 @@ def pipeline_step_time(
         residual_bubble = max(original_bubble - step.steady, 0.0)
         bubble_saved = original_bubble - residual_bubble
         new_cooldown = residual_bubble / 2.0
-        # Recompute DP AR exposure against the shrunk cooldown window
-        if strategy.dp_overlap_in_bubble and dp_ar_time > 0:
-            new_dp_exposed = dp_ar_time - min(new_cooldown, dp_ar_time)
+        # Recompute DP exposure through the same helper used by composers,
+        # so steady-BWD overlap is still available when dualbatch zeros the cooldown.
+        steady_bwd_total_bot = max(0.0, step.steady_bwd_per_mb * M)
+        window = _dp_hide_window(new_cooldown, steady_bwd_total_bot, strategy)
+        if dp_ar_time > 0:
+            new_dp_exposed = dp_ar_time - min(window, dp_ar_time)
         else:
             new_dp_exposed = step.dp_exposed
         dp_delta = new_dp_exposed - step.dp_exposed
@@ -587,25 +632,41 @@ def pipeline_step_time(
     # PP P2P: pp_p2p already baked into bot_comm; scale to critical path via same ratio
     pp_p2p_exposed = (_pipeline_time * (2.0 * pp_p2p) / bot_total) if bot_total > 0 else 0.0
 
-    # TP/CP/EP: proportional split of remaining exposed comm after PP P2P.
-    # TP exposure factor matches stage_time() logic (CoC=0.1, MC2=0.0, none=1.0).
-    _tp_expose = (
-        0.0 if strategy.tp_overlap == TPOverlap.MC2
-        else (0.1 if strategy.tp_overlap == TPOverlap.COC else 1.0)
-    )
+    # TP exposed / hidden: use StageTime.tp_hidden (GEMM-bound, set by
+    # compose/stage.py). Scale to critical path the same way as ep_hidden.
     raw_tp = sum(comm_times.get(c.name, 0.0) for c in graph.collectives if c.group == "TP")
     raw_cp = sum(comm_times.get(c.name, 0.0) for c in graph.collectives if c.group == "CP")
     raw_ep = sum(comm_times.get(c.name, 0.0) for c in graph.collectives if c.group == "EP")
-    eff_tp = raw_tp * _tp_expose
-    eff_total = eff_tp + raw_cp + raw_ep
 
-    remain = max(0.0, exposed_comm_excl_dp - pp_p2p_exposed)
+    # tp_hidden scaled to critical path (matches the ep_hidden treatment below)
+    if bot_total > 0 and s_bot.tp_hidden > 0:
+        step.tp_hidden = _pipeline_time * s_bot.tp_hidden / bot_total
+    else:
+        step.tp_hidden = 0.0
+
+    # tp_exposed = raw TP volume (per stage, scaled to critical path) − tp_hidden
+    raw_tp_critical = (_pipeline_time * (raw_tp / max(pp, 1)) / bot_total) \
+                      if bot_total > 0 else 0.0
+    # Conservation fix: cap tp_exposed_volume so the per-group exposed
+    # times sum to exposed_comm_excl_dp exactly. Without this cap,
+    # raw_tp_critical (computed from un-overlapped raw_tp / pp) can exceed
+    # the exposed-comm budget that was already reduced by stage-level
+    # overlap, breaking the documented invariant
+    #     exposed_comm = tp + cp + ep + pp + dp_exposed
+    tp_exposed_volume = max(0.0, raw_tp_critical - step.tp_hidden)
+    tp_exposed_volume = min(tp_exposed_volume,
+                            max(0.0, exposed_comm_excl_dp - pp_p2p_exposed))
+
+    # CP / EP exposed: proportional split of the remaining exposed-comm budget
+    # after PP P2P and TP exposed have been subtracted.
+    eff_total = raw_cp + raw_ep  # TP no longer participates in proportional split
+    remain = max(0.0, exposed_comm_excl_dp - pp_p2p_exposed - tp_exposed_volume)
     if eff_total > 0 and remain > 0:
-        step.tp_exposed = remain * eff_tp / eff_total
+        step.tp_exposed = tp_exposed_volume
         step.cp_exposed = remain * raw_cp / eff_total
         step.ep_exposed = remain * raw_ep / eff_total
     else:
-        step.tp_exposed = 0.0
+        step.tp_exposed = tp_exposed_volume
         step.cp_exposed = 0.0
         step.ep_exposed = 0.0
     step.pp_exposed = pp_p2p_exposed
@@ -614,15 +675,6 @@ def pipeline_step_time(
     # ── Hidden comm ───────────────────────────────────────────────────────
     # DP AR hidden in pipeline bubble — independent, exact.
     step.dp_hidden = max(0.0, dp_ar_time - step.dp_exposed)
-
-    # TP hidden by CoC/MC2 — from exposure factor and exposed TP.
-    if _tp_expose > 0 and step.tp_exposed > 0:
-        step.tp_hidden = step.tp_exposed * (1.0 - _tp_expose) / _tp_expose
-    elif _tp_expose == 0 and raw_tp > 0 and bot_total > 0:
-        # MC2: all TP hidden; scale raw TP per stage to critical path.
-        step.tp_hidden = _pipeline_time * (raw_tp / max(pp, 1)) / bot_total
-    else:
-        step.tp_hidden = 0.0
 
     # EP hidden by wave-overlap — from StageTime.ep_hidden, scaled to critical path.
     if bot_total > 0 and s_bot.ep_hidden > 0:
@@ -647,6 +699,7 @@ def pipeline_step_time(
 
     # HFU
     step.hfu = compute_hfu(model, strategy, system, step.step_time, graph)
+    step.mfu_native = compute_mfu_native(model, strategy, system, step.step_time, graph)
 
     # Add optimizer time to step_time (per §5.5.2 of muon_optimizer_design.md)
     # This must happen after MFU/HFU calculation so MFU excludes optimizer overhead.
@@ -705,8 +758,14 @@ def _compute_optimizer_time(model: ModelSpec, system: SystemSpec, strategy: Stra
         n_moe = sum(1 for lk in model.layers if lk == LayerKind.MOE)
         if n_moe > 0 and model.moe_ffn > 0:
             expert_p_all = n_moe * 3 * model.hidden * model.moe_ffn * model.num_experts
-            # Scale expert params by the same PP fraction already applied to P
-            expert_p_stage = expert_p_all // strategy.pp if strategy.pp > 1 else expert_p_all
+            # Match the TP+PP sharding already applied to P, otherwise the
+            # subtraction below clamps non_expert_p to 0 and we lose all
+            # non-routed params from the Muon NS budget.
+            expert_p_stage = expert_p_all
+            if strategy.tp > 1:
+                expert_p_stage //= strategy.tp
+            if strategy.pp > 1:
+                expert_p_stage //= strategy.pp
             non_expert_p = max(0, P - expert_p_stage)
             P = non_expert_p + expert_p_stage // strategy.ep
     # ZeRO-1/2/3 all shard optimizer states across DP: each GPU updates P/dp params.
@@ -725,7 +784,12 @@ def _compute_optimizer_time(model: ModelSpec, system: SystemSpec, strategy: Stra
             if strategy.muon_config and strategy.muon_config.muon_param_fraction is not None
             else 0.85
         )
-        flops = muon_optimizer_step_flops(P, K, model.hidden, f_muon)
+        # Architecture-driven NS FLOPs: walk the actual weight-matrix
+        # inventory. The legacy P/hidden² path clamps num_matrices to 1
+        # under ZeRO-3 + EP and yields a constant ~8 ms across the grid.
+        muon_flops = muon_step_flops_from_arch(model, strategy, K, f_muon)
+        adam_flops = adam_step_flops(int(P * (1 - f_muon)))
+        flops = muon_flops + adam_flops
         eff = achieved_flops_efficiency(gpu.name, Dtype.BF16, flops)
         return flops / (peak_flops * eff) if eff > 0 else 0.0
     else:
@@ -809,3 +873,58 @@ def compute_hfu(
     pp_flops = (actual_flops + rc_overhead) / strategy.pp
 
     return util_from_flops(pp_flops, peak, step_time)
+
+
+def compute_mfu_native(
+    model: ModelSpec, strategy: Strategy,
+    system: SystemSpec, step_time: float,
+    graph: Graph,
+) -> float:
+    """MFU with denominator = effective hardware peak under mixed precision.
+
+    The effective peak is the harmonic-mean of per-dtype peaks weighted
+    by per-dtype FLOPs share, derived from each op's component tag:
+
+      effective_peak = total_flops / Σ (flops_by_dtype[d] / peak_for[d])
+
+    Reduces to ``compute_mfu`` (BF16 peak) when all ops are BF16-typed.
+    Returns 0 when step_time <= 0 or total flops <= 0.
+    """
+    from zrt.training.io.perf_tables import peak_tflops_for
+    from zrt.training.models.flops import op_cost, total_training_flops
+    from zrt.training.compose.stage import _resolve_compute_dtype
+
+    if step_time <= 0:
+        return 0.0
+
+    actual_flops = total_training_flops(graph, model, strategy, system)
+    if actual_flops <= 0:
+        return 0.0
+
+    # Aggregate per-dtype FLOPs by walking the graph
+    flops_by_dtype: dict[Dtype, float] = {}
+    for op in graph.ops:
+        cost = op_cost(op, model, system)
+        op_flops = (cost.fwd_cube_flops + cost.fwd_vector_flops
+                    + cost.dx_cube_flops + cost.dx_vector_flops
+                    + cost.dw_cube_flops + cost.dw_vector_flops)
+        if op_flops <= 0:
+            continue
+        d = _resolve_compute_dtype(op, model)
+        flops_by_dtype[d] = flops_by_dtype.get(d, 0.0) + op_flops
+
+    gpu = system.gpu
+    weighted_time = 0.0
+    total = sum(flops_by_dtype.values())
+    if total <= 0:
+        return 0.0
+    for d, f in flops_by_dtype.items():
+        peak = peak_tflops_for(gpu, d)
+        if peak <= 0:
+            continue
+        weighted_time += f / peak
+    if weighted_time <= 0:
+        return 0.0
+    effective_peak = total / weighted_time
+    pp_flops = actual_flops / strategy.pp
+    return util_from_flops(pp_flops, effective_peak, step_time)

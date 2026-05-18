@@ -1,4 +1,4 @@
-# DeepSeek-V4-Pro 3D parallel training — H100 SXM
+# Identical to ..._tp4.yaml except tp_overlap: none (baseline for CoC comparison)
 model: deepseek_v4_pro
 
 system:
@@ -8,13 +8,13 @@ system:
   host_mem_gb: 2048
 
 strategy:
-  tp: 1
-  cp: 8
+  tp: 4
+  cp: 1
   pp: 2
   ep: 384
-  dp: 512
+  dp: 1024
   micro_batch: 1
-  global_batch: 512
+  global_batch: 1024
   pp_schedule: dualpipev
   zero_stage: 3
   recompute:

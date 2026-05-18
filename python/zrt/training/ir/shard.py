@@ -684,12 +684,16 @@ def _apply_ep_sharding(
     for i in range(start, end):
         op = graph.ops[i]
 
-        # Only routed expert FFN is affected by EP sharding
+        # Routed expert FFN: under uniform routing the per-rank work is
+        # invariant to EP. Each rank has experts_per_rank = num_experts/ep
+        # local experts. Tokens flow into them from `ep` ranks (the EP group),
+        # each contributing seq*top_k/num_experts tokens per expert. The two
+        # factors cancel: per-rank work = seq * top_k * moe_ffn * hidden * 6,
+        # which is what fwd_multiplier=3*top_k already encodes. So no scaling
+        # here. Load imbalance (expert_imbalance) is applied later in
+        # compose/stage.py via _ep_parallel_fraction.
         if op.kind == "matmul" and "routed_expert" in op.name:
-            # Scale fwd_multiplier by fraction of experts local to this rank
-            if "fwd_multiplier" in op.meta:
-                ep_frac = experts_per_rank / num_experts
-                op.meta["fwd_multiplier"] = op.meta["fwd_multiplier"] * ep_frac
+            pass  # intentionally left unscaled — see comment above
 
         # Router output: num_experts -> experts_per_rank
         if op.kind == "matmul" and "router" in op.name:
