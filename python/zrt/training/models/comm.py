@@ -141,9 +141,12 @@ def optimizer_comm_time(
       - AllGather before optimizer step to gather full Muon parameters
       - ReduceScatter after optimizer step to distribute updated gradients
 
-    Communication volume per step:
-      - AG: (DP-1)/DP × P_muon × 4B
-      - RS: (DP-1)/DP × P_muon × 4B (same volume)
+    Sharding groups (matches Megatron-Core distributed optimizer):
+      - Non-routed params (dense + shared experts + embed/lm_head):
+        sharded across the full DP group of size ``strategy.dp``.
+      - Routed-expert params: sharded across the **expert-DP** group of size
+        ``max(1, dp // ep)``. When ``dp == ep`` the expert-DP group has a
+        single rank and routed AG/RS is free.
 
     Args:
         model: ModelSpec with hidden dimension and param count
@@ -162,39 +165,47 @@ def optimizer_comm_time(
         if muon_config and muon_config.muon_param_fraction is not None
         else 0.85
     )
-
-    P = _params_on_rank_for_dp(model, strategy)
-    P_muon = int(P * f_muon)
+    rotation = muon_config.rotation if muon_config else True
     param_bytes = 4  # FP32 master copy
 
-    # Total bytes to gather = P_muon × 4B
-    # Ring algorithm factor applied in collective_time(), not pre-scaled here
-    comm_bytes = int(P_muon * param_bytes)
+    P_total = _params_on_rank_for_dp(model, strategy)
 
-    group_size = strategy.dp
-    link = tier_for_group("DP", group_size, system)
-
-    ag_c = Collective(
-        name="muon_ag", kind="AG", group="DP", bytes_=comm_bytes,
-        inserted_after="backward_end",
-    )
-    ag_time = collective_time(ag_c, group_size, link)
-
-    # ReduceScatter only if rotation=True (Moonshot optimization)
-    # When rotation=False, each rank independently computes and slices, no RS needed
-    rotation = muon_config.rotation if muon_config else True
-    if rotation:
-        rs_c = Collective(
-            name="muon_rs", kind="RS", group="DP", bytes_=comm_bytes,
-            inserted_after="optimizer_step",
-        )
-        rs_time = collective_time(rs_c, group_size, link)
+    if strategy.ep > 1 and model.num_experts > 0:
+        from zrt.training.models.memory import _routed_expert_params_on_rank
+        P_routed = _routed_expert_params_on_rank(model, strategy)
     else:
-        rs_time = 0.0
+        P_routed = 0
+    P_non_routed = max(0, P_total - P_routed)
+
+    P_muon_non_routed = int(P_non_routed * f_muon)
+    P_muon_routed = int(P_routed * f_muon)
+
+    def _ag_rs(bytes_, group_size: int) -> tuple[float, float]:
+        if group_size <= 1 or bytes_ <= 0:
+            return 0.0, 0.0
+        link = tier_for_group("DP", group_size, system)
+        ag = collective_time(
+            Collective(name="muon_ag", kind="AG", group="DP",
+                       bytes_=bytes_, inserted_after="backward_end"),
+            group_size, link,
+        )
+        if rotation:
+            rs = collective_time(
+                Collective(name="muon_rs", kind="RS", group="DP",
+                           bytes_=bytes_, inserted_after="optimizer_step"),
+                group_size, link,
+            )
+        else:
+            rs = 0.0
+        return ag, rs
+
+    ag_dense, rs_dense = _ag_rs(P_muon_non_routed * param_bytes, strategy.dp)
+    expert_dp = max(1, strategy.dp // strategy.ep) if strategy.ep > 1 else strategy.dp
+    ag_routed, rs_routed = _ag_rs(P_muon_routed * param_bytes, expert_dp)
 
     return {
-        "muon_ag": ag_time,
-        "muon_rs": rs_time,
+        "muon_ag": ag_dense + ag_routed,
+        "muon_rs": rs_dense + rs_routed,
     }
 
 

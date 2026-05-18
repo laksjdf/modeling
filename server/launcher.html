@@ -1,0 +1,2053 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ZRT — Launch</title>
+<style>
+  :root {
+    --bg: #0d0d0d;
+    --surface: #141414;
+    --surface-hi: #1c1c1c;
+    --border: #262626;
+    --border-hi: #363636;
+    --text: #ddd8cc;
+    --text-dim: #a09c96;
+    --text-muted: #5e5c59;
+    --amber: #d48c0c;
+    --amber-bright: #f0a828;
+    --amber-dim: #7a5008;
+    --teal: #00b890;
+    --teal-dim: #006650;
+    --coral: #e04848;
+    --green: #40c870;
+    --r: 3px;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    background-image: radial-gradient(var(--border) 1px, transparent 1px);
+    background-size: 22px 22px;
+    color: var(--text);
+    font-family: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', 'SF Mono', ui-monospace, monospace;
+    font-size: 13px;
+    line-height: 1.6;
+    min-height: 100vh;
+  }
+
+  /* ── HEADER ── */
+  .hdr {
+    position: sticky; top: 0; z-index: 100;
+    background: rgba(13,13,13,0.95);
+    backdrop-filter: blur(14px);
+    border-bottom: 1px solid var(--border);
+    padding: 10px 24px;
+    display: flex; align-items: center; gap: 14px;
+    height: 48px;
+  }
+  .hdr-logo {
+    width: 26px; height: 26px;
+    border: 1.5px solid var(--amber); border-radius: 3px;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--amber); font-size: 10px; font-weight: 700; flex-shrink: 0;
+  }
+  .hdr-title { font-size: 12px; letter-spacing: 0.3px; }
+  .hdr-title em { color: var(--amber); font-style: normal; }
+  .hdr-right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+  .api-url {
+    background: var(--surface); color: var(--text-dim);
+    border: 1px solid var(--border); padding: 3px 8px;
+    border-radius: var(--r); font: inherit; font-size: 11px; width: 200px;
+    transition: border-color 0.12s, color 0.12s;
+  }
+  .api-url:focus { outline: none; border-color: var(--amber-dim); color: var(--text); }
+  .api-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-muted); transition: background 0.2s; }
+  .api-dot.ok  { background: var(--green);  box-shadow: 0 0 6px var(--green); }
+  .api-dot.err { background: var(--coral); }
+  .api-lbl { font-size: 10px; color: var(--text-muted); min-width: 56px; }
+
+  /* ── TABS ── */
+  .tabs {
+    position: sticky; top: 48px; z-index: 99;
+    background: rgba(13,13,13,0.92); backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border);
+    padding: 0 24px; display: flex; align-items: flex-end; height: 40px;
+  }
+  .tab {
+    padding: 0 18px; height: 40px; cursor: pointer; font: inherit; font-size: 12px;
+    color: var(--text-muted); background: transparent; border: none;
+    border-bottom: 2px solid transparent; letter-spacing: 0.2px;
+    display: flex; align-items: center; gap: 7px;
+    transition: color 0.12s, border-color 0.12s;
+  }
+  .tab:hover { color: var(--text-dim); }
+  .tab.on.est { color: var(--amber); border-bottom-color: var(--amber); }
+  .tab.on.srch { color: var(--teal); border-bottom-color: var(--teal); }
+  .tab-count {
+    font-size: 10px; padding: 1px 5px; border-radius: 2px;
+    background: var(--surface); border: 1px solid var(--border); color: var(--text-muted);
+    transition: background 0.15s, color 0.15s;
+  }
+  .tab.on.est  .tab-count { background: var(--amber-dim); border-color: var(--amber-dim); color: var(--amber-bright); }
+  .tab.on.srch .tab-count { background: var(--teal-dim);  border-color: var(--teal-dim);  color: var(--teal); }
+  .tab-gap { flex: 1; }
+  .hist-btn {
+    font: inherit; font-size: 10px; color: var(--text-muted);
+    background: transparent; border: none; cursor: pointer;
+    padding: 0 4px; height: 40px; letter-spacing: 0.4px; text-transform: uppercase;
+    transition: color 0.12s; display: flex; align-items: center; gap: 6px;
+  }
+  .hist-btn:hover { color: var(--text-dim); }
+  .hist-pill {
+    background: var(--surface); color: var(--text-muted);
+    border: 1px solid var(--border);
+    border-radius: 2px; font-size: 10px; padding: 1px 5px; font-weight: 600;
+  }
+
+  /* ── TWO-COLUMN LAYOUT ── */
+  .main-layout {
+    display: flex; gap: 18px; padding: 18px 24px;
+    align-items: flex-start;
+  }
+  .left-col {
+    width: 380px; flex-shrink: 0;
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  .right-col {
+    flex: 1; min-width: 0;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+
+  /* ── INPUT PANEL ── */
+  .panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r); overflow: hidden; }
+  .panel.est-accent { border-top: 2px solid var(--amber); }
+  .panel.srch-accent { border-top: 2px solid var(--teal); }
+  .panel-hdr {
+    padding: 8px 14px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 10px;
+    font-size: 10px; letter-spacing: 0.8px; text-transform: uppercase; color: var(--text-dim);
+  }
+  .panel-body { padding: 14px; }
+
+  .src-toggle { display: flex; gap: 1px; background: var(--border); border-radius: 2px; overflow: hidden; margin-left: auto; }
+  .src-btn {
+    font: inherit; font-size: 10px; padding: 3px 10px;
+    background: var(--surface); color: var(--text-dim); border: none; cursor: pointer;
+    letter-spacing: 0.2px; transition: background 0.1s, color 0.1s;
+  }
+  .src-btn.on { background: var(--surface-hi); color: var(--amber); }
+
+  .yaml-editor {
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); padding: 10px 12px;
+    border-radius: var(--r); font: inherit; font-size: 11px;
+    width: 100%; min-height: 190px; resize: vertical; line-height: 1.7; tab-size: 2;
+    transition: border-color 0.12s;
+  }
+  .yaml-editor:focus { outline: none; border-color: var(--amber-dim); }
+
+  .presets { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 9px; align-items: center; }
+  .preset-lbl { font-size: 10px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--text-muted); }
+  .preset-pill {
+    font: inherit; font-size: 10px; letter-spacing: 0.1px;
+    background: var(--bg); color: var(--text-dim);
+    border: 1px solid var(--border); padding: 2px 8px; border-radius: 2px;
+    cursor: pointer; transition: border-color 0.1s, color 0.1s;
+  }
+  .preset-pill:hover { border-color: var(--amber-dim); color: var(--text); }
+
+  .path-input {
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); padding: 6px 10px;
+    border-radius: var(--r); font: inherit; font-size: 11px; width: 100%;
+    transition: border-color 0.12s;
+  }
+  .path-input:focus { outline: none; border-color: var(--amber-dim); }
+
+  .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; }
+  .form-group { display: flex; flex-direction: column; gap: 4px; }
+  .form-label { font-size: 10px; letter-spacing: 0.7px; text-transform: uppercase; color: var(--text-dim); }
+  .form-input, .form-select {
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); padding: 5px 8px;
+    border-radius: var(--r); font: inherit; font-size: 11px;
+    transition: border-color 0.12s;
+  }
+  .form-input:focus, .form-select:focus { outline: none; border-color: var(--amber-dim); }
+  .form-select option { background: #141414; }
+  .full-col { grid-column: 1/-1; }
+
+  .run-row { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
+  .run-btn {
+    font: inherit; font-size: 11px; letter-spacing: 0.3px;
+    padding: 6px 18px; border-radius: var(--r); cursor: pointer;
+    transition: background 0.12s, color 0.12s;
+    border: 1px solid;
+  }
+  .run-btn.est-btn {
+    background: var(--amber-dim); color: var(--amber-bright); border-color: var(--amber);
+  }
+  .run-btn.est-btn:hover { background: var(--amber); color: #0d0d0d; }
+  .run-btn.srch-btn {
+    background: var(--teal-dim); color: var(--teal); border-color: var(--teal-dim);
+  }
+  .run-btn.srch-btn:hover { background: var(--teal); color: #0d0d0d; }
+  .run-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+  .run-hint { font-size: 10px; color: var(--text-muted); }
+
+  /* ── INFO PANELS (left col) ── */
+  .info-panel {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--r); overflow: hidden;
+  }
+  .info-panel-hdr {
+    padding: 8px 14px; display: flex; align-items: center; justify-content: space-between;
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.8px; color: var(--text-dim);
+    cursor: pointer; user-select: none;
+    transition: background 0.1s;
+  }
+  .info-panel-hdr:hover { background: var(--surface-hi); }
+  .info-panel-chevron { font-size: 11px; transition: transform 0.2s; }
+  .info-panel.collapsed .info-panel-chevron { transform: rotate(-90deg); }
+  .info-panel-body {
+    max-height: 3000px; overflow: hidden;
+    transition: max-height 0.3s cubic-bezier(.4,0,.2,1);
+    border-top: 1px solid var(--border);
+  }
+  .info-panel.collapsed .info-panel-body { max-height: 0; border-top: none; }
+
+  /* hardware rows */
+  .hw-row {
+    padding: 8px 14px; border-bottom: 1px solid var(--border);
+    cursor: pointer; transition: background 0.08s;
+  }
+  .hw-row:last-child { border-bottom: none; }
+  .hw-row:hover { background: var(--surface-hi); }
+  .hw-name { font-size: 12px; color: var(--text); margin-bottom: 2px; }
+  .hw-specs { font-size: 10px; color: var(--text-muted); display: flex; gap: 10px; flex-wrap: wrap; }
+  .hw-spec-chip {
+    display: inline-flex; align-items: center; gap: 3px;
+    color: var(--text-dim);
+  }
+  .hw-spec-chip span { color: var(--amber-bright); font-size: 11px; font-weight: 600; }
+
+  /* model chips */
+  .model-chips { padding: 10px 14px; display: flex; flex-wrap: wrap; gap: 6px; }
+  .model-chip {
+    font: inherit; font-size: 10px;
+    background: var(--bg); color: var(--text-dim);
+    border: 1px solid var(--border); padding: 2px 9px; border-radius: 2px;
+    cursor: default;
+  }
+
+  /* ── RESULT SECTION HEADER ── */
+  .right-hdr {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.8px; color: var(--text-muted);
+    padding: 2px 0;
+  }
+  .right-hdr-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+  .right-hdr-count {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 2px; font-size: 10px; padding: 0 5px; color: var(--text-dim);
+  }
+  .right-hdr-clear {
+    margin-left: auto; font: inherit; font-size: 10px; color: var(--text-muted);
+    background: none; border: none; cursor: pointer; padding: 1px 4px;
+    transition: color 0.1s;
+  }
+  .right-hdr-clear:hover { color: var(--coral); }
+
+  /* ── RESULT CARD ── */
+  .result-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--r); overflow: hidden;
+    animation: slide-in 0.18s ease;
+  }
+  @keyframes slide-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+  .job-bar {
+    display: flex; align-items: center; gap: 9px;
+    padding: 8px 14px; border-bottom: 1px solid var(--border); font-size: 12px;
+  }
+  .sdot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .sdot.pending { background: var(--text-muted); }
+  .sdot.running { background: var(--amber); animation: sdot-pulse 1.2s ease-in-out infinite; }
+  .sdot.done    { background: var(--green); }
+  .sdot.error   { background: var(--coral); }
+  @keyframes sdot-pulse { 0%,100%{box-shadow:0 0 0 0 rgba(212,140,12,.4)} 50%{box-shadow:0 0 0 5px rgba(212,140,12,0)} }
+
+  .job-type { font-size: 11px; font-weight: 600; letter-spacing: 0.3px; }
+  .job-id   { font-size: 10px; color: var(--text-muted); font-weight: normal; }
+  .job-elapsed { font-size: 11px; color: var(--text-muted); }
+  .card-del {
+    margin-left: auto; font: inherit; font-size: 14px; color: var(--text-muted);
+    background: none; border: none; cursor: pointer; padding: 1px 5px;
+    border-radius: 2px; transition: color 0.1s, background 0.1s; line-height: 1;
+  }
+  .card-del:hover { color: var(--coral); background: rgba(224,72,72,.1); }
+
+  /* metrics strip */
+  .mstrip { display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr)); gap: 1px; background: var(--border); }
+  .mc { background: var(--surface); padding: 10px 14px; position: relative; }
+  .mc::before { content: ''; position: absolute; top: 0; left: 0; width: 2px; height: 100%; background: var(--amber-dim); }
+  .mc-l { font-size: 10px; text-transform: uppercase; letter-spacing: 0.8px; color: var(--text-dim); margin-bottom: 3px; }
+  .mc-v { font-size: 20px; font-weight: 700; color: var(--amber-bright); line-height: 1; }
+  .mc-u { font-size: 10px; color: var(--text-dim); }
+
+  /* breakdown section */
+  .section { padding: 12px 14px; border-top: 1px solid var(--border); }
+  .section-title { font-size: 10px; text-transform: uppercase; letter-spacing: 0.8px; color: var(--text-dim); margin-bottom: 9px; }
+
+  .bk-row { display: grid; grid-template-columns: 160px 1fr 76px; align-items: center; gap: 8px; margin: 3px 0; }
+  .bk-lbl { font-size: 11px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bk-wrap { background: var(--bg); height: 7px; border-radius: 1px; overflow: hidden; }
+  .bk-bar { height: 100%; border-radius: 1px; transition: width 0.4s cubic-bezier(.4,0,.2,1); }
+  .bk-val { font-size: 11px; color: var(--amber); text-align: right; }
+
+  /* phase table */
+  .phase-tbl { width: 100%; border-collapse: collapse; font-size: 11px; }
+  .phase-tbl th { color: var(--text-muted); font-weight: normal; text-align: right; padding: 4px 8px; border-bottom: 1px solid var(--border); }
+  .phase-tbl th:first-child { text-align: left; }
+  .phase-tbl td { padding: 4px 8px; text-align: right; color: var(--text); }
+  .phase-tbl td:first-child { text-align: left; color: var(--text-dim); }
+  .phase-tbl tr.total td { color: var(--amber); border-top: 1px solid var(--border); }
+
+  /* memory */
+  .mem-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(76px, 1fr)); gap: 8px; }
+  .mem-cell { text-align: center; }
+  .mem-l { font-size: 10px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--text-muted); margin-bottom: 3px; }
+  .mem-v { font-size: 15px; font-weight: 600; color: var(--text); }
+  .mem-v.hi { color: var(--amber-bright); font-size: 17px; }
+  .mem-u { font-size: 10px; color: var(--text-muted); }
+
+  /* config grid */
+  .cfg-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 0;
+    border: 1px solid var(--border); border-radius: 2px; overflow: hidden;
+  }
+  .cfg-row {
+    display: flex; align-items: baseline; gap: 8px;
+    padding: 5px 12px; border-bottom: 1px solid var(--border);
+    border-right: 1px solid var(--border);
+  }
+  .cfg-row:nth-child(even) { border-right: none; }
+  .cfg-row:nth-last-child(-n+2) { border-bottom: none; }
+  .cfg-row.full { grid-column: 1 / -1; border-right: none; }
+  .cfg-k { font-size: 10px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--text-muted); flex-shrink: 0; min-width: 76px; }
+  .cfg-v { font-size: 12px; color: var(--text); }
+
+  /* action row */
+  .action-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 14px; border-top: 1px solid var(--border);
+  }
+  .action-btn {
+    font: inherit; font-size: 12px; letter-spacing: 0.2px;
+    background: rgba(212,140,12,.08); color: var(--amber-bright);
+    border: 1px solid var(--amber-dim); padding: 5px 14px;
+    border-radius: var(--r); cursor: pointer; text-decoration: none;
+    display: inline-block; transition: background 0.12s;
+  }
+  .action-btn:hover { background: var(--amber-dim); }
+  .action-meta { font-size: 11px; color: var(--text-muted); }
+  .action-msg { font-size: 11px; color: var(--text-muted); min-width: 120px; }
+  .action-msg.ok { color: var(--green); }
+  .action-msg.err { color: var(--coral); }
+
+  .err-body { padding: 12px 14px; color: var(--coral); font-size: 12px; word-break: break-all; }
+  .waiting { padding: 12px 14px; color: var(--text-muted); font-size: 11px; display: flex; align-items: center; gap: 8px; }
+  .waiting::before { content: ''; width: 10px; height: 10px; border: 1.5px solid var(--text-muted); border-top-color: var(--amber); border-radius: 50%; animation: spin 0.8s linear infinite; flex-shrink: 0; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* search result table */
+  .pareto-tbl { width: 100%; border-collapse: collapse; font-size: 11px; }
+  .pareto-tbl th { color: var(--text-muted); font-weight: normal; text-align: right; padding: 4px 8px; border-bottom: 1px solid var(--border); }
+  .pareto-tbl th:first-child, .pareto-tbl th:nth-child(2) { text-align: left; }
+  .pareto-tbl td { padding: 4px 8px; text-align: right; color: var(--text); border-bottom: 1px solid #1c1c1c; }
+  .pareto-tbl td:first-child { color: var(--text-muted); }
+  .pareto-tbl td:nth-child(2) { text-align: left; }
+  .pareto-tbl tr:first-child td { color: var(--teal); }
+
+  /* warn list */
+  .warn-list { list-style: none; }
+  .warn-item { font-size: 11px; color: var(--amber); padding: 2px 0; }
+  .warn-item::before { content: '⚠ '; color: var(--amber-dim); }
+
+  /* inline report iframe */
+  .report-wrap {
+    overflow: hidden; height: 0; position: relative;
+    transition: height 0.3s cubic-bezier(.4,0,.2,1);
+  }
+  .report-wrap.open { height: 680px; border-top: 1px solid var(--border); }
+  .report-frame { width: 100%; height: 680px; border: none; display: block; background: #0d0d0d; opacity: 0; transition: opacity .18s ease; }
+  .report-frame.ready { opacity: 1; }
+  .report-loader {
+    position: absolute; inset: 0; z-index: 2;
+    display: flex; align-items: center; justify-content: center;
+    background: linear-gradient(180deg, rgba(13,13,13,.98), rgba(13,13,13,.92));
+    transition: opacity .18s ease, visibility .18s ease;
+  }
+  .report-loader.done { opacity: 0; visibility: hidden; pointer-events: none; }
+  .report-loader-box { width: min(360px, calc(100% - 48px)); }
+  .report-loader-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+  .report-loader-title { font-size: 11px; color: var(--amber); text-transform: uppercase; letter-spacing: .8px; }
+  .report-loader-pct { font-size: 11px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+  .report-progress { height: 3px; background: #1d1d1d; border: 1px solid var(--border); overflow: hidden; }
+  .report-progress-bar { height: 100%; width: 0%; background: linear-gradient(90deg, var(--amber), var(--teal)); transition: width .16s ease; }
+  .report-progress-bar.indeterminate { width: 42%; animation: report-progress-scan 1.1s ease-in-out infinite; }
+  .report-loader-msg { margin-top: 9px; font-size: 11px; color: var(--text-muted); }
+  @keyframes report-progress-scan {
+    0% { transform: translateX(-110%); }
+    100% { transform: translateX(250%); }
+  }
+
+  /* ── HISTORY PANEL ── */
+  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.4); z-index: 199; display: none; }
+  .overlay.show { display: block; }
+  .hist-panel {
+    position: fixed; right: 0; top: 0; bottom: 0; width: 300px;
+    background: var(--surface); border-left: 1px solid var(--border);
+    transform: translateX(100%); transition: transform 0.2s cubic-bezier(.4,0,.2,1);
+    z-index: 200; display: flex; flex-direction: column; overflow-y: auto;
+  }
+  .hist-panel.open { transform: none; }
+  .hist-hdr {
+    padding: 10px 14px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center;
+    font-size: 10px; letter-spacing: 0.8px; text-transform: uppercase; color: var(--text-dim);
+    position: sticky; top: 0; background: var(--surface); z-index: 1;
+  }
+  .hist-close { margin-left: auto; font: inherit; font-size: 13px; color: var(--text-muted); background: none; border: none; cursor: pointer; padding: 2px 6px; transition: color 0.1s; }
+  .hist-close:hover { color: var(--text); }
+  .hist-item { padding: 8px 14px; border-bottom: 1px solid var(--border); cursor: pointer; transition: background 0.08s; }
+  .hist-item:hover { background: var(--surface-hi); }
+  .hist-item-row { display: flex; align-items: center; gap: 7px; margin-bottom: 2px; }
+  .hist-item-id { font-size: 11px; color: var(--text-dim); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .hist-item-time { font-size: 10px; color: var(--text-muted); }
+  .hist-item-meta { font-size: 11px; color: var(--text-muted); }
+
+  .hidden { display: none !important; }
+
+  /* ── CRUD MODAL ── */
+  .crud-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 299;
+    display: none; align-items: center; justify-content: center;
+  }
+  .crud-overlay.show { display: flex; }
+  .crud-modal {
+    background: var(--surface); border: 1px solid var(--border-hi);
+    border-radius: var(--r); width: 580px; max-width: 96vw;
+    display: flex; flex-direction: column; max-height: 88vh;
+    box-shadow: 0 8px 40px rgba(0,0,0,.65);
+  }
+  .crud-hdr {
+    padding: 10px 14px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 10px; flex-shrink: 0;
+    font-size: 10px; letter-spacing: 0.8px; text-transform: uppercase; color: var(--text-dim);
+  }
+  .crud-hdr-title { flex: 1; }
+  .crud-close {
+    font: inherit; font-size: 14px; color: var(--text-muted);
+    background: none; border: none; cursor: pointer; padding: 1px 5px; line-height: 1;
+    transition: color 0.1s;
+  }
+  .crud-close:hover { color: var(--coral); }
+  .crud-body { padding: 12px 14px; flex: 1; overflow-y: auto; }
+  .crud-footer {
+    padding: 10px 14px; border-top: 1px solid var(--border);
+    display: flex; align-items: center; gap: 8px; flex-shrink: 0;
+  }
+  .crud-save {
+    font: inherit; font-size: 11px; padding: 5px 16px; border-radius: var(--r);
+    background: var(--amber-dim); color: var(--amber-bright); border: 1px solid var(--amber);
+    cursor: pointer; transition: background 0.12s;
+  }
+  .crud-save:hover { background: var(--amber); color: #0d0d0d; }
+  .crud-copy, .crud-cancel {
+    font: inherit; font-size: 11px; padding: 5px 12px; border-radius: var(--r);
+    background: transparent; color: var(--text-muted); border: 1px solid var(--border);
+    cursor: pointer; transition: background 0.12s, color 0.12s;
+  }
+  .crud-copy:hover, .crud-cancel:hover { background: var(--surface-hi); color: var(--text); }
+  .row-acts { display: flex; gap: 4px; margin-top: 5px; }
+  .row-act {
+    font: inherit; font-size: 10px; padding: 1px 7px; border-radius: 2px;
+    background: transparent; color: var(--text-muted); border: 1px solid var(--border);
+    cursor: pointer; transition: color 0.1s, border-color 0.1s;
+  }
+  .row-act:hover { color: var(--text); border-color: var(--border-hi); }
+  .row-act.del:hover { color: var(--coral); border-color: var(--coral); }
+  .custom-badge {
+    font-size: 9px; padding: 1px 5px; border-radius: 2px;
+    background: rgba(0,184,144,.1); color: var(--teal); border: 1px solid var(--teal-dim);
+  }
+  .panel-add-btn {
+    font: inherit; font-size: 10px; padding: 1px 7px; border-radius: 2px;
+    background: transparent; color: var(--text-muted); border: 1px solid var(--border);
+    cursor: pointer; margin-left: auto; transition: color 0.1s, border-color 0.1s;
+  }
+  .panel-add-btn:hover { color: var(--amber); border-color: var(--amber-dim); }
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<div class="hdr">
+  <div class="hdr-logo">ZRT</div>
+  <div class="hdr-title">Sim Launcher <em>/ Training</em></div>
+  <div class="hdr-right">
+    <input class="api-url" id="api-url" value="" onblur="checkHealth()">
+    <div class="api-dot" id="api-dot"></div>
+    <span class="api-lbl" id="api-lbl">—</span>
+  </div>
+</div>
+
+<!-- TABS -->
+<div class="tabs">
+  <button class="tab on est" onclick="switchTab('estimate')">
+    estimate <span class="tab-count" id="tab-count-estimate">0</span>
+  </button>
+  <button class="tab srch" onclick="switchTab('search')">
+    search <span class="tab-count" id="tab-count-search">0</span>
+  </button>
+  <div class="tab-gap"></div>
+  <button class="hist-btn" onclick="toggleHist()">
+    history <span class="hist-pill" id="hist-count">0</span>
+  </button>
+</div>
+
+<!-- MAIN TWO-COLUMN LAYOUT -->
+<div class="main-layout">
+
+  <!-- ── LEFT COLUMN ── -->
+  <aside class="left-col">
+
+    <!-- ESTIMATE FORM -->
+    <div id="form-estimate">
+      <div class="panel est-accent">
+        <div class="panel-hdr">
+          config
+          <div class="src-toggle">
+            <button class="src-btn on" id="src-est-form" onclick="setSrc('estimate','form')">form</button>
+            <button class="src-btn"    id="src-est-yaml" onclick="setSrc('estimate','yaml')">yaml</button>
+            <button class="src-btn"    id="src-est-path" onclick="setSrc('estimate','path')">file</button>
+          </div>
+        </div>
+        <div class="panel-body">
+
+          <!-- ── FORM MODE ── -->
+          <div id="est-form-sec">
+            <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.7px;color:var(--text-dim);margin-bottom:8px">Model & System</div>
+            <div class="form-grid">
+              <div class="form-group full-col">
+                <label class="form-label">model</label>
+                <select class="form-select" id="form-model-sel"><option value="">loading…</option></select>
+              </div>
+              <div class="form-group full-col">
+                <label class="form-label">hardware</label>
+                <select class="form-select" id="form-hw-sel"><option value="">loading…</option></select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">nodes</label>
+                <input class="form-input" id="form-nodes" type="number" value="16" min="1" onchange="autoDP()">
+              </div>
+              <div class="form-group">
+                <label class="form-label">GPUs / node</label>
+                <select class="form-select" id="form-gpus" onchange="autoDP()">
+                  <option value="8" selected>8</option>
+                  <option value="4">4</option>
+                </select>
+              </div>
+            </div>
+
+            <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.7px;color:var(--text-dim);margin:12px 0 8px">Parallelism</div>
+            <div class="form-grid">
+              <div class="form-group">
+                <label class="form-label">TP</label>
+                <select class="form-select" id="form-tp" onchange="autoDP()">
+                  <option>1</option><option>2</option><option selected>4</option><option>8</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">PP</label>
+                <select class="form-select" id="form-pp" onchange="autoDP()">
+                  <option>1</option><option>2</option><option>4</option><option>8</option><option selected>16</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">EP</label>
+                <select class="form-select" id="form-ep" onchange="autoDP()">
+                  <option selected>1</option><option>2</option><option>4</option><option>8</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">CP</label>
+                <select class="form-select" id="form-cp" onchange="autoDP()">
+                  <option selected>1</option><option>2</option><option>4</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">DP <span id="form-dp-hint" style="color:var(--amber);font-size:9px"></span></label>
+                <input class="form-input" id="form-dp" type="number" value="1" min="1" readonly style="color:var(--text-muted)">
+              </div>
+              <div class="form-group">
+                <label class="form-label">PP schedule</label>
+                <select class="form-select" id="form-ppsched">
+                  <option value="1f1b" selected>1f1b</option>
+                  <option value="interleaved">interleaved</option>
+                  <option value="dualpipe_v">dualpipe_v</option>
+                  <option value="dualpipe">dualpipe</option>
+                  <option value="zero_bubble">zero_bubble</option>
+                </select>
+              </div>
+            </div>
+
+            <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.7px;color:var(--text-dim);margin:12px 0 8px">Batch</div>
+            <div class="form-grid">
+              <div class="form-group">
+                <label class="form-label">micro batch</label>
+                <input class="form-input" id="form-mb" type="number" value="1" min="1">
+              </div>
+              <div class="form-group">
+                <label class="form-label">global batch</label>
+                <input class="form-input" id="form-gb" type="number" value="2048" min="1">
+              </div>
+            </div>
+
+            <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.7px;color:var(--text-dim);margin:12px 0 8px">Training</div>
+            <div class="form-grid">
+              <div class="form-group">
+                <label class="form-label">ZeRO stage <span id="zero-warn" style="color:var(--coral);font-size:9px"></span></label>
+                <select class="form-select" id="form-zero" onchange="checkZeroDP()">
+                  <option>0</option><option selected>1</option><option>2</option><option>3</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">optimizer</label>
+                <select class="form-select" id="form-opt">
+                  <option value="adam" selected>adam</option>
+                  <option value="muon">muon</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">TP overlap</label>
+                <select class="form-select" id="form-tpoverlap">
+                  <option value="none" selected>none</option>
+                  <option value="coc">coc</option>
+                  <option value="mc2">mc2</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">recompute (dense)</label>
+                <select class="form-select" id="form-recomp-dense">
+                  <option value="">none</option>
+                  <option value="attn" selected>attn</option>
+                  <option value="full">full</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">recompute (moe)</label>
+                <select class="form-select" id="form-recomp-moe">
+                  <option value="" selected>none</option>
+                  <option value="full">full</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <!-- ── YAML MODE ── -->
+          <div id="est-yaml-sec" class="hidden">
+            <textarea class="yaml-editor" id="est-yaml" spellcheck="false" placeholder="# Paste YAML training config…"></textarea>
+            <div class="presets">
+              <span class="preset-lbl">presets:</span>
+              <button class="preset-pill" onclick="loadPreset('est','llama3_70b')">LLaMA-3 70B</button>
+              <button class="preset-pill" onclick="loadPreset('est','dsv3_h100')">DSV3 H100</button>
+              <button class="preset-pill" onclick="loadPreset('est','dsv3_h800')">DSV3 H800</button>
+              <button class="preset-pill" onclick="loadPreset('est','dsv4_pro_h100')">DSV4-Pro</button>
+            </div>
+          </div>
+
+          <!-- ── FILE MODE ── -->
+          <div id="est-path-sec" class="hidden">
+            <input class="path-input" id="est-path" placeholder="python/zrt/training/configs/llama3_70b_3d.yaml">
+          </div>
+
+          <div class="run-row">
+            <button class="run-btn est-btn" id="btn-est" disabled onclick="runEstimate()">▶ run estimate</button>
+            <span class="run-hint" id="est-run-hint">POST /estimate</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- SEARCH FORM -->
+    <div id="form-search" class="hidden">
+      <div class="panel srch-accent">
+        <div class="panel-hdr">
+          grid search — strategy space
+          <div class="src-toggle">
+            <button class="src-btn on" id="src-srch-yaml" onclick="setSrc('search','yaml')">inline yaml</button>
+            <button class="src-btn"    id="src-srch-path" onclick="setSrc('search','path')">file path</button>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div id="srch-yaml-sec">
+            <textarea class="yaml-editor" id="srch-yaml" spellcheck="false" placeholder="# Training config YAML — same format as estimate…"></textarea>
+            <div class="presets">
+              <span class="preset-lbl">presets:</span>
+              <button class="preset-pill" onclick="loadPreset('srch','llama3_70b')">LLaMA-3 70B</button>
+              <button class="preset-pill" onclick="loadPreset('srch','dsv3_h100')">DSV3 H100</button>
+            </div>
+          </div>
+          <div id="srch-path-sec" class="hidden">
+            <input class="path-input" id="srch-path" placeholder="python/zrt/training/configs/llama3_70b_3d.yaml">
+          </div>
+          <div class="form-grid" style="margin-top:10px">
+            <div class="form-group full-col">
+              <label class="form-label">output json (optional)</label>
+              <input class="form-input" id="srch-out" placeholder="output/pareto.json">
+            </div>
+          </div>
+          <div class="run-row">
+            <button class="run-btn srch-btn" id="btn-srch" onclick="runSearch()">▶ run search</button>
+            <span class="run-hint">POST /search → Pareto</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- HARDWARE INFO -->
+    <div class="info-panel" id="hw-panel">
+      <div class="info-panel-hdr" onclick="toggleInfoPanel('hw-panel')">
+        hardware specs
+        <button class="panel-add-btn" onclick="event.stopPropagation();openCrudModal('hw','','new')" title="add custom hardware">+ new</button>
+        <span class="info-panel-chevron">▾</span>
+      </div>
+      <div class="info-panel-body">
+        <div id="hw-body" style="padding:10px 14px;font-size:11px;color:var(--text-muted)">loading…</div>
+      </div>
+    </div>
+
+    <!-- MODELS INFO -->
+    <div class="info-panel" id="models-panel">
+      <div class="info-panel-hdr" onclick="toggleInfoPanel('models-panel')">
+        local models
+        <button class="panel-add-btn" onclick="event.stopPropagation();openCrudModal('model','','new')" title="add custom model">+ new</button>
+        <span class="info-panel-chevron">▾</span>
+      </div>
+      <div class="info-panel-body">
+        <div id="models-body"><div style="padding:10px 14px;color:var(--text-muted);font-size:11px">loading…</div></div>
+      </div>
+    </div>
+
+  </aside>
+
+  <!-- ── RIGHT COLUMN ── -->
+  <main class="right-col">
+
+    <!-- ESTIMATE RESULTS -->
+    <div id="right-estimate">
+      <div class="right-hdr">
+        <span class="right-hdr-dot" style="background:var(--amber)"></span>
+        estimate jobs
+        <span class="right-hdr-count" id="est-count">0</span>
+        <button class="right-hdr-clear" onclick="clearJobs('estimate')" title="clear all">clear</button>
+      </div>
+      <div id="est-results"></div>
+    </div>
+
+    <!-- SEARCH RESULTS -->
+    <div id="right-search" class="hidden">
+      <div class="right-hdr">
+        <span class="right-hdr-dot" style="background:var(--teal)"></span>
+        search jobs
+        <span class="right-hdr-count" id="srch-count">0</span>
+        <button class="right-hdr-clear" onclick="clearJobs('search')" title="clear all">clear</button>
+      </div>
+      <div id="srch-results"></div>
+    </div>
+
+  </main>
+</div>
+
+<!-- HISTORY PANEL -->
+<div class="overlay" id="overlay" onclick="toggleHist()"></div>
+<div class="hist-panel" id="hist-panel">
+  <div class="hist-hdr">
+    job history
+    <button class="hist-close" onclick="toggleHist()">✕</button>
+  </div>
+  <div id="hist-list"></div>
+</div>
+
+<!-- CRUD MODAL -->
+<div class="crud-overlay" id="crud-overlay" onclick="crudOverlayClick(event)">
+  <div class="crud-modal" id="crud-modal">
+    <div class="crud-hdr">
+      <span class="crud-hdr-title" id="crud-title">spec</span>
+      <button class="crud-close" onclick="closeCrudModal()">✕</button>
+    </div>
+    <div class="crud-body">
+      <textarea class="yaml-editor" id="crud-yaml" spellcheck="false" style="min-height:340px;width:100%"></textarea>
+    </div>
+    <div class="crud-footer">
+      <button class="crud-save" id="crud-save-btn" onclick="saveCrudModal()">Save</button>
+      <button class="crud-copy" onclick="copyCrudYaml()">Copy</button>
+      <button class="crud-cancel" onclick="closeCrudModal()">Cancel</button>
+      <span id="crud-msg" style="font-size:10px;color:var(--text-muted);margin-left:4px"></span>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────────────
+const api = () => document.getElementById('api-url').value.replace(/\/$/, '');
+let jobs = [];
+let currentTab = 'estimate';
+let formModelsReady = false;
+let formHardwareReady = false;
+// CRUD state
+let _hwBase = []; let _hwCustom = []; let _hwDeleted = new Set();
+let _modelBase = []; let _modelCustom = []; let _modelDeleted = new Set();
+let _crudType = ''; let _crudKey = ''; let _crudMode = '';
+
+// ── Presets ────────────────────────────────────────────────────────────────────
+const PRESETS = {
+  llama3_70b: `# Llama-3 70B — 64× H100 SXM
+model: llama3_70b
+
+system:
+  hw: nvidia_h100_sxm
+  nodes: 8
+  gpus_per_node: 8
+  host_mem_gb: 2048
+
+strategy:
+  tp: 8
+  cp: 1
+  pp: 2
+  ep: 1
+  dp: 4
+  micro_batch: 1
+  global_batch: 32
+  pp_schedule: 1f1b
+  zero_stage: 1
+  recompute:
+    per_layer:
+      dense: ["attn"]
+  offload: {opt_state: false, grads: false, params: false}
+  tp_overlap: none
+  optimizer: adam`,
+
+  dsv3_h100: `# DeepSeek-V3 — 128× H100 SXM
+model: deepseek_v3
+
+system:
+  hw: nvidia_h100_sxm
+  nodes: 16
+  gpus_per_node: 8
+  host_mem_gb: 2048
+
+strategy:
+  tp: 1
+  cp: 1
+  pp: 16
+  ep: 8
+  dp: 1
+  micro_batch: 1
+  global_batch: 2048
+  pp_schedule: dualpipe_v
+  zero_stage: 1
+  recompute:
+    per_layer:
+      dense: []
+      moe: []
+  offload: {opt_state: false, grads: false, params: false}
+  tp_overlap: none
+  optimizer: adam`,
+
+  dsv3_h800: `# DeepSeek-V3 — 128× H800 SXM
+model: deepseek_v3
+
+system:
+  hw: nvidia_h800
+  nodes: 16
+  gpus_per_node: 8
+  host_mem_gb: 2048
+
+strategy:
+  tp: 1
+  cp: 1
+  pp: 16
+  ep: 8
+  dp: 1
+  micro_batch: 1
+  global_batch: 2048
+  pp_schedule: dualpipe_v
+  zero_stage: 1
+  recompute:
+    per_layer:
+      dense: []
+      moe: []
+  offload: {opt_state: false, grads: false, params: false}
+  tp_overlap: none
+  optimizer: adam`,
+
+  dsv4_pro_h100: `# DeepSeek-V4 Pro — 128× H100 SXM
+model: deepseek_v4_pro
+
+system:
+  hw: nvidia_h100_sxm
+  nodes: 16
+  gpus_per_node: 8
+  host_mem_gb: 2048
+
+strategy:
+  tp: 1
+  cp: 1
+  pp: 16
+  ep: 8
+  dp: 1
+  micro_batch: 1
+  global_batch: 2048
+  pp_schedule: dualpipe_v
+  zero_stage: 1
+  recompute:
+    per_layer:
+      dense: []
+      moe: []
+  offload: {opt_state: false, grads: false, params: false}
+  tp_overlap: none
+  optimizer: adam`,
+};
+
+// ── Tab switching ──────────────────────────────────────────────────────────────
+function switchTab(name) {
+  currentTab = name;
+  // forms
+  document.getElementById('form-estimate').classList.toggle('hidden', name !== 'estimate');
+  document.getElementById('form-search').classList.toggle('hidden',   name !== 'search');
+  // results
+  document.getElementById('right-estimate').classList.toggle('hidden', name !== 'estimate');
+  document.getElementById('right-search').classList.toggle('hidden',   name !== 'search');
+  // tab buttons
+  const tabs = document.querySelectorAll('.tab');
+  tabs[0].classList.toggle('on', name === 'estimate');
+  tabs[1].classList.toggle('on', name === 'search');
+}
+
+function setSrc(tab, mode) {
+  if (tab === 'estimate') {
+    document.getElementById('est-form-sec').classList.toggle('hidden', mode !== 'form');
+    document.getElementById('est-yaml-sec').classList.toggle('hidden', mode !== 'yaml');
+    document.getElementById('est-path-sec').classList.toggle('hidden', mode !== 'path');
+    document.getElementById('src-est-form').classList.toggle('on', mode === 'form');
+    document.getElementById('src-est-yaml').classList.toggle('on', mode === 'yaml');
+    document.getElementById('src-est-path').classList.toggle('on', mode === 'path');
+    setEstimateRunState();
+  } else {
+    document.getElementById('srch-yaml-sec').classList.toggle('hidden', mode !== 'yaml');
+    document.getElementById('srch-path-sec').classList.toggle('hidden', mode !== 'path');
+    document.getElementById('src-srch-yaml').classList.toggle('on', mode === 'yaml');
+    document.getElementById('src-srch-path').classList.toggle('on', mode === 'path');
+  }
+}
+
+function isEstimateFormMode() {
+  return !document.getElementById('est-form-sec')?.classList.contains('hidden');
+}
+
+function formCatalogReady() {
+  const model = document.getElementById('form-model-sel')?.value || '';
+  const hw = document.getElementById('form-hw-sel')?.value || '';
+  return formModelsReady && formHardwareReady && Boolean(model) && Boolean(hw);
+}
+
+function setEstimateRunState() {
+  const btn = document.getElementById('btn-est');
+  const hint = document.getElementById('est-run-hint');
+  if (!btn) return;
+  const waitingForCatalogs = isEstimateFormMode() && !formCatalogReady();
+  btn.disabled = waitingForCatalogs;
+  if (hint) hint.textContent = waitingForCatalogs ? 'loading model / hardware' : 'POST /estimate';
+}
+
+function autoDP() {
+  const nodes = parseInt(document.getElementById('form-nodes')?.value || 1);
+  const gpus  = parseInt(document.getElementById('form-gpus')?.value  || 8);
+  const tp    = parseInt(document.getElementById('form-tp')?.value    || 1);
+  const pp    = parseInt(document.getElementById('form-pp')?.value    || 1);
+  const ep    = parseInt(document.getElementById('form-ep')?.value    || 1);
+  const cp    = parseInt(document.getElementById('form-cp')?.value    || 1);
+  const total = nodes * gpus;
+  const denom = tp * pp * cp;
+  const dp = Math.max(1, Math.floor(total / denom));
+  const exact = total % denom === 0;
+  const dpEl = document.getElementById('form-dp');
+  const hintEl = document.getElementById('form-dp-hint');
+  if (dpEl) dpEl.value = dp;
+  if (hintEl) {
+    hintEl.textContent = exact
+      ? `= ${total}/(${tp}×${pp}×${cp}); EP shares ranks`
+      : `invalid: ${total} not divisible by ${denom}`;
+    hintEl.style.color = exact ? 'var(--amber)' : 'var(--coral)';
+  }
+  checkZeroDP(dp);
+}
+
+function checkZeroDP(dp) {
+  const dpVal = dp ?? parseInt(document.getElementById('form-dp')?.value || 1);
+  const zeroEl = document.getElementById('form-zero');
+  const warnEl = document.getElementById('zero-warn');
+  if (!zeroEl) return;
+  if (dpVal <= 1 && parseInt(zeroEl.value) > 0) {
+    zeroEl.value = '0';
+    if (warnEl) warnEl.textContent = 'DP=1，已重置为0';
+  } else {
+    if (warnEl) warnEl.textContent = '';
+  }
+}
+
+function _indentYaml(text, n) {
+  const pad = ' '.repeat(n);
+  return text.trimEnd().split('\n')
+    .map(line => line.trim() === '' ? '' : pad + line)
+    .join('\n');
+}
+
+function buildFormYaml() {
+  const modelKey = document.getElementById('form-model-sel').value;
+  const hwKey    = document.getElementById('form-hw-sel').value;
+  const nodes    = document.getElementById('form-nodes').value;
+  const gpus     = document.getElementById('form-gpus').value;
+  const tp       = document.getElementById('form-tp').value;
+  const pp       = document.getElementById('form-pp').value;
+  const ep       = document.getElementById('form-ep').value;
+  const cp       = document.getElementById('form-cp').value;
+  const dp       = document.getElementById('form-dp').value;
+  const sched    = document.getElementById('form-ppsched').value;
+  const mb       = document.getElementById('form-mb').value;
+  const gb       = document.getElementById('form-gb').value;
+  const zero     = document.getElementById('form-zero').value;
+  const opt      = document.getElementById('form-opt').value;
+  const tpov     = document.getElementById('form-tpoverlap').value;
+  const rDense   = document.getElementById('form-recomp-dense').value;
+  const rMoe     = document.getElementById('form-recomp-moe').value;
+  const denseArr = rDense ? `["${rDense}"]` : '[]';
+  const moeArr   = rMoe   ? `["${rMoe}"]`   : '[]';
+
+  const customModel = _modelCustom.find(c => c.key === modelKey);
+  const customHw    = _hwCustom.find(c => c.key === hwKey);
+
+  const modelSection = customModel
+    ? `model:\n${_indentYaml(customModel.content, 2)}`
+    : `model: ${modelKey}`;
+
+  const hwSection = customHw
+    ? `  hw:\n${_indentYaml(customHw.content, 4)}`
+    : `  hw: ${hwKey}`;
+
+  return `${modelSection}
+
+system:
+${hwSection}
+  nodes: ${nodes}
+  gpus_per_node: ${gpus}
+  host_mem_gb: 2048
+
+strategy:
+  tp: ${tp}
+  cp: ${cp}
+  pp: ${pp}
+  ep: ${ep}
+  dp: ${dp}
+  micro_batch: ${mb}
+  global_batch: ${gb}
+  pp_schedule: ${sched}
+  zero_stage: ${zero}
+  recompute:
+    per_layer:
+      dense: ${denseArr}
+      moe: ${moeArr}
+  offload: {opt_state: false, grads: false, params: false}
+  tp_overlap: ${tpov}
+  optimizer: ${opt}`;
+}
+
+function loadPreset(tab, key) {
+  document.getElementById(tab === 'est' ? 'est-yaml' : 'srch-yaml').value = PRESETS[key] || '';
+}
+
+function toggleInfoPanel(id) {
+  document.getElementById(id).classList.toggle('collapsed');
+}
+
+// ── Health + data fetch ────────────────────────────────────────────────────────
+async function checkHealth() {
+  const dot = document.getElementById('api-dot');
+  const lbl = document.getElementById('api-lbl');
+  try {
+    const r = await fetch(api()+'/health', { signal: AbortSignal.timeout(3000) });
+    if (r.ok) {
+      dot.className = 'api-dot ok'; lbl.textContent = 'connected';
+      fetchHardware();
+      fetchModels();
+    } else throw new Error();
+  } catch {
+    dot.className = 'api-dot err'; lbl.textContent = 'offline';
+  }
+}
+
+async function fetchHardware() {
+  try {
+    const r = await fetch(api()+'/hardware');
+    if (!r.ok) return;
+    const { hardware } = await r.json();
+    const details = await Promise.all(
+      hardware.map(name =>
+        fetch(api()+'/hardware/'+name).then(r => r.ok ? r.json() : { name })
+      )
+    );
+    _hwBase = hardware.map((name, i) => ({ key: name, ...details[i] }));
+    rebuildHwPanel();
+  } catch {}
+}
+
+function rebuildHwPanel() {
+  const customMap = new Map(_hwCustom.map(c => [c.key, c]));
+  const effective = [
+    ..._hwBase
+      .filter(h => !_hwDeleted.has(h.key))
+      .map(h => customMap.has(h.key) ? { ...h, name: customMap.get(h.key).name } : h),
+    ..._hwCustom.filter(c => c.isNew && !_hwDeleted.has(c.key)),
+  ];
+
+  const hwSel = document.getElementById('form-hw-sel');
+  if (hwSel) hwSel.innerHTML = effective.map(h => {
+    const label = (customMap.has(h.key) || h.isNew) ? `${esc(h.name||h.key)} [custom]` : esc(h.name||h.key);
+    return `<option value="${esc(h.key)}">${label}</option>`;
+  }).join('');
+  formHardwareReady = Boolean(effective.length);
+  autoDP();
+  setEstimateRunState();
+
+  const body = document.getElementById('hw-body');
+  if (!body) return;
+  if (!effective.length) { body.innerHTML = '<div style="padding:8px 14px;color:var(--text-muted);font-size:11px">none found</div>'; return; }
+  body.innerHTML = '';
+  effective.forEach(hw => {
+    const isCustom = customMap.has(hw.key) || hw.isNew;
+    const div = document.createElement('div');
+    div.className = 'hw-row';
+    const chips = [
+      hw.bf16_tflops ? `<span class="hw-spec-chip">BF16 <span>${hw.bf16_tflops}</span> TFLOPS</span>` : '',
+      hw.fp8_tops    ? `<span class="hw-spec-chip">FP8 <span>${hw.fp8_tops}</span> TOPS</span>` : '',
+      hw.memory_gb   ? `<span class="hw-spec-chip">HBM <span>${hw.memory_gb}</span> GB</span>` : '',
+      hw.hbm_gbps    ? `<span class="hw-spec-chip"><span>${hw.hbm_gbps}</span> GB/s</span>` : '',
+      hw.intra_type  ? `<span class="hw-spec-chip">${hw.intra_type}${hw.intra_bw ? ' <span>'+hw.intra_bw+'</span> GB/s' : ''}</span>` : '',
+      hw.inter_type  ? `<span class="hw-spec-chip">${hw.inter_type}${hw.inter_bw ? ' <span>'+hw.inter_bw+'</span> Gb/s' : ''}</span>` : '',
+    ].filter(Boolean).join('');
+    const badge = isCustom ? ' <span class="custom-badge">custom</span>' : '';
+    const k = esc(hw.key);
+    div.innerHTML = `
+      <div class="hw-name" style="display:flex;align-items:center;gap:6px">${esc(hw.name||hw.key)}${badge}</div>
+      <div class="hw-specs">${chips}</div>
+      <div class="row-acts">
+        <button class="row-act" onclick="openCrudModal('hw','${k}','view')">view</button>
+        <button class="row-act" onclick="openCrudModal('hw','${k}','edit')">edit</button>
+        <button class="row-act del" onclick="deleteCrudItem('hw','${k}')">delete</button>
+      </div>`;
+    body.appendChild(div);
+  });
+}
+
+let _models = [];
+
+async function fetchModels() {
+  try {
+    const r = await fetch(api()+'/models');
+    if (!r.ok) return;
+    const { models } = await r.json();
+    _modelBase = models;
+    _models = models;
+    rebuildModelPanel();
+  } catch {}
+}
+
+function rebuildModelPanel() {
+  const customMap = new Map(_modelCustom.map(c => [c.key, c]));
+  const effective = [
+    ..._modelBase
+      .filter(m => !_modelDeleted.has(m.key))
+      .map(m => customMap.has(m.key) ? { ...m, name: customMap.get(m.key).name } : m),
+    ..._modelCustom.filter(c => c.isNew && !_modelDeleted.has(c.key)).map(c => ({
+      key: c.key, name: c.name, _custom: true,
+    })),
+  ];
+  renderModelPanel(effective);
+  populateModelSelect(effective);
+}
+
+function renderModelPanel(models) {
+  const customKeys = new Set(_modelCustom.map(c => c.key));
+  const body = document.getElementById('models-body');
+  if (!models.length) { body.innerHTML = '<div style="padding:8px 14px;color:var(--text-muted);font-size:11px">none found</div>'; return; }
+  body.innerHTML = models.map(m => {
+    const lc = m.layer_counts || {};
+    const layerParts = Object.entries(lc).map(([t,n]) => `${n}×${t}`).join(' · ');
+    const isCustom = customKeys.has(m.key) || m._custom;
+    const chips = [
+      m.attn        ? `<span class="hw-spec-chip">${esc(m.attn)}</span>` : '',
+      m.hidden      ? `<span class="hw-spec-chip">h <span>${m.hidden}</span></span>` : '',
+      m.ffn         ? `<span class="hw-spec-chip">ffn <span>${m.ffn}</span></span>` : '',
+      m.num_heads   ? `<span class="hw-spec-chip">heads <span>${m.num_heads}</span>/${m.num_kv_heads}</span>` : '',
+      m.num_experts ? `<span class="hw-spec-chip">experts <span>${m.num_experts}</span>×top${m.top_k}</span>` : '',
+      m.vocab       ? `<span class="hw-spec-chip">vocab <span>${(m.vocab/1000).toFixed(0)}K</span></span>` : '',
+      m.seq_len     ? `<span class="hw-spec-chip">ctx <span>${m.seq_len}</span></span>` : '',
+      m.param_dtype ? `<span class="hw-spec-chip">${esc(m.param_dtype)}</span>` : '',
+    ].filter(Boolean).join('');
+    const archBadge = isCustom
+      ? `<span class="custom-badge">custom</span>`
+      : m.is_moe
+        ? `<span style="font-size:9px;padding:1px 5px;border-radius:2px;background:rgba(0,184,144,.15);color:var(--teal);border:1px solid var(--teal-dim)">MoE</span>`
+        : `<span style="font-size:9px;padding:1px 5px;border-radius:2px;background:rgba(212,140,12,.12);color:var(--amber);border:1px solid var(--amber-dim)">Dense</span>`;
+    const k = esc(m.key);
+    return `<div class="hw-row">
+      <div class="hw-name" style="display:flex;align-items:center;gap:7px">${esc(m.name||m.key)} ${archBadge}</div>
+      ${layerParts ? `<div style="font-size:10px;color:var(--text-muted);margin:2px 0">${layerParts}</div>` : ''}
+      <div class="hw-specs">${chips}</div>
+      <div class="row-acts">
+        <button class="row-act" onclick="openCrudModal('model','${k}','view')">view</button>
+        <button class="row-act" onclick="openCrudModal('model','${k}','edit')">edit</button>
+        <button class="row-act del" onclick="deleteCrudItem('model','${k}')">delete</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function populateModelSelect(models) {
+  const sel = document.getElementById('form-model-sel');
+  if (!sel) return;
+  const customKeys = new Set(_modelCustom.map(c => c.key));
+  sel.innerHTML = models.map(m => {
+    const label = (customKeys.has(m.key) || m._custom) ? `${esc(m.name||m.key)} [custom]` : esc(m.name||m.key);
+    return `<option value="${esc(m.key)}">${label}</option>`;
+  }).join('');
+  formModelsReady = Boolean(models.length);
+  setEstimateRunState();
+}
+
+// ── CRUD modal ────────────────────────────────────────────────────────────────
+const _HW_TEMPLATE = `name: "My Custom GPU"
+vendor: custom
+device_type: gpu
+
+compute:
+  bf16_tflops: 989
+  fp8_tops: 3958
+
+memory:
+  capacity_gb: 80
+  hbm_bandwidth_gbps: 3350
+
+interconnect:
+  intra_node:
+    type: NVLink
+    bandwidth_gbps: 900
+    latency_us: 1
+    topology: all_to_all
+    num_devices: 8
+  inter_node:
+    type: InfiniBand
+    bandwidth_gbps: 400
+    latency_us: 2
+    topology: fat_tree
+    num_devices: 0`;
+
+const _MODEL_TEMPLATE = `name: my_custom_model
+
+hidden: 4096
+ffn: 11008
+num_heads: 32
+num_kv_heads: 8
+head_dim: 128
+vocab: 32000
+seq_len: 4096
+layers: "[dense]*32"
+
+param_dtype: bf16
+grad_dtype: fp32
+master_dtype: fp32
+act_dtype: bf16`;
+
+function openCrudModal(type, key, mode) {
+  _crudType = type; _crudKey = key; _crudMode = mode;
+  const typeLbl = type === 'hw' ? 'hardware spec' : 'model spec';
+  const modeLbl = mode === 'new' ? 'new' : mode;
+  document.getElementById('crud-title').textContent = `${modeLbl} — ${typeLbl}`;
+  const ta  = document.getElementById('crud-yaml');
+  const btn = document.getElementById('crud-save-btn');
+  ta.readOnly = (mode === 'view');
+  ta.value = '';
+  if (btn) btn.style.display = (mode === 'view') ? 'none' : '';
+  document.getElementById('crud-msg').textContent = '';
+
+  if (mode === 'new') {
+    ta.value = (type === 'hw') ? _HW_TEMPLATE : _MODEL_TEMPLATE;
+  } else {
+    const list = (type === 'hw') ? _hwCustom : _modelCustom;
+    const existing = list.find(c => c.key === key);
+    if (existing) {
+      ta.value = existing.content;
+    } else {
+      ta.value = 'loading…';
+      const ep = type === 'hw'
+        ? `/hardware/${encodeURIComponent(key)}/raw`
+        : `/models/${encodeURIComponent(key)}/raw`;
+      fetch(api() + ep)
+        .then(r => r.ok ? r.json() : Promise.reject(r.status))
+        .then(d => { ta.value = d.content; })
+        .catch(e => {
+          const base = type === 'hw'
+            ? _hwBase.find(h => h.key === key)
+            : _modelBase.find(m => m.key === key);
+          if (base) {
+            ta.value = type === 'hw' ? _hwFallbackYaml(base) : _modelFallbackYaml(base);
+          } else {
+            ta.value = `# Error loading content (HTTP ${e})\n# Restart the server if this persists.`;
+          }
+        });
+    }
+  }
+  document.getElementById('crud-overlay').classList.add('show');
+  setTimeout(() => ta.focus(), 60);
+}
+
+function _ensurePanelVisible(panelId, bodyId) {
+  const panel = document.getElementById(panelId);
+  if (panel) panel.classList.remove('collapsed');
+  const body = document.getElementById(bodyId);
+  if (body && body.lastElementChild) {
+    setTimeout(() => body.lastElementChild.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 60);
+  }
+}
+
+function _hwFallbackYaml(hw) {
+  const lines = [
+    `# (reconstructed from API cache — restart server to load full YAML)`,
+    `name: "${hw.name || hw.key}"`,
+    ``,
+    `compute:`,
+  ];
+  if (hw.bf16_tflops != null) lines.push(`  bf16_tflops: ${hw.bf16_tflops}`);
+  if (hw.fp8_tops    != null) lines.push(`  fp8_tops: ${hw.fp8_tops}`);
+  lines.push(``, `memory:`);
+  if (hw.memory_gb  != null) lines.push(`  capacity_gb: ${hw.memory_gb}`);
+  if (hw.hbm_gbps   != null) lines.push(`  hbm_bandwidth_gbps: ${hw.hbm_gbps}`);
+  lines.push(``, `interconnect:`);
+  if (hw.intra_type) {
+    lines.push(`  intra_node:`, `    type: "${hw.intra_type}"`);
+    if (hw.intra_bw != null) lines.push(`    bandwidth_gbps: ${hw.intra_bw}`);
+  }
+  if (hw.inter_type) {
+    lines.push(`  inter_node:`, `    type: "${hw.inter_type}"`);
+    if (hw.inter_bw != null) lines.push(`    bandwidth_gbps: ${hw.inter_bw}`);
+  }
+  return lines.join('\n');
+}
+
+function _modelFallbackYaml(m) {
+  let layersStr = '';
+  if (m.layer_counts && Object.keys(m.layer_counts).length) {
+    layersStr = Object.entries(m.layer_counts).map(([t, n]) => `[${t}]*${n}`).join('+');
+  }
+  const lines = [
+    `# (reconstructed from API cache — restart server to load full YAML)`,
+    `name: ${m.name || m.key}`,
+  ];
+  if (m.hidden      != null) lines.push(`hidden: ${m.hidden}`);
+  if (m.ffn         != null) lines.push(m.num_experts ? `moe_ffn: ${m.ffn}` : `ffn: ${m.ffn}`);
+  if (m.num_heads   != null) lines.push(`num_heads: ${m.num_heads}`);
+  if (m.num_kv_heads != null) lines.push(`num_kv_heads: ${m.num_kv_heads}`);
+  if (m.head_dim    != null) lines.push(`head_dim: ${m.head_dim}`);
+  if (m.vocab       != null) lines.push(`vocab: ${m.vocab}`);
+  if (m.seq_len     != null) lines.push(`seq_len: ${m.seq_len}`);
+  if (layersStr)              lines.push(`layers: "${layersStr}"`);
+  if (m.num_experts != null) lines.push(`num_experts: ${m.num_experts}`);
+  if (m.top_k       != null) lines.push(`top_k: ${m.top_k}`);
+  if (m.param_dtype)          lines.push(`param_dtype: ${m.param_dtype}`);
+  return lines.join('\n');
+}
+
+function closeCrudModal() {
+  document.getElementById('crud-overlay').classList.remove('show');
+}
+
+function crudOverlayClick(e) {
+  if (e.target === document.getElementById('crud-overlay')) closeCrudModal();
+}
+
+function copyCrudYaml() {
+  const text = document.getElementById('crud-yaml').value;
+  navigator.clipboard.writeText(text).then(() => {
+    document.getElementById('crud-msg').textContent = 'copied!';
+    setTimeout(() => { document.getElementById('crud-msg').textContent = ''; }, 1500);
+  }).catch(() => {
+    document.getElementById('crud-msg').textContent = 'copy failed';
+  });
+}
+
+function saveCrudModal() {
+  const content = document.getElementById('crud-yaml').value.trim();
+  if (!content) { document.getElementById('crud-msg').textContent = 'content is empty'; return; }
+
+  // Extract name: field (first occurrence)
+  const nameMatch = content.match(/^name:\s*["']?([^"'\n\r]+)["']?\s*$/m);
+  const displayName = nameMatch ? nameMatch[1].trim() : (_crudKey || 'custom');
+  // For new entries, derive a key from the name
+  const key = _crudKey || displayName.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+
+  if (_crudType === 'hw') {
+    _hwDeleted.delete(key);
+    const idx = _hwCustom.findIndex(c => c.key === key);
+    const entry = { key, name: displayName, content, isNew: !_crudKey };
+    if (idx >= 0) _hwCustom[idx] = entry; else _hwCustom.push(entry);
+    rebuildHwPanel();
+    _ensurePanelVisible('hw-panel', 'hw-body');
+  } else {
+    _modelDeleted.delete(key);
+    const idx = _modelCustom.findIndex(c => c.key === key);
+    const entry = { key, name: displayName, content, isNew: !_crudKey };
+    if (idx >= 0) _modelCustom[idx] = entry; else _modelCustom.push(entry);
+    rebuildModelPanel();
+    _ensurePanelVisible('models-panel', 'models-body');
+  }
+
+  document.getElementById('crud-msg').textContent = 'saved';
+  setTimeout(closeCrudModal, 500);
+}
+
+function deleteCrudItem(type, key) {
+  if (!confirm(`Remove "${key}" from this session's list?`)) return;
+  if (type === 'hw') {
+    _hwDeleted.add(key);
+    _hwCustom = _hwCustom.filter(c => c.key !== key);
+    rebuildHwPanel();
+  } else {
+    _modelDeleted.add(key);
+    _modelCustom = _modelCustom.filter(c => c.key !== key);
+    rebuildModelPanel();
+  }
+}
+
+// ── History panel ──────────────────────────────────────────────────────────────
+function toggleHist() {
+  document.getElementById('hist-panel').classList.toggle('open');
+  document.getElementById('overlay').classList.toggle('show');
+}
+
+function renderHist() {
+  updateCounts();
+  const el = document.getElementById('hist-list');
+  if (!jobs.length) {
+    el.innerHTML = '<div style="padding:14px;color:var(--text-muted);font-size:11px">no jobs yet</div>';
+    return;
+  }
+  el.innerHTML = jobs.slice().reverse().map(j => `
+    <div class="hist-item" onclick="focusResult('${j.id}')">
+      <div class="hist-item-row">
+        <div class="sdot ${j.status}" style="width:7px;height:7px"></div>
+        <span class="hist-item-id">${j.id.slice(0,18)}…</span>
+        <span class="hist-item-time">${j.created_at ? new Date(j.created_at).toLocaleTimeString() : ''}</span>
+      </div>
+      <div class="hist-item-meta" style="color:${j._type==='estimate'?'var(--amber-bright)':'var(--teal)'}">${j._type||''}</div>
+      <div class="hist-item-meta">${j.status}${j._metric ? ' · '+j._metric : ''}</div>
+    </div>`).join('');
+}
+
+function focusResult(id) {
+  const el = document.getElementById('res-'+id);
+  if (el) { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
+  toggleHist();
+}
+
+function updateCounts() {
+  const estN  = document.getElementById('est-results').children.length;
+  const srchN = document.getElementById('srch-results').children.length;
+  document.getElementById('est-count').textContent  = estN;
+  document.getElementById('srch-count').textContent = srchN;
+  document.getElementById('tab-count-estimate').textContent = estN;
+  document.getElementById('tab-count-search').textContent   = srchN;
+  document.getElementById('hist-count').textContent = jobs.length;
+}
+
+// ── Submit ─────────────────────────────────────────────────────────────────────
+async function post(endpoint, body, type) {
+  const r = await fetch(api()+endpoint, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
+  const job = await r.json();
+  job._type = type;
+  jobs.push(job);
+  renderHist();
+  prependCard(job);
+  poll(job.id, type);
+  return job;
+}
+
+async function runEstimate() {
+  const btn = document.getElementById('btn-est');
+  btn.disabled = true;
+  try {
+    let body;
+    const isPath = !document.getElementById('est-path-sec').classList.contains('hidden');
+    const isYaml = !document.getElementById('est-yaml-sec').classList.contains('hidden');
+    if (isPath) {
+      body = { config_path: document.getElementById('est-path').value.trim() };
+    } else if (isYaml) {
+      body = { config_content: document.getElementById('est-yaml').value.trim() };
+    } else {
+      if (isEstimateFormMode() && !formCatalogReady()) {
+        throw new Error('model / hardware is still loading');
+      }
+      body = { config_content: buildFormYaml() };
+    }
+    await post('/estimate', body, 'estimate');
+  } catch(e) { inlineError(e.message, 'estimate'); }
+  finally { setEstimateRunState(); }
+}
+
+async function runSearch() {
+  const btn = document.getElementById('btn-srch');
+  btn.disabled = true;
+  try {
+    const isPath = !document.getElementById('srch-path-sec').classList.contains('hidden');
+    const body = isPath
+      ? { config_path: document.getElementById('srch-path').value.trim() }
+      : { config_content: document.getElementById('srch-yaml').value.trim() };
+    const out = document.getElementById('srch-out').value.trim();
+    if (out) body.output = out;
+    await post('/search', body, 'search');
+  } catch(e) { inlineError(e.message, 'search'); }
+  finally { btn.disabled = false; }
+}
+
+// ── Card lifecycle ─────────────────────────────────────────────────────────────
+function typeColor(type) { return type === 'estimate' ? 'var(--amber)' : 'var(--teal)'; }
+
+function prependCard(job) {
+  const el = document.createElement('div');
+  el.className = 'result-card'; el.id = 'res-'+job.id;
+  el.style.borderLeft = `3px solid ${typeColor(job._type)}`;
+  el.innerHTML = `
+    <div class="job-bar">
+      <div class="sdot ${job.status}"></div>
+      <span class="job-type" style="color:${typeColor(job._type)}">${job._type}</span>
+      <span class="job-id">${job.id.slice(0,12)}…</span>
+      <span class="job-elapsed" id="el-${job.id}">0.0s</span>
+      <button class="card-del" title="remove" onclick="deleteJob('${job.id}')">✕</button>
+    </div>
+    <div class="waiting" id="body-${job.id}">running…</div>`;
+  const container = job._type === 'search' ? 'srch-results' : 'est-results';
+  document.getElementById(container).prepend(el);
+  updateCounts();
+}
+
+function deleteJob(jobId) {
+  jobs = jobs.filter(j => j.id !== jobId);
+  const card = document.getElementById('res-'+jobId);
+  if (card) card.remove();
+  updateCounts();
+  renderHist();
+}
+
+function clearJobs(type) {
+  const container = type === 'search' ? 'srch-results' : 'est-results';
+  jobs = jobs.filter(j => j._type !== type);
+  document.getElementById(container).innerHTML = '';
+  updateCounts();
+  renderHist();
+}
+
+function refreshCard(job) {
+  const bar = document.querySelector('#res-'+job.id+' .sdot');
+  if (bar) bar.className = 'sdot '+job.status;
+  if (job.status === 'done') {
+    if (job._type === 'estimate') renderEstimate(job);
+    else if (job._type === 'search') renderSearch(job);
+  } else if (job.status === 'error') {
+    document.getElementById('body-'+job.id).outerHTML =
+      `<div class="err-body" id="body-${job.id}">✗ ${esc(job.error||'unknown error')}</div>`;
+  }
+}
+
+// ── Estimate result ────────────────────────────────────────────────────────────
+function fmtFlops(v) {
+  if (!v) return '—';
+  if (v >= 1e15) return (v/1e15).toFixed(2)+' PF';
+  if (v >= 1e12) return (v/1e12).toFixed(2)+' TF';
+  if (v >= 1e9)  return (v/1e9).toFixed(2)+' GF';
+  return v.toFixed(0);
+}
+function fmtParams(v) {
+  if (!v) return '—';
+  if (v >= 1e12) return (v/1e12).toFixed(2)+'T';
+  if (v >= 1e9)  return (v/1e9).toFixed(1)+'B';
+  if (v >= 1e6)  return (v/1e6).toFixed(0)+'M';
+  return v.toFixed(0);
+}
+
+function renderEstimate(job) {
+  const d  = job.result?.data;
+  if (!d) return;
+  const st = d.step_time_ms;
+  const md = job.result?.model_detail    || {};
+  const hw = job.result?.hw_detail       || {};
+  const st2= job.result?.strategy_detail || {};
+  const cs = d.config_summary            || {};
+
+  // ── Model section ─────────────────────────────────────────────────
+  const layerStr = Object.entries(md.layer_counts||{}).map(([t,n])=>`${n}×${t}`).join(' · ');
+  const moeBadge = md.is_moe
+    ? `<span style="font-size:9px;padding:1px 5px;border-radius:2px;background:rgba(0,184,144,.15);color:var(--teal);border:1px solid var(--teal-dim)">MoE</span>`
+    : `<span style="font-size:9px;padding:1px 5px;border-radius:2px;background:rgba(212,140,12,.12);color:var(--amber);border:1px solid var(--amber-dim)">Dense</span>`;
+  const modelRows = [
+    { k:'arch',     v: `${md.attn_type||'—'} ${moeBadge}` },
+    { k:'hidden',   v: md.hidden??'—' },
+    { k:'ffn',      v: md.ffn??'—' },
+    { k:'heads',    v: md.num_heads ? `${md.num_heads} / ${md.num_kv_heads} (Q/KV)  head_dim ${md.head_dim}` : '—' },
+    md.is_moe ? { k:'experts', v: `${md.num_experts} × top-${md.top_k}` } : null,
+    { k:'layers',   v: layerStr || (md.num_layers??'—') },
+    { k:'vocab',    v: md.vocab ? `${(md.vocab/1000).toFixed(0)}K` : '—' },
+    { k:'ctx',      v: md.seq_len??'—' },
+    { k:'dtype',    v: md.param_dtype||'—' },
+    { k:'params',   v: fmtParams(md.total_params||d.effective_params) },
+  ].filter(Boolean);
+
+  // ── Hardware section ───────────────────────────────────────────────
+  const hwRows = [
+    { k:'GPU',     v: hw.name||cs.system||'—' },
+    { k:'cluster', v: hw.world_size ? `${hw.nodes} nodes × ${hw.gpus_per_node} GPUs = ${hw.world_size}` : '—' },
+    { k:'BF16',    v: hw.bf16_tflops ? `${hw.bf16_tflops} TFLOPS` : '—' },
+    { k:'FP8',     v: hw.fp8_tops    ? `${hw.fp8_tops} TOPS`      : '—' },
+    { k:'HBM',     v: hw.hbm_gb      ? `${hw.hbm_gb} GB  ·  ${hw.hbm_bw_gbps} GB/s` : '—' },
+    hw.intra ? { k:'intra',  v: hw.intra } : null,
+    hw.inter ? { k:'inter',  v: hw.inter } : null,
+  ].filter(Boolean);
+
+  // ── Strategy section ──────────────────────────────────────────────
+  const stratRows = [
+    { k:'parallel',   v: st2.tp ? `TP${st2.tp} · CP${st2.cp} · PP${st2.pp} · EP${st2.ep} · DP${st2.dp}` : (cs.strategy||'—') },
+    { k:'schedule',   v: `${st2.pp_schedule||d.schedule_name||'—'}  ·  ${st2.num_microbatches??cs.num_microbatches??'—'} µbatches` },
+    { k:'batch',      v: `micro ${st2.micro_batch??cs.micro_batch??'—'}  ·  global ${st2.global_batch??cs.global_batch??'—'}` },
+    { k:'ZeRO',       v: `stage ${st2.zero_stage??cs.zero_stage??'—'}` },
+    { k:'optimizer',  v: st2.optimizer||'—' },
+    { k:'TP overlap', v: st2.tp_overlap||'—' },
+    { k:'FLOPs/tok',  v: fmtFlops(d.flops_per_token) },
+    { k:'total FLOPs',v: fmtFlops(d.total_flops) },
+  ];
+
+  function cfgSection(title, rows) {
+    return `<div class="section">
+      <div class="section-title">${title}</div>
+      <div class="cfg-grid">
+        ${rows.map(r=>`<div class="cfg-row${r.full?' full':''}"><span class="cfg-k">${r.k}</span><span class="cfg-v">${r.v}</span></div>`).join('')}
+      </div></div>`;
+  }
+  const cfgHtml = cfgSection('model', modelRows)
+                + cfgSection('hardware', hwRows)
+                + cfgSection('strategy', stratRows);
+
+  const comps = [
+    { l:'Forward compute',  v:d.fwd_compute_ms,   c:'#00b890' },
+    { l:'Backward compute', v:d.bwd_compute_ms,   c:'#f0a828' },
+    { l:'TP comm',          v:d.tp_exposed_ms||0, c:'#e04848' },
+    { l:'CP comm',          v:d.cp_exposed_ms||0, c:'#e04848' },
+    { l:'EP comm',          v:d.ep_exposed_ms||0, c:'#e04848' },
+    { l:'PP comm',          v:d.pp_exposed_ms||0, c:'#e04848' },
+    { l:'DP comm',          v:d.dp_exposed_ms||0, c:'#e04848' },
+    { l:'Optimizer',        v:(d.optimizer_time_ms||0)+(d.optimizer_comm_ms||0), c:'#7060c8' },
+  ].filter(c => c.v > 0);
+  const bkHtml = comps.map(c=>`
+    <div class="bk-row">
+      <span class="bk-lbl">${c.l}</span>
+      <div class="bk-wrap"><div class="bk-bar" style="width:${(c.v/st*100).toFixed(1)}%;background:${c.c}"></div></div>
+      <span class="bk-val">${fmtMs(c.v)}</span>
+    </div>`).join('');
+
+  let phaseHtml = '';
+  if (d.warmup_ms > 0 || d.steady_ms > 0) {
+    const rows = [
+      ['warmup',   d.warmup_fwd_ms,   d.warmup_bwd_ms,   d.warmup_ms],
+      ['steady',   d.steady_fwd_ms,   d.steady_bwd_ms,   d.steady_ms],
+      ['cooldown', d.cooldown_fwd_ms, d.cooldown_bwd_ms, d.cooldown_ms],
+      ['total',    d.warmup_fwd_ms+d.steady_fwd_ms+d.cooldown_fwd_ms,
+                   d.warmup_bwd_ms+d.steady_bwd_ms+d.cooldown_bwd_ms,
+                   d.warmup_ms+d.steady_ms+d.cooldown_ms],
+    ];
+    phaseHtml = `<div class="section">
+      <div class="section-title">phase breakdown</div>
+      <table class="phase-tbl">
+        <tr><th>phase</th><th>fwd</th><th>bwd</th><th>total</th></tr>
+        ${rows.map(([n,...v],i)=>`<tr${i===3?' class="total"':''}><td>${n}</td>${v.map(x=>`<td>${fmtMs(x)}</td>`).join('')}</tr>`).join('')}
+      </table>
+      ${d.steady_per_mb_ms>0?`<div style="margin-top:7px;font-size:10px;color:var(--text-muted)">per microbatch (steady): fwd ${fmtMs(d.steady_fwd_per_mb_ms)} · bwd ${fmtMs(d.steady_bwd_per_mb_ms)} · total ${fmtMs(d.steady_per_mb_ms)}</div>`:''}
+    </div>`;
+  }
+
+  let memHtml = '';
+  if (d.memory) {
+    const gb = d.memory;
+    const fields = [
+      {l:'weights',v:gb.weights_gb},{l:'grads',v:gb.grads_gb},
+      {l:'opt state',v:gb.opt_state_gb},{l:'activations',v:gb.activations_gb},
+      {l:'comm buf',v:gb.comm_buffers_gb},
+    ].filter(f=>f.v>0);
+    const peak = gb.peak_gb || gb.total_gb || 0;
+    memHtml = `<div class="section">
+      <div class="section-title">memory / gpu</div>
+      <div class="mem-grid">
+        ${fields.map(f=>`<div class="mem-cell"><div class="mem-l">${f.l}</div><div class="mem-v">${f.v.toFixed(1)}</div><div class="mem-u">GB</div></div>`).join('')}
+        <div class="mem-cell"><div class="mem-l">allocated</div><div class="mem-v">${(gb.total_gb||0).toFixed(1)}</div><div class="mem-u">GB</div></div>
+        <div class="mem-cell"><div class="mem-l">peak</div><div class="mem-v hi">${peak.toFixed(1)}</div><div class="mem-u">GB</div></div>
+      </div></div>`;
+  }
+
+  let commHtml = '';
+  if (d.hidden_comm_ms > 0 || d.exposed_comm_ms > 0) {
+    commHtml = `<div class="section">
+      <div class="section-title">communication</div>
+      <div class="cfg-grid">
+        <div class="cfg-row"><span class="cfg-k">exposed</span><span class="cfg-v">${fmtMs(d.exposed_comm_ms||0)}</span></div>
+        <div class="cfg-row"><span class="cfg-k">hidden</span><span class="cfg-v">${fmtMs(d.hidden_comm_ms||0)}</span></div>
+        <div class="cfg-row"><span class="cfg-k">volume</span><span class="cfg-v">${fmtMs(d.total_comm_volume_ms||0)}</span></div>
+        <div class="cfg-row"><span class="cfg-k">DP hidden</span><span class="cfg-v">${fmtMs(d.dp_hidden_ms||0)}</span></div>
+      </div></div>`;
+  }
+
+  let warnHtml = '';
+  if (d.warnings?.length) {
+    warnHtml = `<div class="section"><ul class="warn-list">${d.warnings.map(w=>`<li class="warn-item">${esc(w)}</li>`).join('')}</ul></div>`;
+  }
+
+  document.getElementById('body-'+job.id).outerHTML = `<div id="body-${job.id}">
+    <div class="mstrip">
+      <div class="mc"><div class="mc-l">Step Time</div><div class="mc-v">${fmtMs(st)}</div></div>
+      <div class="mc"><div class="mc-l">MFU</div><div class="mc-v">${(d.mfu*100).toFixed(1)}<span class="mc-u">%</span></div></div>
+      <div class="mc"><div class="mc-l">HFU</div><div class="mc-v">${(d.hfu*100).toFixed(1)}<span class="mc-u">%</span></div></div>
+      <div class="mc"><div class="mc-l">Bubble</div><div class="mc-v">${(d.bubble_fraction*100).toFixed(1)}<span class="mc-u">%</span></div></div>
+      <div class="mc"><div class="mc-l">Tokens/s</div><div class="mc-v">${d.tokens_per_sec>0?fmtNum(d.tokens_per_sec):'—'}</div></div>
+    </div>
+    ${cfgHtml}
+    <div class="section">
+      <div class="section-title">step time breakdown</div>
+      ${bkHtml}
+    </div>
+    ${phaseHtml}${memHtml}${commHtml}${warnHtml}
+    <div class="action-row">
+      <button class="action-btn" data-report-btn="${job.id}" onclick="toggleReport('${job.id}')">View Report ▾</button>
+      ${job.result?.excel_url ? `<button class="action-btn" type="button" data-job-id="${job.id}" data-artifact-kind="excel">Download Excel</button>` : ''}
+      <span class="action-meta">${esc(d.schedule_name||'')} · ${job.id.slice(0,8)}</span>
+      <span class="action-msg" data-action-msg="${job.id}"></span>
+    </div>
+  </div>`;
+
+  job._metric = `MFU ${(d.mfu*100).toFixed(1)}%`;
+  renderHist();
+}
+
+// ── Search result ──────────────────────────────────────────────────────────────
+function renderSearch(job) {
+  const r = job.result;
+  const frontier = r?.pareto_frontier || [];
+  const rows = frontier.slice(0, 10).map((d, i) => {
+    const cs = d.config_summary || {};
+    return `<tr>
+      <td>${i+1}</td>
+      <td>${esc(cs.strategy||'')}</td>
+      <td>${fmtMs(d.step_time_ms)}</td>
+      <td>${(d.mfu*100).toFixed(1)}%</td>
+      <td>${(d.bubble_fraction*100).toFixed(1)}%</td>
+      <td>${d.tokens_per_sec>0?fmtNum(d.tokens_per_sec):'—'}</td>
+    </tr>`;
+  }).join('');
+
+  document.getElementById('body-'+job.id).outerHTML = `<div id="body-${job.id}">
+    <div class="mstrip">
+      <div class="mc" style="--accent:var(--teal)"><div class="mc-l">Searched</div><div class="mc-v" style="color:var(--teal)">${r?.total_configs||0}</div></div>
+      <div class="mc"><div class="mc-l">Pareto</div><div class="mc-v" style="color:var(--teal)">${r?.pareto_count||0}</div></div>
+    </div>
+    <div class="section">
+      <div class="section-title">pareto frontier (top 10)</div>
+      <table class="pareto-tbl">
+        <thead><tr><th>#</th><th>strategy</th><th>step</th><th>MFU</th><th>bubble</th><th>tok/s</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+    <div class="action-row">
+      <button class="action-btn" style="color:var(--teal);border-color:var(--teal-dim);background:rgba(0,184,144,.08)" data-srch-report-btn="${job.id}" onclick="toggleSearchReport('${job.id}')">View Report ▾</button>
+    </div>
+  </div>`;
+
+  job._searchData = r;
+  job._metric = `${r?.pareto_count||0} configs`;
+  renderHist();
+}
+
+// ── Report ─────────────────────────────────────────────────────────────────────
+function toggleReport(jobId) {
+  const job = jobs.find(j => j.id === jobId);
+  const url = job?.result?.html_url || (job?.result?.html_filename ? `/estimate/${job.result.html_filename}` : '');
+  if (!url) return;
+  const card = document.getElementById('res-'+jobId);
+  const btn  = document.querySelector('[data-report-btn="'+jobId+'"]');
+  let wrap   = document.getElementById('report-wrap-'+jobId);
+  if (!wrap) {
+    wrap = document.createElement('div');
+    wrap.id = 'report-wrap-'+jobId;
+    wrap.className = 'report-wrap';
+    wrap.innerHTML = `
+      <div class="report-loader" data-report-loader="${jobId}">
+        <div class="report-loader-box">
+          <div class="report-loader-top">
+            <div class="report-loader-title">loading report</div>
+            <div class="report-loader-pct" data-report-pct="${jobId}">0%</div>
+          </div>
+          <div class="report-progress"><div class="report-progress-bar" data-report-progress="${jobId}"></div></div>
+          <div class="report-loader-msg" data-report-msg="${jobId}">requesting artifact…</div>
+        </div>
+      </div>
+      <iframe class="report-frame" data-report-frame="${jobId}"></iframe>`;
+    card.appendChild(wrap);
+    requestAnimationFrame(() => requestAnimationFrame(() => wrap.classList.add('open')));
+    loadReportFrame(jobId, apiUrl(url));
+    if (btn) btn.textContent = 'Hide Report ▴';
+    return;
+  }
+  const isOpen = wrap.classList.toggle('open');
+  if (btn) btn.textContent = isOpen ? 'Hide Report ▴' : 'View Report ▾';
+}
+
+function apiBase() {
+  return api() || location.origin;
+}
+
+function apiUrl(path) {
+  if (!path) return '';
+  if (/^https?:\/\//i.test(path)) return path;
+  return new URL(path, `${apiBase()}/`).href;
+}
+
+function updateReportProgress(jobId, percent, msg, indeterminate=false) {
+  const bar = document.querySelector(`[data-report-progress="${jobId}"]`);
+  const pct = document.querySelector(`[data-report-pct="${jobId}"]`);
+  const msgEl = document.querySelector(`[data-report-msg="${jobId}"]`);
+  if (bar) {
+    bar.classList.toggle('indeterminate', indeterminate);
+    if (!indeterminate && Number.isFinite(percent)) bar.style.width = `${Math.max(0, Math.min(100, percent))}%`;
+  }
+  if (pct) pct.textContent = indeterminate ? '…' : `${Math.round(Math.max(0, Math.min(100, percent || 0)))}%`;
+  if (msgEl && msg) msgEl.textContent = msg;
+}
+
+async function loadReportFrame(jobId, url) {
+  const frame = document.querySelector(`[data-report-frame="${jobId}"]`);
+  const loader = document.querySelector(`[data-report-loader="${jobId}"]`);
+  if (!frame || !url) return;
+  updateReportProgress(jobId, 3, 'requesting artifact…', false);
+  try {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+    const total = Number(r.headers.get('Content-Length') || 0);
+    const reader = r.body?.getReader();
+    if (!reader) {
+      const html = await r.text();
+      updateReportProgress(jobId, 90, 'rendering report…');
+      frame.src = URL.createObjectURL(new Blob([html], { type: 'text/html;charset=utf-8' }));
+    } else {
+      const chunks = [];
+      let received = 0;
+      updateReportProgress(jobId, total ? 0 : 0, total ? 'loading report…' : 'streaming report…', !total);
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        received += value.byteLength;
+        if (total) updateReportProgress(jobId, (received / total) * 92, `loading ${Math.round((received / total) * 100)}%`);
+      }
+      updateReportProgress(jobId, 96, 'rendering report…');
+      const blob = new Blob(chunks, { type: 'text/html;charset=utf-8' });
+      frame.src = URL.createObjectURL(blob);
+    }
+    frame.onload = () => {
+      updateReportProgress(jobId, 100, 'ready');
+      frame.classList.add('ready');
+      if (loader) setTimeout(() => loader.classList.add('done'), 120);
+    };
+  } catch (e) {
+    updateReportProgress(jobId, 100, `failed to load report: ${e.message || e}`, false);
+  }
+}
+
+function artifactUrl(job, kind) {
+  const key = kind === 'excel' ? 'excel_url' : 'html_url';
+  const url = job?.result?.[key];
+  if (!url) return '';
+  return apiUrl(url);
+}
+
+function artifactFilename(job, kind) {
+  return kind === 'excel' ? job?.result?.excel_filename : job?.result?.html_filename;
+}
+
+function setActionMessage(jobId, msg, cls='') {
+  const el = document.querySelector(`[data-action-msg="${jobId}"]`);
+  if (!el) return;
+  el.textContent = msg;
+  el.className = `action-msg ${cls}`;
+}
+
+function downloadArtifact(jobId, kind) {
+  const job = jobs.find(j => j.id === jobId);
+  const url = artifactUrl(job, kind);
+  if (!url) return;
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = artifactFilename(job, kind) || (kind === 'excel' ? 'estimate.xlsx' : 'estimate.html');
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setActionMessage(jobId, 'download requested', 'ok');
+}
+
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-artifact-kind]');
+  if (!btn) return;
+  e.preventDefault();
+  const jobId = btn.dataset.jobId;
+  const kind = btn.dataset.artifactKind;
+  downloadArtifact(jobId, kind);
+});
+
+function toggleSearchReport(jobId) {
+  const job = jobs.find(j => j.id === jobId);
+  if (!job?._searchData) return;
+  const card = document.getElementById('res-'+jobId);
+  const btn  = document.querySelector('[data-srch-report-btn="'+jobId+'"]');
+  let wrap   = document.getElementById('report-wrap-'+jobId);
+  if (!wrap) {
+    const html = buildSearchReport(job._searchData, job);
+    const url  = URL.createObjectURL(new Blob([html], { type: 'text/html;charset=utf-8' }));
+    wrap = document.createElement('div');
+    wrap.id = 'report-wrap-'+jobId;
+    wrap.className = 'report-wrap';
+    wrap.innerHTML = `<iframe class="report-frame" src="${url}"></iframe>`;
+    card.appendChild(wrap);
+    requestAnimationFrame(() => requestAnimationFrame(() => wrap.classList.add('open')));
+    if (btn) btn.textContent = 'Hide Report ▴';
+    return;
+  }
+  const isOpen = wrap.classList.toggle('open');
+  if (btn) btn.textContent = isOpen ? 'Hide Report ▴' : 'View Report ▾';
+}
+
+function buildSearchReport(r, job) {
+  const frontier = r.pareto_frontier || [];
+  const ts = job.finished_at ? new Date(job.finished_at).toLocaleString() : '';
+  const rows = frontier.map((d, i) => {
+    const cs = d.config_summary || {};
+    return `<tr${i===0?' class="hi"':''}><td>${i+1}</td><td>${esc(cs.strategy||'')}</td><td>${fmtMs(d.step_time_ms)}</td><td>${(d.mfu*100).toFixed(2)}%</td><td>${(d.hfu*100).toFixed(2)}%</td><td>${(d.bubble_fraction*100).toFixed(2)}%</td><td>${d.tokens_per_sec>0?fmtNum(d.tokens_per_sec):'—'}</td></tr>`;
+  }).join('');
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>ZRT Search — Pareto Frontier</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0d0d0d;background-image:radial-gradient(#262626 1px,transparent 1px);background-size:22px 22px;color:#ddd8cc;font-family:'Cascadia Code','Fira Code',ui-monospace,monospace;font-size:12px}
+.hdr{background:rgba(13,13,13,.95);border-bottom:1px solid #262626;padding:11px 32px;display:flex;align-items:center;gap:12px}
+.logo{width:24px;height:24px;border:1.5px solid #00b890;border-radius:3px;display:flex;align-items:center;justify-content:center;color:#00b890;font-size:10px;font-weight:700}
+.hdr-t{font-size:12px}.hdr-t em{color:#00b890;font-style:normal}.hdr-ts{margin-left:auto;font-size:10px;color:#5e5c59}
+.wrap{max-width:900px;margin:0 auto;padding:22px 32px;display:flex;flex-direction:column;gap:16px}
+.stats{display:flex;gap:12px}.stat{background:#141414;border:1px solid #262626;border-left:2px solid #006650;border-radius:3px;padding:10px 16px}
+.stat-l{font-size:9px;text-transform:uppercase;letter-spacing:0.8px;color:#5e5c59;margin-bottom:3px}.stat-v{font-size:18px;font-weight:700;color:#00b890}
+section{background:#141414;border:1px solid #262626;border-radius:3px;overflow:hidden}
+section h2{font-size:9px;text-transform:uppercase;letter-spacing:0.8px;color:#a09c96;padding:9px 16px;border-bottom:1px solid #262626;font-weight:normal}
+table{width:100%;border-collapse:collapse;font-size:11px}th{color:#5e5c59;font-weight:normal;text-align:right;padding:6px 12px;border-bottom:1px solid #262626}
+th:first-child,th:nth-child(2){text-align:left}td{padding:5px 12px;text-align:right;color:#ddd8cc;border-bottom:1px solid #1c1c1c}
+td:first-child{color:#5e5c59}td:nth-child(2){text-align:left}tr.hi td{color:#00b890}
+</style></head><body>
+<div class="hdr"><div class="logo">ZRT</div><div class="hdr-t">Search Report <em>/ Pareto Frontier</em></div><div class="hdr-ts">${ts}</div></div>
+<div class="wrap">
+  <div class="stats"><div class="stat"><div class="stat-l">configs searched</div><div class="stat-v">${r.total_configs||0}</div></div><div class="stat"><div class="stat-l">pareto optimal</div><div class="stat-v">${r.pareto_count||0}</div></div></div>
+  <section><h2>Pareto-optimal Configurations</h2>
+    <table><thead><tr><th>#</th><th>strategy</th><th>step time</th><th>MFU</th><th>HFU</th><th>bubble</th><th>tokens/s</th></tr></thead><tbody>${rows}</tbody></table>
+  </section>
+</div></body></html>`;
+}
+
+// ── Polling ────────────────────────────────────────────────────────────────────
+function poll(jobId, type) {
+  const start = Date.now();
+  const t = setInterval(async () => {
+    try {
+      const r = await fetch(api()+'/jobs/'+jobId);
+      if (!r.ok) { clearInterval(t); return; }
+      const updated = await r.json();
+      updated._type = type;
+      const idx = jobs.findIndex(j => j.id === jobId);
+      if (idx >= 0) Object.assign(jobs[idx], updated);
+      const el = document.getElementById('el-'+jobId);
+      if (el) el.textContent = ((Date.now()-start)/1000).toFixed(1)+'s';
+      refreshCard(updated);
+      if (idx >= 0) {
+        if (updated._searchData) jobs[idx]._searchData = updated._searchData;
+        if (updated._metric)     jobs[idx]._metric     = updated._metric;
+      }
+      renderHist();
+      if (updated.status === 'done' || updated.status === 'error') clearInterval(t);
+    } catch { clearInterval(t); }
+  }, 800);
+}
+
+// ── Utilities ──────────────────────────────────────────────────────────────────
+function fmtMs(v) {
+  if (!v || v <= 0) return '—';
+  if (v < 0.01) return (v*1000).toFixed(1)+'µs';
+  if (v < 1)    return v.toFixed(3)+'ms';
+  if (v < 1000) return v.toFixed(2)+'ms';
+  return (v/1000).toFixed(3)+'s';
+}
+function fmtNum(v) {
+  if (v >= 1e6) return (v/1e6).toFixed(2)+'M';
+  if (v >= 1e3) return (v/1e3).toFixed(1)+'K';
+  return v.toFixed(0);
+}
+function esc(s) {
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function inlineError(msg, type) {
+  const d = document.createElement('div');
+  d.className = 'result-card';
+  d.innerHTML = `<div class="job-bar"><div class="sdot error"></div><span class="job-type" style="color:var(--coral)">error</span></div><div class="err-body">${esc(msg)}</div>`;
+  const container = type === 'search' ? 'srch-results' : 'est-results';
+  document.getElementById(container).prepend(d);
+  updateCounts();
+}
+
+// ── Init ───────────────────────────────────────────────────────────────────────
+// Default API URL: same origin when served by the server, fallback to localhost
+const _defaultApi = (location.protocol === 'file:')
+  ? 'http://localhost:8000'
+  : (location.hostname === 'localhost' || location.hostname === '127.0.0.1')
+  ? 'http://localhost:8000'
+  : location.origin;
+document.getElementById('api-url').value = _defaultApi;
+
+loadPreset('est', 'llama3_70b');
+setEstimateRunState();
+checkHealth();
+setInterval(checkHealth, 30000);
+renderHist();
+</script>
+</body>
+</html>

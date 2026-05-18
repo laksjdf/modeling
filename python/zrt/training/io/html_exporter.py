@@ -361,580 +361,510 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ZRT Estimate — {title}</title>
+<title>ZRT — {title}</title>
 <style>
   :root {{
-    --bg: #1a1a2e;
-    --surface: #16213e;
-    --surface2: #0f3460;
-    --text: #e0e0e0;
-    --text-dim: #8899aa;
-    --accent: #e94560;
-    --accent2: #533483;
-    --green: #00b894;
-    --orange: #fdcb6e;
-    --border: #2a3a5e;
-    --dense-color: #0984e3;
-    --moe-color: #6c5ce7;
-    --mtp-color: #00b894;
-    --attn-bg: #1a2744;
-    --ffn-bg: #1a2a1a;
-    --indexer-bg: #2a1a3a;
-    --router-bg: #2a2a1a;
+    --bg: #0d0d0d;
+    --surface: #141414;
+    --surface-hi: #1c1c1c;
+    --border: #262626;
+    --border-hi: #363636;
+    --text: #ddd8cc;
+    --text-dim: #696560;
+    --text-muted: #3e3c3a;
+    --amber: #d48c0c;
+    --amber-bright: #f0a828;
+    --amber-dim: #7a5008;
+    --teal: #00b890;
+    --coral: #e04848;
+    --dense-tag-bg: #112a1c; --dense-tag-fg: #4ab870; --dense-tag-bd: #1a4428;
+    --moe-tag-bg: #280e38;   --moe-tag-fg: #9060d0; --moe-tag-bd: #3c1450;
+    --mtp-tag-bg: #0a2038;   --mtp-tag-fg: #3888d0; --mtp-tag-bd: #0e2e52;
+    --attn-stripe: #131820;
+    --ffn-stripe: #131a13;
+    --router-stripe: #1c1a10;
+    --r: 3px;
   }}
 
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
 
   body {{
     background: var(--bg);
+    background-image: radial-gradient(var(--border) 1px, transparent 1px);
+    background-size: 22px 22px;
     color: var(--text);
-    font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
-    font-size: 13px;
-    line-height: 1.5;
+    font-family: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', 'SF Mono', ui-monospace, monospace;
+    font-size: 12px;
+    line-height: 1.6;
   }}
 
-  .header {{
-    background: var(--surface);
+  /* ── HEADER ── */
+  .hdr {{
+    position: sticky; top: 0; z-index: 100;
+    background: rgba(13,13,13,0.94);
+    backdrop-filter: blur(14px);
     border-bottom: 1px solid var(--border);
-    padding: 16px 24px;
-    position: sticky;
-    top: 0;
-    z-index: 100;
+    padding: 12px 26px;
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
   }}
-  .header h1 {{ font-size: 18px; color: #fff; }}
-  .header .stats {{ display: flex; gap: 24px; margin-top: 8px; flex-wrap: wrap; }}
-  .header .stat {{ color: var(--text-dim); }}
-  .header .stat span {{ color: #fff; font-weight: bold; }}
+  .hdr-logo {{
+    width: 26px; height: 26px;
+    border: 1.5px solid var(--amber); border-radius: 3px;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--amber); font-size: 10px; font-weight: 700; letter-spacing: 0.5px;
+    flex-shrink: 0;
+  }}
+  .hdr-title {{ font-size: 12px; color: var(--text); letter-spacing: 0.3px; }}
+  .hdr-title em {{ color: var(--amber); font-style: normal; }}
+  .hdr-meta {{ display: flex; gap: 18px; margin-left: auto; flex-wrap: wrap; }}
+  .hdr-stat {{ color: var(--text-dim); font-size: 10px; }}
+  .hdr-stat b {{ color: var(--amber-bright); font-weight: 600; }}
 
+  /* ── TOOLBAR ── */
   .toolbar {{
-    padding: 12px 24px;
-    background: var(--surface);
+    position: sticky; top: 51px; z-index: 99;
+    background: rgba(13,13,13,0.90);
+    backdrop-filter: blur(8px);
     border-bottom: 1px solid var(--border);
-    display: flex;
-    gap: 12px;
-    align-items: center;
-    flex-wrap: wrap;
+    padding: 7px 26px;
+    display: flex; gap: 4px; align-items: center;
   }}
-  .toolbar button {{
-    background: var(--surface2);
-    color: var(--text);
+  .tb-btn {{
+    background: transparent;
+    color: var(--text-dim);
     border: 1px solid var(--border);
-    padding: 6px 14px;
-    border-radius: 4px;
-    cursor: pointer;
-    font-size: 12px;
+    padding: 3px 11px; border-radius: var(--r);
+    cursor: pointer; font: inherit; font-size: 11px; letter-spacing: 0.2px;
+    transition: color 0.1s, border-color 0.1s, background 0.1s;
   }}
-  .toolbar button:hover {{ background: var(--accent); border-color: var(--accent); }}
-  .toolbar .filter {{
-    background: var(--bg);
-    color: var(--text);
-    border: 1px solid var(--border);
-    padding: 6px 10px;
-    border-radius: 4px;
-    font-size: 12px;
+  .tb-btn:hover, .tb-btn.on {{
+    color: var(--amber); border-color: var(--amber-dim);
+    background: rgba(212,140,12,0.07);
   }}
+  .tb-sep {{ width: 1px; height: 14px; background: var(--border); margin: 0 5px; }}
+  .tb-search {{
+    background: var(--surface); color: var(--text);
+    border: 1px solid var(--border); padding: 3px 9px;
+    border-radius: var(--r); font: inherit; font-size: 11px; width: 190px;
+    transition: border-color 0.12s;
+  }}
+  .tb-search:focus {{ outline: none; border-color: var(--amber-dim); }}
+  .tb-search::placeholder {{ color: var(--text-muted); }}
+  .tb-hint {{ color: var(--text-muted); font-size: 10px; margin-left: 4px; }}
 
-  .container {{ padding: 16px 24px; }}
+  /* ── CONTAINER ── */
+  .wrap {{ padding: 18px 26px; max-width: 1440px; margin: 0 auto; }}
 
-  /* Global ops bar */
-  .global-ops {{
-    display: flex;
-    gap: 8px;
-    margin-bottom: 16px;
-    flex-wrap: wrap;
-  }}
-  .global-ops .op-chip {{
-    background: var(--surface2);
-    border: 1px solid var(--border);
-    padding: 4px 10px;
-    border-radius: 4px;
-    font-size: 11px;
-  }}
-  .global-ops .op-chip .time {{ color: var(--orange); }}
-
-  /* Layer */
-  .layer {{
-    margin-bottom: 8px;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    overflow: hidden;
-  }}
-  .layer-header {{
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    padding: 8px 14px;
-    cursor: pointer;
-    user-select: none;
-    background: var(--surface);
-    transition: background 0.15s;
-  }}
-  .layer-header:hover {{ background: var(--surface2); }}
-  .layer-header .kind {{
-    font-size: 11px;
-    padding: 2px 8px;
-    border-radius: 3px;
-    font-weight: bold;
-    text-transform: uppercase;
-  }}
-  .layer-header .kind.dense {{ background: var(--dense-color); color: #fff; }}
-  .layer-header .kind.moe {{ background: var(--moe-color); color: #fff; }}
-  .layer-header .kind.mtp {{ background: var(--mtp-color); color: #1a1a2e; }}
-  .layer-header .idx {{ color: var(--text-dim); min-width: 50px; }}
-  .layer-header .ops-count {{ color: var(--text-dim); font-size: 11px; }}
-  .layer-header .total-ms {{ color: var(--orange); font-size: 11px; }}
-  .layer-header .arrow {{ color: var(--text-dim); transition: transform 0.2s; }}
-  .layer-header.open .arrow {{ transform: rotate(90deg); }}
-
-  .layer-body {{ display: none; background: var(--bg); }}
-  .layer-body.open {{ display: block; }}
-
-  /* Block */
-  .block {{
-    margin: 4px 8px;
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    overflow: hidden;
-  }}
-  .block-header {{
-    padding: 6px 12px;
-    cursor: pointer;
-    user-select: none;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    transition: background 0.15s;
-  }}
-  .block-header:hover {{ filter: brightness(1.2); }}
-  .block-header.attn {{ background: var(--attn-bg); }}
-  .block-header.ffn {{ background: var(--ffn-bg); }}
-  .block-header.indexer {{ background: var(--indexer-bg); }}
-  .block-header.router {{ background: var(--router-bg); }}
-  .block-header .arrow {{ color: var(--text-dim); font-size: 10px; transition: transform 0.2s; }}
-  .block-header.open .arrow {{ transform: rotate(90deg); }}
-  .block-header .name {{ font-size: 12px; color: var(--text-dim); }}
-  .block-header .time {{ color: var(--orange); font-size: 11px; margin-left: auto; }}
-
-  .block-body {{ display: none; padding: 4px; }}
-  .block-body.open {{ display: block; }}
-
-  /* Op node */
-  .op-node {{
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 4px 10px;
-    margin: 2px 0;
-    background: var(--surface);
-    border-radius: 3px;
-    font-size: 12px;
-    position: relative;
-  }}
-  .op-node::before {{
-    content: '';
-    position: absolute;
-    left: 16px;
-    top: -4px;
-    bottom: -4px;
-    width: 1px;
-    background: var(--border);
-  }}
-  .op-node:first-child::before {{ display: none; }}
-  .op-node .kind-tag {{
-    font-size: 10px;
-    padding: 1px 6px;
-    border-radius: 2px;
-    min-width: 80px;
-    text-align: center;
-  }}
-  .op-node .kind-tag.matmul {{ background: #2d5a8e; color: #fff; }}
-  .op-node .kind-tag.rmsnorm {{ background: #4a4a6a; color: #ddd; }}
-  .op-node .kind-tag.attn_core {{ background: #8e2d5a; color: #fff; }}
-  .op-node .kind-tag.sparse_attn {{ background: #8e2d5a; color: #fff; }}
-  .op-node .kind-tag.swiglu {{ background: #4a8e2d; color: #fff; }}
-  .op-node .kind-tag.add {{ background: #4a6a4a; color: #ddd; }}
-  .op-node .kind-tag.rope {{ background: #6a4a8e; color: #fff; }}
-  .op-node .kind-tag.indexer_topk {{ background: #8e5a2d; color: #fff; }}
-  .op-node .kind-tag.compressor_pool {{ background: #8e5a2d; color: #ddd; }}
-  .op-node .kind-tag.softmax {{ background: #6a6a2a; color: #fff; }}
-  .op-node .kind-tag.embed {{ background: #2d8e5a; color: #fff; }}
-  .op-node .kind-tag.lm_head {{ background: #2d8e5a; color: #fff; }}
-  .op-node .kind-tag.hash_route {{ background: #3a3a3a; color: #888; }}
-  .op-node .name {{ color: var(--text); min-width: 180px; }}
-  .op-node .flops {{ color: var(--text-dim); min-width: 100px; font-size: 11px; }}
-  .op-node .time-bar {{
-    flex: 1;
-    height: 8px;
-    background: var(--bg);
-    border-radius: 2px;
-    overflow: hidden;
-    min-width: 80px;
-  }}
-  .op-node .time-bar .fill {{
-    height: 100%;
-    border-radius: 2px;
-    transition: width 0.3s;
-  }}
-  .op-node .time-bar .fill.compute {{ background: var(--accent); }}
-  .op-node .time-bar .fill.memory {{ background: var(--accent2); }}
-  .op-node .ms {{ color: var(--orange); min-width: 60px; text-align: right; font-size: 11px; }}
-  .op-node .pct {{ color: var(--text-dim); min-width: 40px; text-align: right; font-size: 10px; }}
-
-  /* Bar chart view */
-  .bar-chart {{
-    margin: 8px 0;
-    padding: 0 12px;
-  }}
-  .bar-chart .bar-row {{
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin: 2px 0;
-    font-size: 11px;
-  }}
-  .bar-chart .bar-label {{ min-width: 120px; color: var(--text-dim); }}
-  .bar-chart .bar {{
-    height: 14px;
-    border-radius: 2px;
-    min-width: 2px;
-    transition: width 0.3s;
-  }}
-  .bar-chart .bar.compute {{ background: var(--accent); }}
-  .bar-chart .bar.memory {{ background: var(--accent2); }}
-  .bar-chart .bar-val {{ min-width: 60px; color: var(--orange); }}
-
-  /* Summary cards */
-  .summary-cards {{
+  /* ── METRICS ── */
+  .metrics {{
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-    gap: 12px;
-    margin-bottom: 16px;
+    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    gap: 1px; background: var(--border);
+    border: 1px solid var(--border); border-radius: var(--r);
+    overflow: hidden; margin-bottom: 18px;
   }}
-  .card {{
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 12px;
+  .metric {{
+    background: var(--surface); padding: 12px 14px; position: relative;
   }}
-  .card .label {{ color: var(--text-dim); font-size: 11px; }}
-  .card .value {{ color: #fff; font-size: 20px; font-weight: bold; margin-top: 4px; }}
-  .card .unit {{ color: var(--text-dim); font-size: 12px; }}
+  .metric::before {{
+    content: ''; position: absolute;
+    top: 0; left: 0; width: 2px; height: 100%;
+    background: var(--amber-dim);
+  }}
+  .metric-lbl {{ color: var(--text-dim); font-size: 9px; letter-spacing: 0.9px; text-transform: uppercase; margin-bottom: 5px; }}
+  .metric-val {{ font-size: 20px; font-weight: 700; color: var(--amber-bright); line-height: 1; letter-spacing: -0.5px; }}
 
-  /* Tooltip */
-  .tooltip {{
-    display: none;
-    position: fixed;
-    background: var(--surface2);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 10px;
-    font-size: 11px;
-    z-index: 200;
-    max-width: 320px;
-    box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+  /* ── GLOBAL OPS ── */
+  .global-bar {{
+    display: flex; gap: 6px; margin-bottom: 14px;
+    padding: 7px 12px; background: var(--surface);
+    border: 1px solid var(--border); border-radius: var(--r); flex-wrap: wrap;
+    align-items: center;
   }}
-  .tooltip.show {{ display: block; }}
-  .tooltip .row {{ display: flex; justify-content: space-between; gap: 16px; margin: 2px 0; }}
-  .tooltip .row .k {{ color: var(--text-dim); }}
-  .tooltip .row .v {{ color: #fff; }}
+  .global-lbl {{ color: var(--text-muted); font-size: 9px; letter-spacing: 0.6px; text-transform: uppercase; margin-right: 4px; }}
+  .op-chip {{
+    background: var(--bg); border: 1px solid var(--border);
+    padding: 2px 7px; border-radius: 2px;
+    font-size: 10px; color: var(--text-dim); transition: border-color 0.1s;
+  }}
+  .op-chip:hover {{ border-color: var(--amber-dim); color: var(--text); }}
+  .chip-time {{ color: var(--amber); margin-left: 4px; }}
 
-  .search-hint {{ color: var(--text-dim); font-size: 11px; }}
+  /* ── LAYER ── */
+  .layer {{ margin-bottom: 3px; border: 1px solid var(--border); border-radius: var(--r); overflow: hidden; transition: border-color 0.1s; }}
+  .layer:hover {{ border-color: var(--border-hi); }}
+
+  .layer-hdr {{
+    display: grid;
+    grid-template-columns: 14px 48px 52px 1fr 72px 100px;
+    align-items: center; gap: 10px;
+    padding: 6px 14px; cursor: pointer; user-select: none;
+    background: var(--surface); transition: background 0.1s;
+  }}
+  .layer-hdr:hover {{ background: var(--surface-hi); }}
+  .layer-arrow {{ color: var(--text-muted); font-size: 8px; transition: transform 0.18s cubic-bezier(.4,0,.2,1); }}
+  .layer-hdr.open .layer-arrow {{ transform: rotate(90deg); color: var(--amber); }}
+  .layer-idx {{ color: var(--text-dim); font-size: 10px; }}
+  .layer-kind {{
+    font-size: 9px; padding: 2px 5px; border-radius: 2px;
+    font-weight: 700; letter-spacing: 0.7px; text-transform: uppercase; text-align: center;
+  }}
+  .layer-kind.dense {{ background: var(--dense-tag-bg); color: var(--dense-tag-fg); border: 1px solid var(--dense-tag-bd); }}
+  .layer-kind.moe   {{ background: var(--moe-tag-bg);   color: var(--moe-tag-fg);   border: 1px solid var(--moe-tag-bd); }}
+  .layer-kind.mtp   {{ background: var(--mtp-tag-bg);   color: var(--mtp-tag-fg);   border: 1px solid var(--mtp-tag-bd); }}
+  .layer-timebar {{ height: 2px; background: var(--border); border-radius: 1px; overflow: hidden; }}
+  .layer-timebar-fill {{ height: 100%; background: var(--amber); opacity: 0.5; border-radius: 1px; }}
+  .layer-opcount {{ color: var(--text-muted); font-size: 10px; text-align: right; white-space: nowrap; }}
+  .layer-ms {{ color: var(--amber); font-size: 10px; text-align: right; white-space: nowrap; }}
+  .layer-ms span {{ color: var(--text-muted); }}
+
+  .layer-body {{ max-height: 0; overflow: hidden; transition: max-height 0.22s cubic-bezier(.4,0,.2,1); background: var(--bg); }}
+  .layer-body.open {{ max-height: 9999px; transition: max-height 0.45s cubic-bezier(.4,0,.2,1); }}
+
+  /* ── BLOCK ── */
+  .block {{ margin: 3px 8px; border-radius: 2px; overflow: hidden; border-left: 2px solid var(--border); }}
+  .block.attn    {{ border-left-color: #204060; }}
+  .block.ffn     {{ border-left-color: #1e4020; }}
+  .block.router  {{ border-left-color: #504018; }}
+  .block.indexer {{ border-left-color: #402e10; }}
+
+  .block-hdr {{
+    display: flex; align-items: center; gap: 8px;
+    padding: 4px 10px; cursor: pointer; user-select: none;
+    background: var(--surface); font-size: 11px; transition: background 0.1s;
+  }}
+  .block-hdr:hover {{ background: var(--surface-hi); }}
+  .block.attn   .block-hdr {{ background: var(--attn-stripe); }}
+  .block.ffn    .block-hdr {{ background: var(--ffn-stripe); }}
+  .block.router .block-hdr {{ background: var(--router-stripe); }}
+  .block-arrow {{ color: var(--text-muted); font-size: 8px; transition: transform 0.14s; }}
+  .block-hdr.open .block-arrow {{ transform: rotate(90deg); }}
+  .block-name {{ color: var(--text-dim); }}
+  .block-time {{ margin-left: auto; color: var(--amber); font-size: 10px; }}
+
+  .block-body {{ max-height: 0; overflow: hidden; transition: max-height 0.18s cubic-bezier(.4,0,.2,1); }}
+  .block-body.open {{ max-height: 5000px; transition: max-height 0.35s cubic-bezier(.4,0,.2,1); padding: 3px 4px 4px; }}
+
+  /* ── OP NODE ── */
+  .op-node {{
+    display: grid;
+    grid-template-columns: 88px 158px 86px 1fr 58px 34px;
+    align-items: center; gap: 8px;
+    padding: 3px 8px; margin: 1px 0;
+    background: var(--surface); border-radius: 2px;
+    transition: background 0.08s;
+  }}
+  .op-node:hover {{ background: var(--surface-hi); }}
+  .op-node.hidden {{ display: none; }}
+
+  .kind-tag {{
+    font-size: 9px; padding: 1px 5px; border-radius: 2px;
+    text-align: center; font-weight: 600; letter-spacing: 0.2px;
+    border: 1px solid transparent;
+  }}
+  .kind-tag.matmul         {{ background:#0c2040; color:#4898e0; border-color:#1a3660; }}
+  .kind-tag.lm_head        {{ background:#0c2040; color:#4898e0; border-color:#1a3660; }}
+  .kind-tag.attn_core      {{ background:#280c30; color:#c060e8; border-color:#481450; }}
+  .kind-tag.sparse_attn    {{ background:#280c30; color:#c060e8; border-color:#481450; }}
+  .kind-tag.hca_attn       {{ background:#280c30; color:#c060e8; border-color:#481450; }}
+  .kind-tag.swa_attn       {{ background:#280c30; color:#c060e8; border-color:#481450; }}
+  .kind-tag.rmsnorm        {{ background:#1c1c1c; color:#686460; border-color:#2c2c2c; }}
+  .kind-tag.ln             {{ background:#1c1c1c; color:#686460; border-color:#2c2c2c; }}
+  .kind-tag.swiglu         {{ background:#0c2416; color:#40c870; border-color:#184428; }}
+  .kind-tag.add            {{ background:#161616; color:#505050; border-color:#242424; }}
+  .kind-tag.rope           {{ background:#180e2c; color:#7060c8; border-color:#2c1e48; }}
+  .kind-tag.indexer_topk   {{ background:#281600; color:#c08020; border-color:#442c00; }}
+  .kind-tag.compressor_pool{{ background:#281600; color:#c08020; border-color:#442c00; }}
+  .kind-tag.softmax        {{ background:#181800; color:#a0a020; border-color:#2c2c08; }}
+  .kind-tag.embed          {{ background:#001620; color:#00a8c0; border-color:#002c40; }}
+  .kind-tag.hash_route     {{ background:#161616; color:#383838; border-color:#242424; }}
+  .kind-tag.mhc_pre        {{ background:#1c0e1e; color:#8050a8; border-color:#341c3c; }}
+  .kind-tag.mhc_post       {{ background:#1c0e1e; color:#8050a8; border-color:#341c3c; }}
+  .kind-tag.mhc_head       {{ background:#1c0e1e; color:#8050a8; border-color:#341c3c; }}
+
+  .op-name {{ color: var(--text); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+  .op-flops {{ color: var(--text-dim); font-size: 10px; text-align: right; }}
+
+  .op-segbar {{ height: 5px; background: var(--border); border-radius: 1px; overflow: hidden; display: flex; }}
+  .op-segbar .seg {{ height: 100%; }}
+  .op-segbar .seg.fwd {{ background: var(--teal); }}
+  .op-segbar .seg.dx  {{ background: var(--amber); }}
+  .op-segbar .seg.dw  {{ background: var(--coral); }}
+
+  .op-ms  {{ color: var(--amber); font-size: 10px; text-align: right; }}
+  .op-pct {{ color: var(--text-muted); font-size: 9px; text-align: right; }}
+
+  /* ── CHART VIEW ── */
+  .chart-section {{ margin-bottom: 22px; }}
+  .chart-title {{
+    font-size: 9px; letter-spacing: 0.9px; text-transform: uppercase;
+    color: var(--text-dim); margin-bottom: 8px;
+    padding-bottom: 5px; border-bottom: 1px solid var(--border);
+  }}
+  .chart-row {{
+    display: grid; grid-template-columns: 155px 1fr 80px;
+    align-items: center; gap: 10px; margin: 2px 0; font-size: 10px;
+  }}
+  .chart-lbl {{ color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+  .chart-wrap {{ background: var(--surface); height: 9px; border-radius: 1px; overflow: hidden; }}
+  .chart-bar {{ height: 100%; border-radius: 1px; }}
+  .chart-bar.compute {{ background: var(--teal); opacity: 0.75; }}
+  .chart-bar.memory  {{ background: var(--amber); opacity: 0.75; }}
+  .chart-val {{ color: var(--amber); text-align: right; }}
+
+  /* ── TOOLTIP ── */
+  #tooltip {{
+    display: none; position: fixed;
+    background: #111; border: 1px solid var(--border-hi);
+    border-radius: var(--r); padding: 10px 14px;
+    font-size: 11px; z-index: 1000; max-width: 360px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.85), 0 0 0 1px rgba(212,140,12,0.08);
+    pointer-events: none;
+  }}
+  #tooltip.show {{ display: block; animation: tip-in 0.1s ease; }}
+  @keyframes tip-in {{ from {{ opacity:0; transform:translateY(3px); }} to {{ opacity:1; transform:none; }} }}
+  .tip-name {{ color: var(--amber-bright); font-weight: 600; margin-bottom: 7px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }}
+  .tip-row {{ display: grid; grid-template-columns: 86px 1fr; gap: 6px; margin: 2px 0; align-items: start; }}
+  .tip-k {{ color: var(--text-dim); }}
+  .tip-v {{ color: var(--text); word-break: break-all; }}
+  .tip-timing {{
+    display: grid; grid-template-columns: repeat(3,1fr); gap: 6px;
+    margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border);
+  }}
+  .tip-tc {{ text-align: center; }}
+  .tip-tc .tv {{ font-size: 13px; font-weight: 600; line-height: 1; }}
+  .tip-tc .tl {{ font-size: 9px; color: var(--text-dim); letter-spacing: 0.5px; text-transform: uppercase; margin-top: 3px; }}
+  .tip-tc.fwd .tv {{ color: var(--teal); }}
+  .tip-tc.dx  .tv {{ color: var(--amber); }}
+  .tip-tc.dw  .tv {{ color: var(--coral); }}
 </style>
 </head>
 <body>
 
-<div class="header">
-  <h1>ZRT Training Estimate</h1>
-  <div class="stats" id="header-stats"></div>
+<div class="hdr">
+  <div class="hdr-logo">ZRT</div>
+  <div class="hdr-title">Training Estimate <em>/ {title}</em></div>
+  <div class="hdr-meta" id="hdr-meta"></div>
 </div>
 
 <div class="toolbar">
-  <button onclick="expandAll()">Expand All</button>
-  <button onclick="collapseAll()">Collapse All</button>
-  <button onclick="showChart()">Bar Chart</button>
-  <button onclick="showTree()">Tree View</button>
-  <input type="text" class="filter" id="search" placeholder="Search op name..." oninput="filterOps()">
-  <span class="search-hint">Press / to focus search</span>
+  <button class="tb-btn" onclick="expandAll()">expand all</button>
+  <button class="tb-btn" onclick="collapseAll()">collapse all</button>
+  <div class="tb-sep"></div>
+  <button class="tb-btn on" id="btn-tree" onclick="showTree()">tree</button>
+  <button class="tb-btn" id="btn-chart" onclick="showChart()">chart</button>
+  <div class="tb-sep"></div>
+  <input type="text" class="tb-search" id="search" placeholder="/ search ops…" oninput="filterOps()">
+  <span class="tb-hint">esc clears</span>
 </div>
 
-<div class="container" id="main"></div>
-
-<div class="tooltip" id="tooltip"></div>
+<div class="wrap" id="main"></div>
+<div id="tooltip"></div>
 
 <script>
 const DATA = {json_data};
-const STEP_TIME_MS = {step_time_ms};
+const STEP_MS = {step_time_ms};
 
-function fmtFlops(v) {{
-  if (v <= 0) return '-';
-  if (v >= 1e15) return (v/1e15).toFixed(2) + ' PF';
-  if (v >= 1e12) return (v/1e12).toFixed(2) + ' TF';
-  if (v >= 1e9) return (v/1e9).toFixed(2) + ' GF';
-  if (v >= 1e6) return (v/1e6).toFixed(2) + ' MF';
+function fmtF(v) {{
+  if (v <= 0) return '—';
+  if (v >= 1e15) return (v/1e15).toFixed(2)+'P';
+  if (v >= 1e12) return (v/1e12).toFixed(2)+'T';
+  if (v >= 1e9)  return (v/1e9).toFixed(2)+'G';
+  if (v >= 1e6)  return (v/1e6).toFixed(2)+'M';
   return v.toFixed(0);
 }}
 
 function fmtMs(v) {{
-  if (v < 0.01) return (v * 1000).toFixed(1) + ' us';
-  if (v < 1) return v.toFixed(2) + ' ms';
-  if (v < 1000) return v.toFixed(2) + ' ms';
-  return (v / 1000).toFixed(2) + ' s';
+  if (v <= 0) return '—';
+  if (v < 0.01) return (v*1000).toFixed(1)+'µs';
+  if (v < 1)    return v.toFixed(3)+'ms';
+  if (v < 1000) return v.toFixed(2)+'ms';
+  return (v/1000).toFixed(3)+'s';
 }}
 
-  function getBlockClass(name) {
-    const n = name.toLowerCase();
-    if (n.includes('router')) return 'router';
-    if (n.includes('routed expert')) return 'router';
-    if (n.includes('shared')) return 'router';
-    if (n.includes('indexer')) return 'indexer';
-    if (n.includes('attention') || n.includes('attn')) return 'attn';
-    if (n.includes('ffn')) return 'ffn';
-    return 'attn';
-  }
+function blkCls(name) {{
+  const n = name.toLowerCase();
+  if (n.includes('router')||n.includes('routed')||n.includes('shared')) return 'router';
+  if (n.includes('indexer')) return 'indexer';
+  if (n.includes('attn')||n.includes('attention')) return 'attn';
+  return 'ffn';
+}}
 
-function buildGlobalOps() {{
+function kindCls(k) {{ return k.replace(/[^a-z0-9_]/gi,'_'); }}
+
+function buildMetrics() {{
+  const nD = DATA.layers.filter(l=>l.kind==='dense').length;
+  const nM = DATA.layers.filter(l=>l.kind==='moe').length;
+  document.getElementById('hdr-meta').innerHTML =
+    `<div class="hdr-stat">step <b>${{fmtMs(STEP_MS)}}</b></div>` +
+    `<div class="hdr-stat">layers <b>${{DATA.layers.length}}</b></div>` +
+    `<div class="hdr-stat">ops <b>${{DATA.total_ops}}</b></div>`;
+  return `<div class="metrics">
+    <div class="metric"><div class="metric-lbl">Step Time</div><div class="metric-val">${{fmtMs(STEP_MS)}}</div></div>
+    <div class="metric"><div class="metric-lbl">Layers</div><div class="metric-val">${{DATA.layers.length}}</div></div>
+    <div class="metric"><div class="metric-lbl">Dense</div><div class="metric-val">${{nD}}</div></div>
+    <div class="metric"><div class="metric-lbl">MoE</div><div class="metric-val">${{nM}}</div></div>
+    <div class="metric"><div class="metric-lbl">Total Ops</div><div class="metric-val">${{DATA.total_ops}}</div></div>
+  </div>`;
+}}
+
+function buildGlobal() {{
   if (!DATA.global_ops.length) return '';
-  let html = '<div class="global-ops"><b style="color:var(--text-dim)">Global ops:</b>';
+  let h = '<div class="global-bar"><span class="global-lbl">global</span>';
   for (const op of DATA.global_ops) {{
-    const pct = STEP_TIME_MS > 0 ? (op.total_ms / STEP_TIME_MS * 100) : 0;
-    html += `<div class="op-chip">${{op.name}} <span class="time">(${{fmtMs(op.total_ms)}}, ${{pct.toFixed(1)}}%)</span></div>`;
+    const pct = STEP_MS > 0 ? (op.total_ms/STEP_MS*100).toFixed(1) : '0.0';
+    const td = JSON.stringify(op).replace(/"/g,'&quot;');
+    h += `<div class="op-chip" onmouseenter="showTip(event,${{td}})" onmouseleave="hideTip()">${{op.name}}<span class="chip-time">${{fmtMs(op.total_ms)}} ${{pct}}%</span></div>`;
   }}
-  html += '</div>';
-  return html;
+  return h+'</div>';
 }}
 
-function buildOpNode(op, blockTotalMs) {{
-  const pct = blockTotalMs > 0 ? (op.total_ms / blockTotalMs * 100) : 0;
-  const cls = op.kind.replace(/[^a-z]/g, '_');
-  return `
-    <div class="op-node" data-name="${{op.name.toLowerCase()}}"
-         onmouseenter="showTooltip(event, ${JSON.stringify(op).replace(/"/g, '&quot;')})"
-         onmouseleave="hideTooltip()">
-      <span class="kind-tag ${{cls}}">${{op.kind}}</span>
-      <span class="name">${{op.name}}</span>
-      <span class="flops">${{fmtFlops(op.fwd_flops)}}</span>
-      <div class="time-bar"><div class="fill ${{op.bound}}" style="width:${{pct}}%"></div></div>
-      <span class="ms">${{fmtMs(op.total_ms)}}</span>
-      <span class="pct">${{pct.toFixed(1)}}%</span>
-    </div>`;
+function buildOp(op, blkTotal) {{
+  const tot = op.fwd_ms + op.dx_ms + op.dw_ms;
+  const fw = tot>0 ? (op.fwd_ms/tot*100).toFixed(1) : 0;
+  const dxw= tot>0 ? (op.dx_ms/tot*100).toFixed(1) : 0;
+  const dww= tot>0 ? (op.dw_ms/tot*100).toFixed(1) : 0;
+  const pct= blkTotal>0 ? (op.total_ms/blkTotal*100).toFixed(0) : 0;
+  const td = JSON.stringify(op).replace(/"/g,'&quot;');
+  return `<div class="op-node" data-name="${{op.name.toLowerCase()}}"
+    onmouseenter="showTip(event,${{td}})" onmouseleave="hideTip()">
+    <span class="kind-tag ${{kindCls(op.kind)}}">${{op.kind}}</span>
+    <span class="op-name" title="${{op.name}}">${{op.name}}</span>
+    <span class="op-flops">${{fmtF(op.fwd_flops)}}</span>
+    <div class="op-segbar">
+      <div class="seg fwd" style="width:${{fw}}%"></div>
+      <div class="seg dx"  style="width:${{dxw}}%"></div>
+      <div class="seg dw"  style="width:${{dww}}%"></div>
+    </div>
+    <span class="op-ms">${{fmtMs(op.total_ms)}}</span>
+    <span class="op-pct">${{pct}}%</span>
+  </div>`;
 }}
 
-function buildLayer(layer, modelTotalMs) {{
-  const layerTotal = layer.blocks.reduce((s, b) => s + b.total_ms, 0);
-  const pct = modelTotalMs > 0 ? (layerTotal / modelTotalMs * 100) : 0;
+let modelMs = 0;
 
-  let html = `<div class="layer" data-kind="${{layer.kind}}">`;
-  html += `<div class="layer-header" onclick="toggleLayer(this)">`;
-  html += `<span class="arrow">▶</span>`;
-  html += `<span class="idx">L${{layer.id}}</span>`;
-  html += `<span class="kind ${{layer.kind}}">${{layer.kind}}</span>`;
-  html += `<span class="ops-count">${{layer.op_count}} ops</span>`;
-  html += `<span class="total-ms">${{fmtMs(layerTotal)}} (${{pct.toFixed(1)}}%)</span>`;
-  html += `</div>`;
-  html += `<div class="layer-body">`;
-
+function buildLayer(layer) {{
+  const lt = layer.blocks.reduce((s,b)=>s+b.total_ms,0);
+  const pct = modelMs>0 ? (lt/modelMs*100).toFixed(1) : 0;
+  const bw  = modelMs>0 ? (lt/modelMs*100).toFixed(1) : 0;
+  let h = `<div class="layer" data-kind="${{layer.kind}}">
+    <div class="layer-hdr" onclick="toggleLayer(this)">
+      <span class="layer-arrow">▶</span>
+      <span class="layer-idx">L${{layer.id}}</span>
+      <span class="layer-kind ${{layer.kind}}">${{layer.kind}}</span>
+      <div class="layer-timebar"><div class="layer-timebar-fill" style="width:${{bw}}%"></div></div>
+      <span class="layer-opcount">${{layer.op_count}} ops</span>
+      <span class="layer-ms">${{fmtMs(lt)}} <span>(${{pct}}%)</span></span>
+    </div>
+    <div class="layer-body">`;
   for (const blk of layer.blocks) {{
-    const bcls = getBlockClass(blk.name);
-    const blkPct = layerTotal > 0 ? (blk.total_ms / layerTotal * 100) : 0;
-    html += `<div class="block">`;
-    html += `<div class="block-header ${{bcls}}" onclick="toggleBlock(this)">`;
-    html += `<span class="arrow">▶</span>`;
-    html += `<span class="name">${{blk.name}}</span>`;
-    html += `<span class="time">${{fmtMs(blk.total_ms)}} (${{blkPct.toFixed(1)}}%)</span>`;
-    html += `</div>`;
-    html += `<div class="block-body">`;
-    for (const op of blk.ops) {{
-      html += buildOpNode(op, blk.total_ms);
-    }}
-    html += `</div></div>`;
+    const bc = blkCls(blk.name);
+    const bp = lt>0 ? (blk.total_ms/lt*100).toFixed(1) : 0;
+    h += `<div class="block ${{bc}}">
+      <div class="block-hdr" onclick="toggleBlock(this)">
+        <span class="block-arrow">▶</span>
+        <span class="block-name">${{blk.name}}</span>
+        <span class="block-time">${{fmtMs(blk.total_ms)}} (${{bp}}%)</span>
+      </div>
+      <div class="block-body">`;
+    for (const op of blk.ops) h += buildOp(op, blk.total_ms);
+    h += `</div></div>`;
   }}
-
-  html += `</div></div>`;
-  return html;
+  h += `</div></div>`;
+  return h;
 }}
 
 function renderTree() {{
-  let html = '';
-
-  // Summary cards
-  const stepT = STEP_TIME_MS;
-  html += `<div class="summary-cards">`;
-  html += `<div class="card"><div class="label">Step Time</div><div class="value">${{fmtMs(stepT)}}</div></div>`;
-  html += `<div class="card"><div class="label">Total Ops</div><div class="value">${{DATA.total_ops}}</div></div>`;
-  html += `<div class="card"><div class="label">Layers</div><div class="value">${{DATA.layers.length}}</div></div>`;
-  html += `<div class="card"><div class="label">Dense</div><div class="value">${{DATA.layers.filter(l=>l.kind==='dense').length}}</div></div>`;
-  html += `<div class="card"><div class="label">MoE</div><div class="value">${{DATA.layers.filter(l=>l.kind==='moe').length}}</div></div>`;
-  html += `</div>`;
-
-  // Global ops
-  html += buildGlobalOps();
-
-  // Calculate total model time (sum of all layers)
-  let modelTotalMs = 0;
-  for (const layer of DATA.layers) {{
-    modelTotalMs += layer.blocks.reduce((s, b) => s + b.total_ms, 0);
-  }}
-
-  // Layers
-  for (const layer of DATA.layers) {{
-    html += buildLayer(layer, modelTotalMs);
-  }}
-
-  document.getElementById('main').innerHTML = html;
+  document.getElementById('btn-tree').classList.add('on');
+  document.getElementById('btn-chart').classList.remove('on');
+  modelMs = DATA.layers.reduce((s,l)=>s+l.blocks.reduce((ss,b)=>ss+b.total_ms,0),0);
+  let h = buildMetrics() + buildGlobal();
+  for (const layer of DATA.layers) h += buildLayer(layer);
+  document.getElementById('main').innerHTML = h;
 }}
 
 function renderChart() {{
-  // Aggregate time by op kind across all ops
-  const kindMap = {{}};
-  for (const layer of DATA.layers) {{
-    for (const blk of layer.blocks) {{
+  document.getElementById('btn-chart').classList.add('on');
+  document.getElementById('btn-tree').classList.remove('on');
+  const km = {{}};
+  for (const layer of DATA.layers)
+    for (const blk of layer.blocks)
       for (const op of blk.ops) {{
-        if (!kindMap[op.kind]) kindMap[op.kind] = {{ kind: op.kind, total: 0, count: 0 }};
-        kindMap[op.kind].total += op.total_ms;
-        kindMap[op.kind].count++;
+        if (!km[op.kind]) km[op.kind]={{kind:op.kind,total:0,count:0}};
+        km[op.kind].total+=op.total_ms; km[op.kind].count++;
       }}
-    }}
-  }}
   for (const op of DATA.global_ops) {{
-    if (!kindMap[op.kind]) kindMap[op.kind] = {{ kind: op.kind, total: 0, count: 0 }};
-    kindMap[op.kind].total += op.total_ms;
-    kindMap[op.kind].count++;
+    if (!km[op.kind]) km[op.kind]={{kind:op.kind,total:0,count:0}};
+    km[op.kind].total+=op.total_ms; km[op.kind].count++;
   }}
+  const sk = Object.values(km).sort((a,b)=>b.total-a.total);
+  const mk = sk.length>0 ? sk[0].total : 1;
 
-  const sorted = Object.values(kindMap).sort((a, b) => b.total - a.total);
-  const maxTotal = sorted.length > 0 ? sorted[0].total : 1;
+  let maxL=0;
+  for (const l of DATA.layers) {{ const lt=l.blocks.reduce((s,b)=>s+b.total_ms,0); if(lt>maxL)maxL=lt; }}
 
-  let html = '<div class="summary-cards">';
-  html += `<div class="card"><div class="label">Step Time</div><div class="value">${{fmtMs(STEP_TIME_MS)}}</div></div>`;
-  html += `</div>`;
-  html += '<h3 style="margin:12px 0 8px;color:var(--text-dim)">Time by Op Kind</h3>';
-  html += '<div class="bar-chart">';
-
-  for (const k of sorted) {{
-    const pct = (k.total / maxTotal * 100).toFixed(1);
-    const w = (k.total / maxTotal * 100).toFixed(1);
-    html += `<div class="bar-row">
-      <span class="bar-label">${{k.kind}} (${{k.count}})</span>
-      <div class="bar compute" style="width:${{w}}%"></div>
-      <span class="bar-val">${{fmtMs(k.total)}} (${{pct}}%)</span>
-    </div>`;
+  let h = buildMetrics();
+  h += `<div class="chart-section"><div class="chart-title">time by op kind</div>`;
+  for (const k of sk) {{
+    const w=(k.total/mk*100).toFixed(1);
+    const pct=STEP_MS>0?(k.total/STEP_MS*100).toFixed(1):'—';
+    h+=`<div class="chart-row"><span class="chart-lbl">${{k.kind}} <span style="color:var(--text-muted)">×${{k.count}}</span></span><div class="chart-wrap"><div class="chart-bar compute" style="width:${{w}}%"></div></div><span class="chart-val">${{fmtMs(k.total)}}</span></div>`;
   }}
-
-  html += '</div>';
-
-  // Per-layer breakdown
-  html += '<h3 style="margin:16px 0 8px;color:var(--text-dim)">Time by Layer</h3>';
-  html += '<div class="bar-chart">';
-
-  let maxL = 0;
+  h+=`</div><div class="chart-section"><div class="chart-title">time by layer</div>`;
   for (const layer of DATA.layers) {{
-    const lt = layer.blocks.reduce((s, b) => s + b.total_ms, 0);
-    if (lt > maxL) maxL = lt;
+    const lt=layer.blocks.reduce((s,b)=>s+b.total_ms,0);
+    const w=maxL>0?(lt/maxL*100).toFixed(1):0;
+    h+=`<div class="chart-row"><span class="chart-lbl">L${{layer.id}} <span style="color:var(--text-muted)">(${{layer.kind}})</span></span><div class="chart-wrap"><div class="chart-bar memory" style="width:${{w}}%"></div></div><span class="chart-val">${{fmtMs(lt)}}</span></div>`;
   }}
-
-  for (const layer of DATA.layers) {{
-    const lt = layer.blocks.reduce((s, b) => s + b.total_ms, 0);
-    const w = maxL > 0 ? (lt / maxL * 100).toFixed(1) : 0;
-    html += `<div class="bar-row">
-      <span class="bar-label">L${{layer.id}} (${{layer.kind}})</span>
-      <div class="bar memory" style="width:${{w}}%"></div>
-      <span class="bar-val">${{fmtMs(lt)}}</span>
-    </div>`;
-  }}
-
-  html += '</div>';
-
-  document.getElementById('main').innerHTML = html;
+  h+=`</div>`;
+  document.getElementById('main').innerHTML = h;
 }}
 
-function toggleLayer(el) {{
-  el.classList.toggle('open');
-  const body = el.nextElementSibling;
-  body.classList.toggle('open');
-}}
-
-function toggleBlock(el) {{
-  el.classList.toggle('open');
-  const body = el.nextElementSibling;
-  body.classList.toggle('open');
-}}
-
-function expandAll() {{
-  document.querySelectorAll('.layer-header, .block-header').forEach(el => {{
-    el.classList.add('open');
-    el.nextElementSibling.classList.add('open');
-  }});
-}}
-
-function collapseAll() {{
-  document.querySelectorAll('.layer-header, .block-header').forEach(el => {{
-    el.classList.remove('open');
-    el.nextElementSibling.classList.remove('open');
-  }});
-}}
-
-function showChart() {{ renderChart(); }}
-function showTree() {{ renderTree(); }}
+function toggleLayer(el) {{ el.classList.toggle('open'); el.nextElementSibling.classList.toggle('open'); }}
+function toggleBlock(el) {{ el.classList.toggle('open'); el.nextElementSibling.classList.toggle('open'); }}
+function expandAll()  {{ document.querySelectorAll('.layer-hdr,.block-hdr').forEach(el=>{{ el.classList.add('open'); el.nextElementSibling.classList.add('open'); }}); }}
+function collapseAll(){{ document.querySelectorAll('.layer-hdr,.block-hdr').forEach(el=>{{ el.classList.remove('open'); el.nextElementSibling.classList.remove('open'); }}); }}
+function showTree()   {{ renderTree(); }}
+function showChart()  {{ renderChart(); }}
 
 function filterOps() {{
-  const q = document.getElementById('search').value.toLowerCase();
-  document.querySelectorAll('.op-node').forEach(el => {{
-    el.style.display = el.dataset.name.includes(q) ? '' : 'none';
-  }});
+  const q=document.getElementById('search').value.toLowerCase();
+  document.querySelectorAll('.op-node').forEach(el=>el.classList.toggle('hidden',!!q&&!el.dataset.name.includes(q)));
 }}
 
-function showTooltip(e, op) {{
-  const tip = document.getElementById('tooltip');
-  let formulaRows = '';
-  if (op.fwd_formula && op.fwd_formula !== 'negligible') {{
-    formulaRows += `<div class="row"><span class="k">FWD FLOPs</span><span class="v">${{op.fwd_formula}}</span></div>`;
-    formulaRows += `<div class="row"><span class="k">BWD FLOPs</span><span class="v">${{op.bwd_formula}}</span></div>`;
-    formulaRows += `<div class="row"><span class="k">FWD Bytes</span><span class="v">${{op.fwd_bytes_formula}}</span></div>`;
-    formulaRows += `<div class="row"><span class="k">BWD Bytes</span><span class="v">${{op.bwd_bytes_formula}}</span></div>`;
+function showTip(e, op) {{
+  const t=document.getElementById('tooltip');
+  let fr='';
+  if (op.fwd_formula&&op.fwd_formula!=='negligible') {{
+    fr=`<div class="tip-row"><span class="tip-k">fwd FLOPs</span><span class="tip-v">${{op.fwd_formula}}</span></div>
+    <div class="tip-row"><span class="tip-k">bwd FLOPs</span><span class="tip-v">${{op.bwd_formula}}</span></div>
+    <div class="tip-row"><span class="tip-k">fwd bytes</span><span class="tip-v">${{op.fwd_bytes_formula}}</span></div>
+    <div class="tip-row"><span class="tip-k">bwd bytes</span><span class="tip-v">${{op.bwd_bytes_formula}}</span></div>`;
   }}
-  tip.innerHTML = `
-    <div style="font-weight:bold;margin-bottom:6px;color:#fff">${{op.name}}</div>
-    <div class="row"><span class="k">Kind</span><span class="v">${{op.kind}}</span></div>
-    <div class="row"><span class="k">Bound</span><span class="v">${{op.bound}}</span></div>
-    <div class="row"><span class="k">Input</span><span class="v">${{op.inputs}}</span></div>
-    <div class="row"><span class="k">Output</span><span class="v">${{op.outputs}}</span></div>
-    ${{formulaRows}}
-    <div style="border-top:1px solid var(--border);margin-top:6px;padding-top:4px"></div>
-    <div class="row"><span class="k">FWD Time</span><span class="v">${{fmtMs(op.fwd_ms)}}</span></div>
-    <div class="row"><span class="k">DX Time</span><span class="v">${{fmtMs(op.dx_ms)}}</span></div>
-    <div class="row"><span class="k">DW Time</span><span class="v">${{fmtMs(op.dw_ms)}}</span></div>
-    <div class="row"><span class="k" style="color:var(--orange)">Total</span><span class="v" style="color:var(--orange)">${{fmtMs(op.total_ms)}}</span></div>
-  `;
-  tip.classList.add('show');
-  tip.style.left = Math.min(e.clientX + 12, window.innerWidth - 340) + 'px';
-  tip.style.top = Math.min(e.clientY + 12, window.innerHeight - 200) + 'px';
+  t.innerHTML=`<div class="tip-name">${{op.name}}</div>
+    <div class="tip-row"><span class="tip-k">kind</span><span class="tip-v">${{op.kind}}</span></div>
+    <div class="tip-row"><span class="tip-k">bound</span><span class="tip-v">${{op.bound}}</span></div>
+    <div class="tip-row"><span class="tip-k">input</span><span class="tip-v">${{op.inputs}}</span></div>
+    <div class="tip-row"><span class="tip-k">output</span><span class="tip-v">${{op.outputs}}</span></div>
+    ${{fr}}
+    <div class="tip-timing">
+      <div class="tip-tc fwd"><div class="tv">${{fmtMs(op.fwd_ms)}}</div><div class="tl">fwd</div></div>
+      <div class="tip-tc dx" ><div class="tv">${{fmtMs(op.dx_ms)}}</div><div class="tl">dx</div></div>
+      <div class="tip-tc dw" ><div class="tv">${{fmtMs(op.dw_ms)}}</div><div class="tl">dw</div></div>
+    </div>`;
+  t.classList.add('show');
+  t.style.left=Math.min(e.clientX+14,window.innerWidth-380)+'px';
+  t.style.top=Math.min(e.clientY+14,window.innerHeight-220)+'px';
 }}
 
-function hideTooltip() {{
-  document.getElementById('tooltip').classList.remove('show');
-}}
+function hideTip() {{ document.getElementById('tooltip').classList.remove('show'); }}
 
-document.addEventListener('keydown', e => {{
-  if (e.key === '/' && document.activeElement.tagName !== 'INPUT') {{
-    e.preventDefault();
-    document.getElementById('search').focus();
-  }}
-  if (e.key === 'Escape') {{
-    document.getElementById('search').value = '';
-    filterOps();
-    document.getElementById('search').blur();
-  }}
+document.addEventListener('keydown',e=>{{
+  if (e.key==='/'&&document.activeElement.tagName!=='INPUT') {{ e.preventDefault(); document.getElementById('search').focus(); }}
+  if (e.key==='Escape') {{ document.getElementById('search').value=''; filterOps(); document.getElementById('search').blur(); }}
 }});
 
-// Init
 renderTree();
-
-// Populate header
-document.getElementById('header-stats').innerHTML = `
-  <span class="stat">Model: <span>${{DATA.model_name}}</span></span>
-  <span class="stat">Step Time: <span>${{fmtMs(STEP_TIME_MS)}}</span></span>
-  <span class="stat">Layers: <span>${{DATA.layers.length}}</span></span>
-`;
 </script>
 </body>
 </html>

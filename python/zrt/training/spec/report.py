@@ -99,7 +99,8 @@ class TrainingReport:
     cooldown_ms: float = 0.0
     dp_exposed_ms: float = 0.0
     optimizer_time_ms: float = 0.0
-    optimizer_comm_ms: float = 0.0
+    optimizer_comm_ms: float = 0.0        # Exposed on critical path (post-hide)
+    optimizer_comm_hidden_ms: float = 0.0  # AG hidden under NS compute (Moonshot rotation)
 
     # Fwd/Bwd breakdown per phase (milliseconds)
     warmup_fwd_ms: float = 0.0
@@ -188,6 +189,7 @@ class TrainingReport:
             "dp_exposed_ms": self.dp_exposed_ms,
             "optimizer_time_ms": self.optimizer_time_ms,
             "optimizer_comm_ms": self.optimizer_comm_ms,
+            "optimizer_comm_hidden_ms": self.optimizer_comm_hidden_ms,
             "warmup_fwd_ms": self.warmup_fwd_ms,
             "warmup_bwd_ms": self.warmup_bwd_ms,
             "steady_fwd_ms": self.steady_fwd_ms,

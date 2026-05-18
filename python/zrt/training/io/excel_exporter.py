@@ -143,6 +143,7 @@ def export_estimate_excel(
         ["  DP hidden", f"{report.dp_hidden_ms:.2f}" if report.dp_hidden_ms > 0 else "-", "ms"],
         ["  TP hidden", f"{report.tp_hidden_ms:.2f}" if report.tp_hidden_ms > 0 else "-", "ms"],
         ["  EP hidden", f"{report.ep_hidden_ms:.2f}" if report.ep_hidden_ms > 0 else "-", "ms"],
+        ["  Optimizer comm hidden", f"{report.optimizer_comm_hidden_ms:.2f}" if report.optimizer_comm_hidden_ms > 0 else "-", "ms"],
         ["  Total hidden", f"{report.hidden_comm_ms:.2f}" if report.hidden_comm_ms > 0 else "-", "ms"],
         ["", "", ""],
         # Efficiency

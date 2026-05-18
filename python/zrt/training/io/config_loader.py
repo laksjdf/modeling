@@ -218,7 +218,8 @@ def _parse_model(d: dict) -> ModelSpec:
 def _parse_system(d: dict) -> SystemSpec:
     from zrt.hardware import registry as hw_registry
 
-    hw = hw_registry.load(d["hw"])
+    hw_ref = d["hw"]
+    hw = hw_registry._parse_spec(hw_ref) if isinstance(hw_ref, dict) else hw_registry.load(hw_ref)
 
     gpu = GPU(
         name=hw.name,
@@ -291,6 +292,7 @@ def _parse_strategy(d: dict) -> Strategy:
         dualbatch=d.get("dualbatch", False),
         dp_overlap_in_bubble=d.get("dp_overlap_in_bubble", True),
         dp_steady_overlap_ratio=float(d.get("dp_steady_overlap_ratio", 0.5)),
+        dp_grad_buckets=int(d.get("dp_grad_buckets", 25)),
         optimizer=OptKind(d.get("optimizer", "adam")),
         muon_config=muon_config,
     )

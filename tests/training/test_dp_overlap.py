@@ -38,10 +38,10 @@ class TestSteadyBwdOverlap:
     def test_ratio_extends_hide_window_in_dualpipe(self):
         """DualPipe cooldown is small; with ratio>0, steady_bwd contributes
         and dp_exposed shrinks."""
-        # Two equal stages, fwd=10, bwd=20 → t_stage_max = 30
+        # Two equal stages, fwd=10, bwd=20 → t_fwd_max=10, t_bwd_max=20, t_stage_max=30
         # pp=2 DualPipe: bubble = (pp-1)/2 * t_stage_max = 15
         #                cooldown = bubble / 2 = 7.5
-        # steady_bwd_total = M * t_stage_max / 2 = 4 * 30 / 2 = 60
+        # steady_bwd_total = M * t_bwd_max = 4 * 20 = 80 (bottom-up: reads actual bwd)
         stages = [StageTime(fwd=10.0, bwd=20.0), StageTime(fwd=10.0, bwd=20.0)]
         s_no = Strategy(tp=1, pp=2, dp=4, micro_batch=1, global_batch=4,
                         pp_schedule=PPSched.DUALPIPE, dp_steady_overlap_ratio=0.0)
@@ -52,9 +52,9 @@ class TestSteadyBwdOverlap:
         r_half = DualPipeComposer().compose(stages, M=4, pp=2, dp_ar_time=100.0, strategy=s_half)
 
         # ratio=0: window = 7.5 → hide = 7.5 → exposed = 92.5
-        # ratio=0.5: window = 7.5 + 0.5*60 = 37.5 → hide = 37.5 → exposed = 62.5
+        # ratio=0.5: window = 7.5 + 0.5*80 = 47.5 → hide = 47.5 → exposed = 52.5
         assert r_no.dp_exposed == pytest.approx(92.5)
-        assert r_half.dp_exposed == pytest.approx(62.5)
+        assert r_half.dp_exposed == pytest.approx(52.5)
 
     def test_ratio_zero_matches_legacy_behavior(self):
         """ratio=0 should reproduce the previous cooldown-only window exactly,
@@ -69,10 +69,17 @@ class TestSteadyBwdOverlap:
 
 
 class TestDualbatchRecoversWithSteadyOverlap:
-    """When dualbatch=True eats cooldown, DP can still overlap with steady BWD."""
+    """dualbatch + DP overlap interaction.
 
-    def test_dualbatch_with_ratio_zero_keeps_dp_fully_exposed(self):
-        """Backward-compat: ratio=0 → existing dualbatch behavior."""
+    Post-redesign: dualbatch on DualPipe/DualPipeV is a no-op for the
+    pipeline bubble (the antiparallel reduction is already baked into the
+    composer's (pp-1)/(2V) formula). The natural cooldown therefore
+    remains available for DP hiding even when dualbatch=True.
+    """
+
+    def test_dualbatch_dualpipe_preserves_cooldown_dp_hide(self):
+        """DualPipe + dualbatch: composer cooldown is non-zero, so DP can
+        hide in cooldown even with ratio=0."""
         model = ModelSpec(hidden=2048, ffn=8192, num_heads=16, num_kv_heads=16,
                           head_dim=128, vocab=32000, seq_len=1024,
                           layers=[LayerKind.DENSE]*4)
@@ -81,8 +88,9 @@ class TestDualbatchRecoversWithSteadyOverlap:
                      dp_steady_overlap_ratio=0.0)
         graph = build_graph(model, s)
         result = pipeline_step_time(graph, model, _make_system(), s)
-        # After dualbatch eats cooldown → new_cooldown=0 → exposed=dp_total
-        assert result.dp_hidden == pytest.approx(0.0, abs=1e-9)
+        # Composer cooldown survives → some DP can be hidden in it.
+        assert result.cooldown > 0.0
+        assert result.dp_hidden >= 0.0
 
     def test_dualbatch_with_ratio_half_recovers_dp_hide(self):
         model = ModelSpec(hidden=2048, ffn=8192, num_heads=16, num_kv_heads=16,
@@ -127,16 +135,17 @@ class TestHideWindowConsistency:
         assert r0.dp_exposed > r.dp_exposed, \
             f"{sched}: ratio=0 should expose more DP than ratio=0.5"
 
-    def test_onef1b_pp1_consistent_with_helper(self):
-        """The OneF1B pp=1 special case used st.bwd*M directly. After the
-        refactor, the same number should fall out of the unified helper when
-        cooldown=0 and ratio=1.0."""
+    def test_onef1b_pp1_keeps_last_bucket_residual(self):
+        """pp=1: even when the steady-bwd hide window dwarfs dp_ar_time, the
+        last gradient bucket cannot overlap, so a residual of
+        dp_ar_time / dp_grad_buckets stays exposed (never exactly 0)."""
         stages = [StageTime(fwd=1.0, bwd=2.0)]
         s = Strategy(tp=1, pp=1, dp=4, micro_batch=1, global_batch=4,
-                     dp_steady_overlap_ratio=1.0)
-        # Pre-refactor: pp=1 uses bwd*M = 2*4 = 8; with dp_ar_time=3 → fully hidden.
+                     dp_steady_overlap_ratio=1.0, dp_grad_buckets=25)
+        # window = bwd*M = 8 >> dp_ar_time; max_hidable = 3*(1-1/25) = 2.88
         r = OneF1BComposer().compose(stages, M=4, pp=1, dp_ar_time=3.0, strategy=s)
-        assert r.dp_exposed == pytest.approx(0.0)
+        assert r.dp_exposed == pytest.approx(3.0 / 25)
+        assert r.dp_exposed > 0.0
 
     def test_dualbatch_uses_same_helper(self):
         """After fix #3, dualbatch's new_dp_exposed should go through the same
@@ -153,6 +162,97 @@ class TestHideWindowConsistency:
         # With ratio=1.0 and steady_bwd >> dp_total, DP should be ~fully hidden.
         assert result.dp_hidden > 0.5 * (result.dp_exposed + result.dp_hidden), \
             f"dualbatch+ratio=1.0 should hide most DP; got exposed={result.dp_exposed}, hidden={result.dp_hidden}"
+
+
+class TestLastBucketResidual:
+    """Regression for the dp_exposed≈0 bug: gradient bucketing leaves the last
+    bucket's collective non-overlappable, so dp_exposed must stay > 0 whenever
+    dp>1, regardless of how large the hide window is."""
+
+    def _model(self):
+        return ModelSpec(hidden=2048, ffn=8192, num_heads=16, num_kv_heads=16,
+                         head_dim=128, vocab=32000, seq_len=1024,
+                         layers=[LayerKind.DENSE] * 4)
+
+    @pytest.mark.parametrize("pp,sched", [
+        (1, PPSched.ONE_F_ONE_B),
+        (2, PPSched.ONE_F_ONE_B),
+        (2, PPSched.DUALPIPE),
+    ])
+    def test_dp_exposed_strictly_positive(self, pp, sched):
+        model = self._model()
+        s = Strategy(tp=1, pp=pp, dp=8, micro_batch=1, global_batch=32,
+                     zero_stage=1, pp_schedule=sched,
+                     dp_overlap_in_bubble=True, dp_steady_overlap_ratio=0.5,
+                     dp_grad_buckets=25)
+        r = pipeline_step_time(build_graph(model, s), model, _make_system(), s)
+        total_dp = r.dp_exposed + r.dp_hidden
+        assert total_dp > 0.0
+        assert r.dp_exposed > 0.0, \
+            f"DP fully hidden (bug): exposed={r.dp_exposed}, total={total_dp}"
+        # Residual is one bucket's worth: exposed ≈ total / buckets.
+        assert r.dp_exposed == pytest.approx(total_dp / 25, rel=1e-6)
+
+    def test_more_buckets_smaller_residual(self):
+        stages = [StageTime(fwd=1.0, bwd=2.0)]
+        s_few = Strategy(tp=1, pp=1, dp=4, micro_batch=1, global_batch=4,
+                         dp_steady_overlap_ratio=1.0, dp_grad_buckets=4)
+        s_many = Strategy(tp=1, pp=1, dp=4, micro_batch=1, global_batch=4,
+                          dp_steady_overlap_ratio=1.0, dp_grad_buckets=100)
+        r_few = OneF1BComposer().compose(stages, M=4, pp=1, dp_ar_time=3.0, strategy=s_few)
+        r_many = OneF1BComposer().compose(stages, M=4, pp=1, dp_ar_time=3.0, strategy=s_many)
+        assert r_few.dp_exposed == pytest.approx(3.0 / 4)
+        assert r_many.dp_exposed == pytest.approx(3.0 / 100)
+        assert r_many.dp_exposed < r_few.dp_exposed
+
+    def test_overlap_disabled_still_fully_exposed(self):
+        """dp_overlap_in_bubble=False is unchanged: DP fully exposed."""
+        stages = [StageTime(fwd=1.0, bwd=2.0)]
+        s = Strategy(tp=1, pp=1, dp=4, micro_batch=1, global_batch=4,
+                     dp_overlap_in_bubble=False, dp_grad_buckets=25)
+        r = OneF1BComposer().compose(stages, M=4, pp=1, dp_ar_time=3.0, strategy=s)
+        assert r.dp_exposed == pytest.approx(3.0)
+
+
+class TestDualbatchBubbleFloor:
+    """dualbatch cannot zero the pipeline bubble — there is always an
+    irreducible (pp-1)/(2V) · t_stage fill/drain even with two antiparallel
+    streams (no third stream exists to fill that region).
+    """
+
+    def test_1f1b_dualbatch_residual_bubble_is_dualpipe_floor(self):
+        """1F1B + dualbatch should reduce bubble to the DualPipe floor
+        (pp-1)/2 · t_stage_max, NOT to zero, regardless of M."""
+        model = ModelSpec(hidden=2048, ffn=8192, num_heads=16, num_kv_heads=16,
+                          head_dim=128, vocab=32000, seq_len=1024,
+                          layers=[LayerKind.DENSE] * 4)
+        # Large M to confirm bubble doesn't get "filled" by steady work.
+        s = Strategy(tp=1, pp=4, dp=2, micro_batch=1, global_batch=256,
+                     pp_schedule=PPSched.ONE_F_ONE_B, dualbatch=True)
+        graph = build_graph(model, s)
+        result = pipeline_step_time(graph, model, _make_system(), s)
+        assert result.bubble_fraction > 0.0, (
+            "dualbatch must not zero the pipeline bubble; got "
+            f"bubble_fraction={result.bubble_fraction}"
+        )
+        assert (result.warmup + result.cooldown) > 0.0
+
+    def test_dualpipev_dualbatch_skips_pipeline_adjustment(self):
+        """DualPipeV already bakes the antiparallel floor into the
+        composer's (pp-1)/(2V) bubble. dualbatch must not double-count
+        and zero it; the composer's bubble should pass through unchanged."""
+        model = ModelSpec(hidden=2048, ffn=8192, num_heads=16, num_kv_heads=16,
+                          head_dim=128, vocab=32000, seq_len=1024,
+                          layers=[LayerKind.DENSE] * 4)
+        s = Strategy(tp=1, pp=4, dp=2, micro_batch=1, global_batch=256,
+                     pp_schedule=PPSched.DUALPIPE_V, vpp_chunks=2,
+                     dualbatch=True)
+        graph = build_graph(model, s)
+        result = pipeline_step_time(graph, model, _make_system(), s)
+        # Composer gives bubble = (pp-1)/(2V) · t_stage > 0; dualbatch must
+        # leave it alone.
+        assert result.bubble_fraction > 0.0
+        assert (result.warmup + result.cooldown) > 0.0
 
 
 class TestZeroBubbleFloor:

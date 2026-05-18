@@ -29,6 +29,9 @@ class StageTime:
     comm_bwd: float = 0.0   # exposed comm in bwd (after TP/EP overlap reductions)
     ep_hidden: float = 0.0  # EP comm hidden by wave-overlap (fwd + bwd combined)
     tp_hidden: float = 0.0  # TP comm hidden by CoC/MC2 (fwd + bwd combined)
+    tp_exposed: float = 0.0  # TP comm exposed after CoC/MC2 (fwd + bwd combined)
+    ep_exposed: float = 0.0  # EP comm exposed after wave-overlap (fwd + bwd combined)
+    cp_exposed: float = 0.0  # CP comm exposed — no overlap mechanism (fwd + bwd combined)
 
 
 def ep_imbalance_factor(num_experts: int, ep: int, topk: int = 1) -> float:
@@ -190,6 +193,12 @@ def stage_time(
     t_comm_bwd = 0.0
     t_tp_comm_fwd = 0.0
     t_tp_comm_bwd = 0.0
+    t_cp_comm_fwd = 0.0
+    t_cp_comm_bwd = 0.0
+    t_ep_raw_comm_fwd = 0.0
+    t_ep_raw_comm_bwd = 0.0
+    t_other_comm_fwd = 0.0  # DP and any other groups
+    t_other_comm_bwd = 0.0
     for c in stage_collectives:
         group_size = _group_size(c.group, strategy)
         tier = tier_for_group(c.group, group_size, system)
@@ -197,12 +206,12 @@ def stage_time(
 
         if c.group == "CP":
             if c.phase == "fwd":
-                t_comm_fwd += ct
+                t_cp_comm_fwd += ct
             elif c.phase == "bwd":
-                t_comm_bwd += ct
-            elif c.phase == "both":
-                t_comm_fwd += ct * 0.5
-                t_comm_bwd += ct * 0.5
+                t_cp_comm_bwd += ct
+            else:  # both
+                t_cp_comm_fwd += ct * 0.5
+                t_cp_comm_bwd += ct * 0.5
         elif c.group == "TP":
             # TP AG/RS are inserted with phase='both' by ir/shard.py and we
             # split 50/50 across fwd/bwd because Megatron-SP performs the
@@ -210,18 +219,28 @@ def stage_time(
             # Pinned by tests/training/test_tp_overlap.py::TestTPCollectivePhaseSplit.
             t_tp_comm_fwd += ct * 0.5
             t_tp_comm_bwd += ct * 0.5
+        elif c.group == "EP":
+            if c.phase == "fwd":
+                t_ep_raw_comm_fwd += ct
+            elif c.phase == "bwd":
+                t_ep_raw_comm_bwd += ct
+            else:  # both
+                t_ep_raw_comm_fwd += ct * 0.5
+                t_ep_raw_comm_bwd += ct * 0.5
         else:
-            t_comm_fwd += ct * 0.5
-            t_comm_bwd += ct * 0.5
+            t_other_comm_fwd += ct * 0.5
+            t_other_comm_bwd += ct * 0.5
 
     # Apply TP overlap with GEMM bound (parallels EP wave-overlap):
     #   CoC: K=4 wave-overlap; exposed = max(comm - gemm*(K-1)/K, 0) per phase
     #   MC2: bounded by max(comm - gemm, 0) — fully covered iff GEMM ≥ comm
     #   NONE: all TP comm exposed
     t_tp_hidden = 0.0
+    t_tp_exposed_fwd = 0.0
+    t_tp_exposed_bwd = 0.0
     if strategy.tp_overlap == TPOverlap.NONE:
-        t_comm_fwd += t_tp_comm_fwd
-        t_comm_bwd += t_tp_comm_bwd
+        t_tp_exposed_fwd = t_tp_comm_fwd
+        t_tp_exposed_bwd = t_tp_comm_bwd
     else:
         t_tp_gemm_fwd = _tp_gemm_time(stage_ops, model, system, gpu_name, "fwd")
         t_tp_gemm_bwd = _tp_gemm_time(stage_ops, model, system, gpu_name, "bwd")
@@ -233,9 +252,13 @@ def stage_time(
         else:  # COC
             saved_fwd = _wave_overlap_saved(t_tp_comm_fwd, t_tp_gemm_fwd, K=4)
             saved_bwd = _wave_overlap_saved(t_tp_comm_bwd, t_tp_gemm_bwd, K=4)
-        t_comm_fwd += max(0.0, t_tp_comm_fwd - saved_fwd)
-        t_comm_bwd += max(0.0, t_tp_comm_bwd - saved_bwd)
+        t_tp_exposed_fwd = max(0.0, t_tp_comm_fwd - saved_fwd)
+        t_tp_exposed_bwd = max(0.0, t_tp_comm_bwd - saved_bwd)
         t_tp_hidden = saved_fwd + saved_bwd
+
+    # Build combined t_comm_fwd/bwd from all components
+    t_comm_fwd = t_other_comm_fwd + t_tp_exposed_fwd + t_cp_comm_fwd + t_ep_raw_comm_fwd
+    t_comm_bwd = t_other_comm_bwd + t_tp_exposed_bwd + t_cp_comm_bwd + t_ep_raw_comm_bwd
 
     t_fwd += t_comm_fwd
     t_bwd_dx += t_comm_bwd
@@ -251,33 +274,30 @@ def stage_time(
             t_fwd = t_fwd * (1 - ep_frac) + t_fwd * ep_frac * imb
             t_bwd_dx = t_bwd_dx * (1 - ep_frac) + t_bwd_dx * ep_frac * imb
             t_bwd_dw = t_bwd_dw * (1 - ep_frac) + t_bwd_dw * ep_frac * imb
-            t_comm_fwd = t_comm_fwd * (1 - ep_frac) + t_comm_fwd * ep_frac * imb
-            t_comm_bwd = t_comm_bwd * (1 - ep_frac) + t_comm_bwd * ep_frac * imb
+            # Apply imbalance to EP comm only (CP and TP are not EP-parallel)
+            # Track the EP comm before imbalance to compute the delta
+            ep_comm_fwd_before = t_ep_raw_comm_fwd
+            ep_comm_bwd_before = t_ep_raw_comm_bwd
+            t_ep_raw_comm_fwd *= imb
+            t_ep_raw_comm_bwd *= imb
+            # Rebuild combined t_comm_fwd/bwd with imbalanced EP
+            t_comm_fwd = t_other_comm_fwd + t_tp_exposed_fwd + t_cp_comm_fwd + t_ep_raw_comm_fwd
+            t_comm_bwd = t_other_comm_bwd + t_tp_exposed_bwd + t_cp_comm_bwd + t_ep_raw_comm_bwd
+            # Add the EP comm delta to stage totals so the full imbalance is reflected
+            t_fwd += (t_ep_raw_comm_fwd - ep_comm_fwd_before)
+            t_bwd_dx += (t_ep_raw_comm_bwd - ep_comm_bwd_before)
 
     # EP wave-overlap: split EP A2A into K waves, overlap with expert GEMM.
     # Fix (2026-05-10): compute fwd and bwd overlap independently, since
     # bwd GEMM (dx + dw) is ~2.5× fwd GEMM and can hide much more comm.
     # Also separate EP comm into fwd/bwd portions instead of treating them
     # as a single pool.
+    # Fix (2026-05-18): use pre-computed t_ep_raw_comm_fwd/bwd (post-imbalance);
+    # no inner re-loop over collectives needed.
     t_ep_hidden = 0.0
+    t_ep_exposed_fwd = t_ep_raw_comm_fwd  # default: no overlap
+    t_ep_exposed_bwd = t_ep_raw_comm_bwd
     if strategy.ep_overlap and strategy.ep > 1 and model.num_experts > 0:
-        # Separate EP comm into fwd and bwd portions (used by both overlap paths).
-        t_comm_ep_fwd = 0.0
-        t_comm_ep_bwd = 0.0
-        for c in stage_collectives:
-            if c.group != "EP":
-                continue
-            group_size = _group_size(c.group, strategy)
-            tier = tier_for_group(c.group, group_size, system)
-            ct = collective_time(c, group_size, tier)
-            if c.phase == "fwd":
-                t_comm_ep_fwd += ct
-            elif c.phase == "bwd":
-                t_comm_ep_bwd += ct
-            elif c.phase == "both":
-                t_comm_ep_fwd += ct * 0.5
-                t_comm_ep_bwd += ct * 0.5
-
         # EP GEMM times needed by both K-wave formula and inter-batch non_ep_compute.
         t_ep_gemm_fwd = _ep_gemm_time(stage_ops, model, system, strategy, gpu_name)
         t_ep_gemm_bwd = 0.0
@@ -299,16 +319,12 @@ def stage_time(
         # Ascend HCCS: ep_overlap_waves=0, not supported).
         if gpu.ep_overlap_waves > 0:
             K = gpu.ep_overlap_waves
-            saved_fwd = _wave_overlap_saved(t_comm_ep_fwd, t_ep_gemm_fwd, K)
-            saved_fwd = min(saved_fwd, t_comm_fwd)
-            t_fwd -= saved_fwd
-            t_comm_fwd -= saved_fwd
+            saved_fwd = _wave_overlap_saved(t_ep_raw_comm_fwd, t_ep_gemm_fwd, K)
+            saved_fwd = min(saved_fwd, t_ep_raw_comm_fwd)
             t_ep_hidden += saved_fwd
 
-            saved_bwd = _wave_overlap_saved(t_comm_ep_bwd, t_ep_gemm_bwd, K)
-            saved_bwd = min(saved_bwd, t_comm_bwd)
-            t_bwd_dx -= saved_bwd
-            t_comm_bwd -= saved_bwd
+            saved_bwd = _wave_overlap_saved(t_ep_raw_comm_bwd, t_ep_gemm_bwd, K)
+            saved_bwd = min(saved_bwd, t_ep_raw_comm_bwd)
             t_ep_hidden += saved_bwd
 
         # Inter-batch EP overlap: when dual_batch=True and pp>1, two microbatches
@@ -331,8 +347,8 @@ def stage_time(
         # fraction M/(M + bubble_slots) makes the aggregate step saving exactly
         # M * inter_saved (steady only), not (M + bubble_slots) * inter_saved.
         if strategy.dualbatch and strategy.pp > 1:
-            residual_ep_fwd = max(0.0, t_comm_ep_fwd - saved_fwd)
-            residual_ep_bwd = max(0.0, t_comm_ep_bwd - saved_bwd)
+            residual_ep_fwd = max(0.0, t_ep_raw_comm_fwd - saved_fwd)
+            residual_ep_bwd = max(0.0, t_ep_raw_comm_bwd - saved_bwd)
 
             non_ep_compute_fwd = max(0.0, t_fwd - t_comm_fwd - t_ep_gemm_fwd)
             non_ep_compute_bwd = max(0.0, (t_bwd_dx + t_bwd_dw) - t_comm_bwd - t_ep_gemm_bwd)
@@ -348,11 +364,20 @@ def stage_time(
             inter_saved_fwd *= steady_fraction
             inter_saved_bwd *= steady_fraction
 
-            t_fwd -= inter_saved_fwd
-            t_comm_fwd -= inter_saved_fwd
-            t_bwd_dx -= inter_saved_bwd
-            t_comm_bwd -= inter_saved_bwd
             t_ep_hidden += inter_saved_fwd + inter_saved_bwd
+            saved_fwd += inter_saved_fwd
+            saved_bwd += inter_saved_bwd
+
+        # Remove hidden EP from combined comm totals
+        t_comm_fwd -= saved_fwd
+        t_comm_bwd -= saved_bwd
+        # Update fwd/bwd totals (EP portion reduced)
+        t_fwd -= saved_fwd
+        t_bwd_dx -= saved_bwd
+
+        # EP exposed per direction
+        t_ep_exposed_fwd = max(0.0, t_ep_raw_comm_fwd - saved_fwd)
+        t_ep_exposed_bwd = max(0.0, t_ep_raw_comm_bwd - saved_bwd)
 
     t_bwd = t_bwd_dx + t_bwd_dw
     return StageTime(
@@ -364,6 +389,9 @@ def stage_time(
         comm_bwd=t_comm_bwd,
         ep_hidden=t_ep_hidden,
         tp_hidden=t_tp_hidden,
+        tp_exposed=t_tp_exposed_fwd + t_tp_exposed_bwd,
+        ep_exposed=t_ep_exposed_fwd + t_ep_exposed_bwd,
+        cp_exposed=t_cp_comm_fwd + t_cp_comm_bwd,
     )
 
 

@@ -40,16 +40,17 @@ def test_single_stage_no_bubble():
 
 
 def test_single_stage_dp_allreduce_overlaps_backward_when_enabled():
-    """PP=1: DP grad reduce overlaps backward via steady-BWD window.
-    bwd=2.0, M=4 → steady_bwd_total=8.0. With default ratio=0.5,
-    window=0+0.5*8.0=4.0. dp_ar_time=3.0 < 4.0 → fully hidden."""
+    """PP=1: DP grad reduce overlaps backward via steady-BWD window, except
+    the last gradient bucket. bwd=2.0, M=4 → steady_bwd_total=8.0. With
+    default ratio=0.5, window=0+0.5*8.0=4.0 > dp_ar_time=3.0, but the last
+    bucket (1/25) cannot overlap → dp_exposed = 3.0/25 = 0.12."""
     stage = [StageTime(fwd=1.0, bwd=2.0)]
     strategy = Strategy(tp=1, pp=1, dp=4, micro_batch=1, global_batch=4)
 
     result = OneF1BComposer().compose(stage, M=4, pp=1, dp_ar_time=3.0, strategy=strategy)
 
-    assert result.step_time == 12.0
-    assert result.dp_exposed == 0.0
+    assert result.dp_exposed == pytest.approx(3.0 / 25)
+    assert result.step_time == pytest.approx(12.0 + 3.0 / 25)
 
 
 def test_single_stage_dp_allreduce_exposed_when_overlap_disabled():

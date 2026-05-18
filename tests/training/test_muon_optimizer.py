@@ -226,6 +226,29 @@ class TestOptimizerCommTime:
         comm = optimizer_comm_time(model, system, strategy)
         assert comm["muon_rs"] > 0
 
+    def test_muon_routed_expert_uses_expert_dp_group(self):
+        """Routed-expert AG/RS lives on expert_dp = dp/ep, not full DP.
+
+        With dp==ep, expert_dp==1, so routed-expert AG/RS time vanishes.
+        Non-routed (dense + shared experts) keeps the full-DP cost.
+        """
+        model = _make_moe_model(num_experts=8)
+        system = _make_mock_system()
+        s_dp_eq_ep = Strategy(
+            optimizer=OptKind.MUON, tp=1, pp=1, ep=8, dp=8,
+            zero_stage=1, muon_config=MuonConfig(),
+        )
+        s_dp_gt_ep = Strategy(
+            optimizer=OptKind.MUON, tp=1, pp=1, ep=2, dp=8,
+            zero_stage=1, muon_config=MuonConfig(),
+        )
+        c_eq = optimizer_comm_time(model, system, s_dp_eq_ep)
+        c_gt = optimizer_comm_time(model, system, s_dp_gt_ep)
+        # dp==ep collapses routed AG/RS but non-routed (embed + bias + norms,
+        # MoE model has no dense ffn) still contributes a small fixed cost.
+        assert c_gt["muon_ag"] > c_eq["muon_ag"]
+        assert c_gt["muon_rs"] > c_eq["muon_rs"]
+
 
 class TestResolveMuonNsSteps:
     """Test resolve_muon_ns_steps priority logic (per §8.1 of design doc)."""

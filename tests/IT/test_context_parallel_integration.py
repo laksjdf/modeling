@@ -12,10 +12,6 @@ These are baseline tests for CP functionality - do not modify after baselining.
 """
 
 import pytest
-import sys
-import os
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'python'))
 
 from zrt.ir.graph import OpGraph
 from zrt.ir.node import OpNode

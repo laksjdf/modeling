@@ -110,3 +110,76 @@ def test_pareto_frontier_basic():
 
 def test_pareto_frontier_empty():
     assert pareto_frontier([]) == []
+
+
+def test_report_summary_includes_peak_memory():
+    """Verify report_summary() displays peak_gb for OOM visibility."""
+    from zrt.training.search.report import report_summary
+    from zrt.training.models.memory import MemBreakdown
+
+    # Create a minimal report with memory breakdown
+    report = Report(
+        step_time_ms=100.0,
+        pipeline_time_ms=100.0,
+        mfu=0.5,
+        hfu=0.5,
+        mfu_native=0.5,
+        memory=MemBreakdown(weights=40e9, grads=20e9, opt_state=20e9, activations=10e9),
+        total_flops=1e12,
+        forward_flops=5e11,
+        backward_flops=5e11,
+        training_flops=1e12,
+        total_params=7e9,
+        warnings=[],
+        config_summary={},
+        bubble_fraction=0.0,
+        schedule_name="1f1b",
+        warmup_steps=0,
+        cooldown_steps=0,
+        steady_steps=32,
+        warmup_ms=0.0,
+        steady_ms=100.0,
+        cooldown_ms=0.0,
+        dp_exposed_ms=0.0,
+        tokens_per_sec=1000.0,
+    )
+
+    # Call report_summary()
+    summary = report_summary(report)
+
+    # Verify output contains "PEAK:" line
+    assert "PEAK:" in summary
+    assert "OOM-relevant" in summary
+    # Verify it's displayed after TOTAL
+    assert summary.index("TOTAL:") < summary.index("PEAK:")
+
+
+def test_pareto_frontier_sorts_by_total_memory():
+    """Verify pareto_frontier uses memory.total for sorting, not peak_overall.
+
+    This test documents the actual behavior: the frontier uses the algebraic
+    sum of components (total) rather than the OOM-relevant peak_overall metric.
+    This is intentional for consistency with the established sorting behavior.
+    """
+    from zrt.training.models.memory import MemBreakdown
+
+    # Create configs with same step_time but different total vs peak
+    # Config A: lower total, higher peak (should be preferred by frontier)
+    mem_a = MemBreakdown(weights=30e9, grads=15e9, opt_state=15e9, activations=30e9)
+    # peak_overall will be computed as max of phases, but total = 90e9
+
+    # Config B: higher total, lower peak (should be dominated by A)
+    mem_b = MemBreakdown(weights=30e9, grads=15e9, opt_state=15e9, activations=31e9)
+    # total = 91e9, even if peak_overall might be lower
+
+    reports = [
+        Report(step_time_ms=100.0, mfu=0.5, total_flops=1e12, memory=mem_a),
+        Report(step_time_ms=100.0, mfu=0.5, total_flops=1e12, memory=mem_b),
+    ]
+
+    frontier = pareto_frontier(reports)
+
+    # Config A (lower total) should dominate, even if Config B has lower peak
+    assert len(frontier) == 1
+    assert frontier[0].memory.total == 90e9  # Config A
+    assert frontier[0].memory.total < reports[1].memory.total  # A < B

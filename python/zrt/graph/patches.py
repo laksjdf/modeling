@@ -624,7 +624,19 @@ def _make_attention_training_closure(attn: nn.Module):
         inf = sys.modules["_v4_inference_model"]
 
         bsz, seqlen, _ = x.size()
-        freqs_cis = attn.freqs_cis[start_pos : start_pos + seqlen]
+        # Handle freqs_cis for FakeTensorMode compatibility
+        # freqs_cis is precomputed as real tensor, but in FakeTensorMode we need fake tensor
+        freqs_cis = attn.freqs_cis
+        if freqs_cis is not None and not hasattr(freqs_cis, '_fake_quant_enabled'):
+            # freqs_cis is not a FakeTensor - create a fake version for tracing
+            # The actual rotary embedding computation is handled separately
+            # For training capture, we just need the shape to be correct
+            freqs_cis = torch.empty(
+                freqs_cis.shape[0], freqs_cis.shape[1],
+                dtype=freqs_cis.dtype,
+                device=freqs_cis.device
+            )
+        freqs_cis = freqs_cis[start_pos : start_pos + seqlen]
         win = attn.window_size
         ratio = attn.compress_ratio
         rd = attn.rope_head_dim
@@ -645,15 +657,39 @@ def _make_attention_training_closure(attn: nn.Module):
         kv = attn.kv_norm(kv)
         inf.act_quant(kv[..., :-rd], 64, None, torch.float32, True)
 
+        # Handle topk_idxs for FakeTensorMode compatibility
+        # These functions return real tensors, but we need fake tensors for tracing
         topk_idxs = inf.get_window_topk_idxs(win, bsz, seqlen, start_pos)
+        if topk_idxs is not None and not hasattr(topk_idxs, '_fake_quant_enabled'):
+            # Create fake indices tensor with correct shape
+            topk_idxs = torch.empty(
+                topk_idxs.shape,
+                dtype=topk_idxs.dtype,
+                device=topk_idxs.device
+            )
+        
         if ratio:
             offset = kv.size(1) if start_pos == 0 else win
             if attn.indexer is not None:
                 compress_topk_idxs = attn.indexer(x, qr, start_pos, offset)
+                # Handle indexer output
+                if compress_topk_idxs is not None and not hasattr(compress_topk_idxs, '_fake_quant_enabled'):
+                    compress_topk_idxs = torch.empty(
+                        compress_topk_idxs.shape,
+                        dtype=compress_topk_idxs.dtype,
+                        device=compress_topk_idxs.device
+                    )
             else:
                 compress_topk_idxs = inf.get_compress_topk_idxs(
                     ratio, bsz, seqlen, start_pos, offset
                 )
+                # Handle get_compress_topk_idxs output
+                if compress_topk_idxs is not None and not hasattr(compress_topk_idxs, '_fake_quant_enabled'):
+                    compress_topk_idxs = torch.empty(
+                        compress_topk_idxs.shape,
+                        dtype=compress_topk_idxs.dtype,
+                        device=compress_topk_idxs.device
+                    )
             topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
         topk_idxs = topk_idxs.int()
 
@@ -827,14 +863,41 @@ def patch_v4_inference_stubs() -> None:
         logger.debug("Patched rotate_activation noop in %s for inference.", _INF_MOD_NAME)
 
 
+def _replace_real_tensors_with_fake(model: nn.Module) -> None:
+    """Replace precomputed real tensors (like freqs_cis) with fake tensors for FakeTensorMode.
+
+    DeepSeek V4 inference model has several precomputed tensors that are created
+    before entering FakeTensorMode. These cause "Mixing fake modes NYI" errors.
+    This function finds and replaces them with empty fake tensors of the same shape.
+    """
+    patched = 0
+    for name, module in model.named_modules():
+        # Handle freqs_cis in all modules
+        if hasattr(module, 'freqs_cis') and module.freqs_cis is not None:
+            freqs = module.freqs_cis
+            if not hasattr(freqs, '_fake_quant_enabled'):
+                # Replace with empty tensor - FakeTensorMode will convert it to fake
+                module.freqs_cis = torch.empty(
+                    freqs.shape,
+                    dtype=freqs.dtype,
+                    device=freqs.device
+                )
+                patched += 1
+    
+    if patched:
+        logger.info(f"Replaced {patched} real tensor(s) with fake tensors for FakeTensorMode compatibility")
+
+
 def patch_for_training_capture(model: nn.Module) -> None:
     """Enable backward() on the DeepSeek-V4 inference model for training graph capture.
 
     Applies minimal runtime patches without touching inference/model.py:
 
-    1. Removes ``@torch.inference_mode()`` from ``Transformer.forward`` so that
+    1. Replaces precomputed real tensors (freqs_cis, etc.) with fake tensors to
+       avoid "Mixing fake modes NYI" errors under FakeTensorMode.
+    2. Removes ``@torch.inference_mode()`` from ``Transformer.forward`` so that
        autograd records op history during the forward pass.
-    2. Upgrades kernel stubs to backward-compatible differentiable versions:
+    3. Upgrades kernel stubs to backward-compatible differentiable versions:
        - ``fp4_gemm`` / ``fp8_gemm`` → ``_DiffGemm`` (autograd.Function with
          correct dx/dw shapes)
        - ``sparse_attn`` → standard self-attention on q (differentiable,
@@ -842,15 +905,16 @@ def patch_for_training_capture(model: nn.Module) -> None:
        - ``hc_split_sinkhorn`` → softmax/sigmoid approximation (differentiable)
        - ``act_quant`` / ``fp4_act_quant`` → identity pass-through (preserves
          grad tracking through activations)
-    3. Applies ``patch_moe_for_fake`` to handle the data-dependent MoE routing
+    4. Applies ``patch_moe_for_fake`` to handle the data-dependent MoE routing
        loop that is incompatible with FakeTensorMode.
-    4. Applies ``patch_indexer_for_fake`` to fix the Indexer transpose bug.
-    5. Applies ``patch_hc_for_capture`` so ModuleTracker sees HC sub-layer
+    5. Applies ``patch_indexer_for_fake`` to fix the Indexer transpose bug.
+    6. Applies ``patch_hc_for_capture`` so ModuleTracker sees HC sub-layer
        boundaries as distinct nn.Modules.
 
     Only has effect when the ZRT kernel stubs are loaded
     (``sys.modules['kernel']._zrt_stub is True``).
     """
+    _replace_real_tensors_with_fake(model)
     _patch_inference_mode(model)
     _upgrade_kernel_stubs_for_backward()
     _patch_attention_for_training(model)

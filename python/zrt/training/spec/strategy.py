@@ -142,6 +142,11 @@ class Strategy:
     # (FSDP / Megatron grad bucket scheduling). 0.0 = legacy cooldown-only window;
     # 0.5 = conservative default; 1.0 = idealized full overlap.
     dp_steady_overlap_ratio: float = 0.5
+    # Gradient-bucket count for DP grad-reduce overlap. The last bucket's
+    # collective cannot start until the final gradient is produced, so a
+    # residual of ~dp_ar_time / dp_grad_buckets is always exposed even under
+    # full overlap. Aligns with PyTorch DDP's ~25MB bucketing.
+    dp_grad_buckets: int = 25
 
     # optimizer
     optimizer: OptKind = OptKind.ADAM
