@@ -182,3 +182,69 @@ def test_recompute_attribution_preserves_step_time():
     )
     assert step.recompute_time > 0.0
     assert step.bubble == pytest.approx(step.warmup + step.cooldown)
+
+
+def test_html_export_surfaces_recompute_and_bubble(tmp_path):
+    """The HTML report must visibly carry recompute + bubble: JS constants,
+    the metric cards, and the step-time breakdown section."""
+    from zrt.training.io.html_exporter import export_estimate_html
+    from zrt.training.models.flops import op_cost
+
+    model, system = _model(), _system()
+    # TP*CP*PP*DP must equal world_size (8) for estimate()'s validate().
+    strategy = Strategy(
+        tp=1, cp=1, pp=2, ep=1, dp=4, micro_batch=1, global_batch=8,
+        recompute=RecomputePolicy(per_layer={"dense": {"full"}}),
+    )
+    graph = build_graph(model, strategy)
+    from zrt.training.search.estimator import estimate
+    report = estimate(model, system, strategy, graph=graph)
+    op_costs = {op.name: op_cost(op, model, system) for op in graph.ops}
+
+    out = tmp_path / "r.html"
+    export_estimate_html(report=report, graph=graph, model=model,
+                         system=system, strategy=strategy,
+                         op_costs=op_costs, output_path=out)
+    html = out.read_text(encoding="utf-8")
+
+    assert "const RECOMPUTE_MS = " in html
+    assert "const RECOMPUTE_RAW_MS = " in html
+    assert "const BREAKDOWN = {" in html
+    assert "function buildBreakdown()" in html
+    assert "buildMetrics() + buildBreakdown()" in html
+    assert "Recompute (crit. path)" in html
+    assert "step time breakdown" in html
+    assert report.recompute_time_ms > 0.0  # this config does recompute
+
+
+def test_search_report_surfaces_bubble_and_recompute():
+    """grid-search / estimate result report (search/report.py) must carry
+    bubble absolute time and recompute pre/post-hide times."""
+    from zrt.training.search.estimator import estimate
+    from zrt.training.search.report import report_to_dict, report_summary
+
+    model, system = _model(), _system()
+    strategy = Strategy(
+        tp=1, cp=1, pp=2, ep=1, dp=4, micro_batch=1, global_batch=8,
+        recompute=RecomputePolicy(per_layer={"dense": {"full"}}),
+    )
+    report = estimate(model, system, strategy)
+
+    d = report_to_dict(report)
+    for key in ("bubble_ms", "recompute_time_ms", "recompute_time_raw_ms"):
+        assert key in d, f"{key} missing from report_to_dict"
+    assert d["bubble_ms"] > 0.0
+    assert d["recompute_time_raw_ms"] > 0.0
+
+    txt = report_summary(report)
+    assert "Recompute (critical path)" in txt
+    assert "Recompute (pre/post pipeline-hide)" in txt
+    assert "raw (pre-hide, NOT in step)" in txt
+    assert f"({report.bubble_ms:.2f} ms)" in txt
+    # The recompute/bubble lines we added must not introduce CJK (the
+    # pre-existing table uses box-drawing '─' but no wide CJK that would
+    # break <NNs> column alignment / crash GBK consoles).
+    added = [l for l in txt.splitlines()
+             if "Recompute" in l or "pre-hide" in l or "Bubble:" in l]
+    for line in added:
+        assert all(ord(c) < 0x2E80 for c in line), f"CJK in: {line!r}"

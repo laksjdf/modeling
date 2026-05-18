@@ -20,6 +20,7 @@ def report_to_dict(report: Report) -> dict:
         "config_summary": report.config_summary,
         "schedule_name": report.schedule_name,
         "bubble_fraction": round(report.bubble_fraction, 4),
+        "bubble_ms": round(report.bubble_ms, 3),
         "warmup_ms": round(report.warmup_ms, 3),
         "steady_ms": round(report.steady_ms, 3),
         "cooldown_ms": round(report.cooldown_ms, 3),
@@ -39,6 +40,8 @@ def report_to_dict(report: Report) -> dict:
         "compute_time_ms": round(report.compute_time_ms, 3),
         "fwd_compute_ms": round(report.fwd_compute_ms, 3),
         "bwd_compute_ms": round(report.bwd_compute_ms, 3),
+        "recompute_time_ms": round(report.recompute_time_ms, 3),
+        "recompute_time_raw_ms": round(report.recompute_time_raw_ms, 3),
         "exposed_comm_ms": round(report.exposed_comm_ms, 3),
         "tp_exposed_ms": round(report.tp_exposed_ms, 3),
         "cp_exposed_ms": round(report.cp_exposed_ms, 3),
@@ -95,7 +98,7 @@ def report_summary(report: Report) -> str:
 
     lines.append(f"  Step time:  {report.step_time_ms:.1f} ms")
     lines.append(f"  Schedule:   {report.schedule_name}")
-    lines.append(f"  Bubble:     {report.bubble_fraction:.1%}")
+    lines.append(f"  Bubble:     {report.bubble_fraction:.1%}  ({report.bubble_ms:.2f} ms)")
     lines.append(f"  MFU:        {report.mfu:.1%}")
     lines.append(f"  HFU:        {report.hfu:.1%}")
 
@@ -115,6 +118,7 @@ def report_summary(report: Report) -> str:
         # Core compute components
         lines.append(f"  {'Forward Compute':<38s} {report.fwd_compute_ms:>10.2f} {report.fwd_compute_ms/st*100:>7.1f}%")
         lines.append(f"  {'Backward Compute':<38s} {report.bwd_compute_ms:>10.2f} {report.bwd_compute_ms/st*100:>7.1f}%")
+        lines.append(f"  {'Recompute (critical path)':<38s} {report.recompute_time_ms:>10.2f} {report.recompute_time_ms/st*100:>7.1f}%")
 
         # Exposed communication
         lines.append(f"  {'Communication (exposed)':<38s} {report.exposed_comm_ms:>10.2f} {report.exposed_comm_ms/st*100:>7.1f}%")
@@ -148,6 +152,17 @@ def report_summary(report: Report) -> str:
             lines.append(f"    {'TP hidden':<36s} {report.tp_hidden_ms:>10.2f} ms")
             lines.append(f"    {'EP hidden':<36s} {report.ep_hidden_ms:>10.2f} ms")
             lines.append(f"    {'Total hidden':<36s} {report.hidden_comm_ms:>10.2f} ms")
+
+        # Recompute raw (pre-hide) vs critical (post-hide). raw is NOT summed
+        # into step_time: when the recomputed stage is not the pipeline
+        # bottleneck the work is hidden and the critical-path term above is 0.
+        if report.recompute_time_raw_ms > 0 or report.recompute_time_ms > 0:
+            hidden = report.recompute_time_raw_ms > report.recompute_time_ms + 1e-9
+            note = "  (pipeline-hidden, adds 0 to step)" if hidden else ""
+            lines.append("")
+            lines.append("  Recompute (pre/post pipeline-hide):")
+            lines.append(f"    {'raw (pre-hide, NOT in step)':<36s} {report.recompute_time_raw_ms:>10.2f} ms{note}")
+            lines.append(f"    {'critical path (post-hide, in step)':<36s} {report.recompute_time_ms:>10.2f} ms")
 
     # ── Phase Breakdown ─────────────────────────────────────────────
     if report.warmup_ms > 0 or report.steady_ms > 0:

@@ -667,6 +667,7 @@ const STEP_MS = {step_time_ms};
 const BUBBLE_MS = {bubble_ms};
 const RECOMPUTE_MS = {recompute_ms};
 const RECOMPUTE_RAW_MS = {recompute_raw_ms};
+const BREAKDOWN = {breakdown_json};
 
 function fmtF(v) {{
   if (v <= 0) return '—';
@@ -713,6 +714,39 @@ function buildMetrics() {{
     <div class="metric"><div class="metric-lbl">MoE</div><div class="metric-val">${{nM}}</div></div>
     <div class="metric"><div class="metric-lbl">Total Ops</div><div class="metric-val">${{DATA.total_ops}}</div></div>
   </div>`;
+}}
+
+function buildBreakdown() {{
+  const B = BREAKDOWN, S = B.step_time_ms || 0;
+  if (S <= 0) return '';
+  // Rows that sum to step_time.
+  const rows = [
+    ['Forward compute',      B.fwd_compute_ms,   'compute'],
+    ['Backward compute',     B.bwd_compute_ms,   'compute'],
+    ['Recompute (crit path)',B.recompute_time_ms,'compute'],
+    ['Communication (exposed)', B.exposed_comm_ms, 'memory'],
+    ['Optimizer (compute)',  B.optimizer_time_ms,'memory'],
+    ['Optimizer (comm)',     B.optimizer_comm_ms,'memory'],
+  ];
+  let h = `<div class="chart-section"><div class="chart-title">step time breakdown — total ${{fmtMs(S)}}</div>`;
+  for (const [lbl,v,cls] of rows) {{
+    if (!v || v<=0) continue;
+    const w=(v/S*100).toFixed(1), pct=(v/S*100).toFixed(1);
+    h+=`<div class="chart-row"><span class="chart-lbl">${{lbl}}</span><div class="chart-wrap"><div class="chart-bar ${{cls}}" style="width:${{w}}%"></div></div><span class="chart-val">${{fmtMs(v)}} (${{pct}}%)</span></div>`;
+  }}
+  // Informational rows — NOT part of step_time.
+  const note = B.recompute_time_raw_ms > B.recompute_time_ms + 1e-9
+      ? ' — pipeline-hidden, adds 0 to step' : '';
+  const info = [
+    [`Recompute (raw, NOT in step)${{note}}`, B.recompute_time_raw_ms],
+    ['Bubble (pipeline idle, abs)', B.bubble_ms],
+  ];
+  h+=`<div class="chart-title" style="margin-top:10px">informational (not summed into step)</div>`;
+  for (const [lbl,v] of info) {{
+    const w=(Math.min(v,S)/S*100).toFixed(1);
+    h+=`<div class="chart-row"><span class="chart-lbl">${{lbl}}</span><div class="chart-wrap"><div class="chart-bar memory" style="width:${{w}}%;opacity:0.4"></div></div><span class="chart-val">${{v>0?fmtMs(v):'0'}}</span></div>`;
+  }}
+  return h+`</div>`;
 }}
 
 function buildGlobal() {{
@@ -785,7 +819,7 @@ function renderTree() {{
   document.getElementById('btn-tree').classList.add('on');
   document.getElementById('btn-chart').classList.remove('on');
   modelMs = DATA.layers.reduce((s,l)=>s+l.blocks.reduce((ss,b)=>ss+b.total_ms,0),0);
-  let h = buildMetrics() + buildGlobal();
+  let h = buildMetrics() + buildBreakdown() + buildGlobal();
   for (const layer of DATA.layers) h += buildLayer(layer);
   document.getElementById('main').innerHTML = h;
 }}
@@ -810,7 +844,7 @@ function renderChart() {{
   let maxL=0;
   for (const l of DATA.layers) {{ const lt=l.blocks.reduce((s,b)=>s+b.total_ms,0); if(lt>maxL)maxL=lt; }}
 
-  let h = buildMetrics();
+  let h = buildMetrics() + buildBreakdown();
   h += `<div class="chart-section"><div class="chart-title">time by op kind</div>`;
   for (const k of sk) {{
     const w=(k.total/mk*100).toFixed(1);
@@ -902,6 +936,18 @@ def export_estimate_html(
     html = html.replace("{bubble_ms}", str(report.bubble_ms))
     html = html.replace("{recompute_ms}", str(report.recompute_time_ms))
     html = html.replace("{recompute_raw_ms}", str(report.recompute_time_raw_ms))
+    breakdown = {
+        "step_time_ms": report.step_time_ms,
+        "fwd_compute_ms": report.fwd_compute_ms,
+        "bwd_compute_ms": report.bwd_compute_ms,
+        "recompute_time_ms": report.recompute_time_ms,
+        "recompute_time_raw_ms": report.recompute_time_raw_ms,
+        "exposed_comm_ms": report.exposed_comm_ms,
+        "optimizer_time_ms": report.optimizer_time_ms,
+        "optimizer_comm_ms": report.optimizer_comm_ms,
+        "bubble_ms": report.bubble_ms,
+    }
+    html = html.replace("{breakdown_json}", json.dumps(breakdown))
 
     output_path.write_text(html, encoding="utf-8")
     return output_path
