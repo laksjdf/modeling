@@ -39,8 +39,11 @@ jobs:
 
       # ── 步骤 1：在 base 分支（main）跑测试，记录覆盖率 ────────────────────
       # 关键设计：
-      # - pytest 不加 `|| true` —— base 分支测试失败属于 broken main，应直接红，
-      #   而不是把退出码吞了导致后续比较拿"0"当 base 覆盖率（任何 PR ≥0 都过）。
+      # - --continue-on-collection-errors：base 分支上若有测试文件收集失败
+      #   （例如本 PR 正在修复的 broken test），跳过该文件继续跑其余测试，
+      #   让覆盖率数字照常输出，避免"修复 broken main 的 PR 被 broken main 阻塞"死锁。
+      # - `|| true`：配合上条，吞掉 pytest 因收集错误产生的非零退出码；
+      #   若 TOTAL 行缺失（完全无法运行），下方 Python 脚本仍会 sys.exit(1) 报错。
       # - 正则解析失败 sys.exit(1) —— pytest-cov 输出格式变更不能静默 fallback 到 0。
       # - 切分支前 git clean -fdx 清除 __pycache__/.coverage/.pytest_cache 残留。
       - name: Measure base branch coverage
@@ -48,7 +51,8 @@ jobs:
           git clean -fdx
           git checkout ${{ github.base_ref }}
           pytest tests/ -m "not network" \
-            --cov=python/zrt --cov-report=term -q 2>&1 | tee /tmp/base.txt
+            --continue-on-collection-errors \
+            --cov=python/zrt --cov-report=term -q 2>&1 | tee /tmp/base.txt || true
           python - <<'EOF'
           import re, pathlib, sys
           txt = pathlib.Path("/tmp/base.txt").read_text()
