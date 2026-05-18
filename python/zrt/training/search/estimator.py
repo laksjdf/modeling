@@ -134,6 +134,7 @@ def estimate(
         tokens_per_sec=tokens_per_sec,
         effective_params=model.effective_params_for_flops(),
         flops_per_token=flops_per_token,
+        mhc_recompute_ms=s.mhc_recompute * 1000,
     )
 
 

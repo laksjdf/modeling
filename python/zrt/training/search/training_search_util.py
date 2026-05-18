@@ -574,6 +574,7 @@ def format_results(reports: List[TrainingReport], configs: List[Dict]) -> pd.Dat
             d["activations_gb"] = round(report.memory.activations / 1e9, 2)
             d["comm_buffers_gb"] = round(report.memory.comm_buffers / 1e9, 2)
             d["memory_gb"] = memory_gb
+        d["mhc_recompute_ms"] = round(report.mhc_recompute_ms, 2) if report.mhc_recompute_ms > 0 else 0.0
         rows.append(d)
 
     df = pd.DataFrame(rows)
@@ -587,7 +588,7 @@ def format_results(reports: List[TrainingReport], configs: List[Dict]) -> pd.Dat
                                                           "optimizer_comm_ms", "optimizer_comm_hidden_ms", "step_time_ms", "pipeline_time_ms",
                                                           "mfu", "mfu_native", "hfu", "bubble_fraction", "tokens_per_sec",
                                                           "weights_gb", "grads_gb", "opt_state_gb", "activations_gb",
-                                                          "comm_buffers_gb", "memory_gb"]] if rows else []
+                                                          "comm_buffers_gb", "memory_gb", "mhc_recompute_ms"]] if rows else []
     metric_cols = ["fwd_compute_ms", "bwd_compute_ms", "exposed_comm_ms",
                                                           "tp_total_ms", "tp_exposed_ms", "cp_total_ms", "cp_exposed_ms",
                                                           "ep_total_ms", "ep_exposed_ms", "pp_total_ms", "pp_exposed_ms",
@@ -595,7 +596,7 @@ def format_results(reports: List[TrainingReport], configs: List[Dict]) -> pd.Dat
                                                           "optimizer_comm_ms", "optimizer_comm_hidden_ms", "step_time_ms", "pipeline_time_ms",
                                                           "mfu", "mfu_native", "hfu", "bubble_fraction", "tokens_per_sec",
                                                           "weights_gb", "grads_gb", "opt_state_gb", "activations_gb",
-                                                          "comm_buffers_gb", "memory_gb"]
+                                                          "comm_buffers_gb", "memory_gb", "mhc_recompute_ms"]
     cols = config_cols + [c for c in metric_cols if c in df.columns]
     df = df[[c for c in cols if c in df.columns]]
     return df
@@ -819,7 +820,7 @@ if __name__ == "__main__":
 
     training_param_grid = {
         "model": ["deepseek_v4_pro"],
-        "hw": ["nvidia_b300"],
+        "hw": ["nvidia_h100_sxm"],
         "world_size": [8192],
         "tp": [1, 2, 4, 8, 16],
         "cp": [1, 2, 4, 8, 16],

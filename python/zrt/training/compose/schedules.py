@@ -102,6 +102,9 @@ class StepResult:
 
     # Total comm volume = exposed + hidden
     total_comm_volume: float = 0.0  # All comm in step
+    
+    # MHC recompute time (seconds) — sum of all stages' mhc_recompute
+    mhc_recompute: float = 0.0
 
 
 def _dp_hide_window(
@@ -582,6 +585,7 @@ def pipeline_step_time(
                 tp_exposed=st.tp_exposed,
                 ep_exposed=st.ep_exposed,
                 cp_exposed=st.cp_exposed,
+                mhc_recompute=st.mhc_recompute,
             )
             for st in stage_times
         ]
@@ -592,6 +596,9 @@ def pipeline_step_time(
     step = composer.compose(stage_times, M, pp, dp_ar_time, strategy)
 
     step.per_stage = stage_times
+
+    # Calculate total MHC recompute time from all stages
+    step.mhc_recompute = sum(st.mhc_recompute for st in stage_times) * M
 
     # Dual-batch overlap on pipeline bubble.
     #

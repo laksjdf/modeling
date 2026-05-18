@@ -32,6 +32,7 @@ class StageTime:
     tp_exposed: float = 0.0  # TP comm exposed after CoC/MC2 (fwd + bwd combined)
     ep_exposed: float = 0.0  # EP comm exposed after wave-overlap (fwd + bwd combined)
     cp_exposed: float = 0.0  # CP comm exposed — no overlap mechanism (fwd + bwd combined)
+    mhc_recompute: float = 0.0  # MHC (hc category) recompute time for this stage
 
 
 def ep_imbalance_factor(num_experts: int, ep: int, topk: int = 1) -> float:
@@ -188,6 +189,7 @@ def stage_time(
     # Recompute: re-do forward for selected ops before backward
     recompute_t = _recompute_time(stage_ops, model, system, strategy, gpu_name)
     t_bwd_dx += recompute_t
+    mhc_recompute_t = _mhc_recompute_time(stage_ops, model, system, strategy, gpu_name)
 
     t_comm_fwd = 0.0
     t_comm_bwd = 0.0
@@ -392,6 +394,7 @@ def stage_time(
         tp_exposed=t_tp_exposed_fwd + t_tp_exposed_bwd,
         ep_exposed=t_ep_exposed_fwd + t_ep_exposed_bwd,
         cp_exposed=t_cp_comm_fwd + t_cp_comm_bwd,
+        mhc_recompute=mhc_recompute_t,
     )
 
 
@@ -433,6 +436,42 @@ def _recompute_time(
             op_dtype = _resolve_compute_dtype(op, model)
             t += _cost_phase_time(cost, "fwd", system, gpu_name, overlap, op_dtype)
 
+    return t
+
+
+def _mhc_recompute_time(
+    ops: list[Op], model: ModelSpec, system: SystemSpec,
+    strategy: Strategy, gpu_name: str,
+) -> float:
+    """Compute MHC (hc category) recompute time for this stage.
+    
+    Returns the forward pass time for mhc_pre/mhc_post/mhc_head ops
+    that are selected for recompute under the "hc" category.
+    If MHC recompute is not enabled (no "hc" in policy), returns 0.0.
+    """
+    from zrt.training.models.flops import _op_recompute_categories as _flops_op_cats
+    
+    policy = strategy.recompute.per_layer
+    if not policy:
+        return 0.0
+    
+    t = 0.0
+    for op in ops:
+        if op.layer_id < 0:
+            continue
+        if op.kind not in ("mhc_pre", "mhc_post", "mhc_head"):
+            continue
+        lk = model.layers[op.layer_id].value if op.layer_id < len(model.layers) else ""
+        cats = policy.get(lk, set())
+        if "hc" not in cats:
+            continue
+        op_cats = _flops_op_cats(op)
+        if op_cats & {"hc"}:
+            cost = op_cost(op, model, system)
+            overlap = system.gpu.overlap_ratio.get(op.kind, 0.0)
+            op_dtype = _resolve_compute_dtype(op, model)
+            t += _cost_phase_time(cost, "fwd", system, gpu_name, overlap, op_dtype)
+    
     return t
 
 

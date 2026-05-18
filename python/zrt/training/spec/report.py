@@ -159,6 +159,9 @@ class TrainingReport:
     # Fused-operator summary (graph-native runs only).
     # Maps fused op_type → {count, sample_names, total_flops_pct, dtype, module_class}.
     fused_ops_summary: dict = field(default_factory=dict)
+    
+    # MHC recompute time (milliseconds) — 0.0 if MHC recompute not enabled
+    mhc_recompute_ms: float = 0.0
 
     def __post_init__(self) -> None:
         """Sync total_flops with training_flops for unified contract.
@@ -214,6 +217,7 @@ class TrainingReport:
             "ep_total_ms": self.ep_total_ms,
             "pp_total_ms": self.pp_total_ms,
             "dp_total_ms": self.dp_total_ms,
+            "mhc_recompute_ms": self.mhc_recompute_ms,
         }
 
         # Add optional fields if present
