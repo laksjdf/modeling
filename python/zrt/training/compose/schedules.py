@@ -200,21 +200,23 @@ class OneF1BComposer(PipelineComposer):
     ) -> StepResult:
         """Standard 1F1B pipeline schedule.
 
-        Uses bottleneck stage times to avoid underestimating bubble:
-        warmup   = (pp - 1) * max(t_fwd[s])
-        steady   = M * max(t_fwd[s] + t_bwd[s])
-        cooldown = (pp - 1) * max(t_bwd[s])
-        step     = warmup + steady + cooldown + dp_ar_exposed
+        Reference formula (pipeline_bubble_formula_google.md):
+            warmup   = (PP - 1) * F
+            steady   = M * (F + B)
+            cooldown = (PP - 1) * B
+            bubble   = (PP - 1) * (F + B)
+
+        In standard 1F1B, backward is executed as a whole (B + W combined).
+        W cannot be separated to fill bubble, so cooldown uses full bwd.
+        F = t_fwd, B = t_bwd (full backward including weight gradient).
         """
         if pp == 1:
-            # No pipeline: just fwd + bwd for single stage
             st = stage_times[0] if stage_times else StageTime()
             step = st.fwd + st.bwd
             steady_bwd_total = st.bwd * M
             hidden = _dp_hidden(dp_ar_time, 0.0, steady_bwd_total, strategy)
             dp_exposed = dp_ar_time - hidden
 
-            ideal_step = M * (st.fwd + st.bwd)
             bubble_frac = 0.0
 
             return StepResult(
@@ -238,24 +240,21 @@ class OneF1BComposer(PipelineComposer):
                 steady_per_mb=step,
             )
 
-        # With pipeline parallelism
-        t_fwd_max = max(st.fwd for st in stage_times) if stage_times else 0
-        t_bwd_max = max(st.bwd for st in stage_times) if stage_times else 0
-        t_stage_max = max(st.fwd + st.bwd for st in stage_times) if stage_times else 0
+        t_fwd_max = max(st.fwd for st in stage_times) if stage_times else 0.0
+        t_bwd_max = max(st.bwd for st in stage_times) if stage_times else 0.0
+        t_stage_max = max(st.fwd + st.bwd for st in stage_times) if stage_times else 0.0
 
         warmup = (pp - 1) * t_fwd_max
         steady = M * t_stage_max
         cooldown = (pp - 1) * t_bwd_max
 
-        # DP AR: hide in cooldown (backward drain phase) if enabled
         bubble = warmup + cooldown
         steady_bwd_total = M * t_bwd_max
         hidden = _dp_hidden(dp_ar_time, cooldown, steady_bwd_total, strategy)
         dp_exposed = dp_ar_time - hidden
 
         step = warmup + steady + cooldown + dp_exposed
-        ideal_step = M * t_stage_max
-        bubble_frac = (warmup + cooldown) / step if step > 0 else 0.0
+        bubble_frac = bubble / step if step > 0 else 0.0
 
         return StepResult(
             step_time=step,
@@ -282,13 +281,16 @@ class OneF1BComposer(PipelineComposer):
 class Interleaved1F1BComposer(PipelineComposer):
     """VPP / Interleaved 1F1B pipeline schedule.
 
-    Each device holds `vpp_chunks` virtual stages, reducing pipeline
-    bubble by interleaving forward and backward passes.
+    Reference formula (pipeline_bubble_formula_google.md):
+        warmup   = (PP - 1) / V * F
+        steady   = M * (F + B)
+        cooldown = (PP - 1) / V * B
+        bubble   = (PP - 1) / V * (F + B)
 
-    With V virtual stages per device, each virtual stage has 1/V of the
-    layers, so per-virtual-stage times are t_fwd/V and t_bwd/V.
-    The warmup/cooldown fill (pp-1) pipeline slots but each slot is
-    1/V the time, giving a bubble that is V times smaller than standard 1F1B.
+    where V = vpp_chunks, F = t_fwd, B = t_bwd (full backward).
+    Each device holds V virtual stages, so per-virtual-stage time is 1/V.
+    warmup_steps = cooldown_steps = PP - 1 (number of microbatches to fill/drain).
+    Standard 1F1B: W cannot be separated, so cooldown uses full bwd.
     """
 
     def compose(
@@ -303,13 +305,13 @@ class Interleaved1F1BComposer(PipelineComposer):
         if V <= 1 or pp <= 1:
             return OneF1BComposer().compose(stage_times, M, pp, dp_ar_time, strategy)
 
-        t_fwd_max = max(st.fwd for st in stage_times) if stage_times else 0
-        t_bwd_max = max(st.bwd for st in stage_times) if stage_times else 0
-        t_stage_max = max(st.fwd + st.bwd for st in stage_times) if stage_times else 0
+        t_fwd_max = max(st.fwd for st in stage_times) if stage_times else 0.0
+        t_bwd_max = max(st.bwd for st in stage_times) if stage_times else 0.0
+        t_stage_max = max(st.fwd + st.bwd for st in stage_times) if stage_times else 0.0
 
-        warmup = (pp - 1) * t_fwd_max / V
+        warmup = (pp - 1) / V * t_fwd_max
         steady = M * t_stage_max
-        cooldown = (pp - 1) * t_bwd_max / V
+        cooldown = (pp - 1) / V * t_bwd_max
 
         bubble = warmup + cooldown
         steady_bwd_total = M * t_bwd_max
@@ -317,7 +319,7 @@ class Interleaved1F1BComposer(PipelineComposer):
         dp_exposed = dp_ar_time - hidden
 
         step = warmup + steady + cooldown + dp_exposed
-        bubble_frac = (warmup + cooldown) / step if step > 0 else 0.0
+        bubble_frac = bubble / step if step > 0 else 0.0
 
         return StepResult(
             step_time=step,
@@ -327,8 +329,8 @@ class Interleaved1F1BComposer(PipelineComposer):
             cooldown=cooldown,
             dp_exposed=dp_exposed,
             schedule_name="i1f1b",
-            warmup_steps=max(1, -(-(pp - 1) // V)),
-            cooldown_steps=max(1, -(-(pp - 1) // V)),
+            warmup_steps=pp - 1,
+            cooldown_steps=pp - 1,
             warmup_fwd=warmup,
             warmup_bwd=0.0,
             steady_fwd=M * t_fwd_max,
@@ -344,12 +346,16 @@ class Interleaved1F1BComposer(PipelineComposer):
 class DualPipeComposer(PipelineComposer):
     """DualPipe schedule — forward and backward on different stages in parallel.
 
-    Key insight: in standard 1F1B, each stage alternates F then B.
-    DualPipe splits the pipeline so that while stage S does forward,
-    stage S+1 does backward, reducing bubble.
+    Reference formula (pipeline_bubble_formula_google.md):
+        warmup   = (PP/2 - 1) * (F&B - 2W)
+        steady   = M * F&B  (F&B = max(F, B), overlapped forward-backward)
+        cooldown = (PP/2 - 1) * (B - W)
+        bubble   = (PP/2 - 1) * (F&B + B - 3W)
 
-    Bubble fraction ≈ (pp - 1) / (2 * M + pp - 1)
-    Step time ≈ (M + (pp-1)/2) * t_stage + dp_exposed
+    where F = t_fwd, B = t_bwd_dx (activation gradient), W = t_bwd_dw.
+    If bwd_dx not set, derive from bwd - bwd_dw or bwd.
+    DualPipe uses bidirectional streams, halving effective pipeline depth.
+    W fills bubble slots in both warmup and cooldown phases.
     """
 
     def compose(
@@ -364,21 +370,34 @@ class DualPipeComposer(PipelineComposer):
             return OneF1BComposer().compose(stage_times, M, pp, dp_ar_time, strategy)
 
         t_fwd_max = max((st.fwd for st in stage_times), default=0.0)
+        t_b_dx_max = max((st.bwd_dx for st in stage_times), default=0.0)
         t_bwd_max = max((st.bwd for st in stage_times), default=0.0)
-        t_stage_max = t_fwd_max + t_bwd_max
+        t_w_max = max((st.bwd_dw for st in stage_times), default=0.0)
 
-        # Reference: DualPipe README formula (PP/2-1)*t_stage
-        # pp=2: two anti-parallel streams perfectly fill each other → zero bubble
-        # pp=3: half-stage bubble (not floored to zero)
-        bubble = max(pp / 2 - 1, 0) * t_stage_max
-        warmup = bubble / 2.0
-        cooldown = bubble / 2.0
-        steady = M * t_stage_max
+        if t_b_dx_max == 0:
+            t_b_dx_max = t_bwd_max - t_w_max if t_bwd_max > t_w_max else t_bwd_max
+
+        F = t_fwd_max
+        B = t_b_dx_max
+        W = t_w_max
+
+        F_and_B = max(F, B)
+
+        ZB_BUBBLE_FLOOR_PER_TRANSITION = 2e-6
+
+        warmup_bubble_per_slot = max(F_and_B - 2 * W, ZB_BUBBLE_FLOOR_PER_TRANSITION)
+        cooldown_bubble_per_slot = max(B - W, ZB_BUBBLE_FLOOR_PER_TRANSITION)
+
+        warmup = max(pp / 2 - 1, 0) * warmup_bubble_per_slot
+        steady = M * F_and_B
+        cooldown = max(pp / 2 - 1, 0) * cooldown_bubble_per_slot
+
         steady_bwd_total = M * t_bwd_max
         hidden = _dp_hidden(dp_ar_time, cooldown, steady_bwd_total, strategy)
         dp_exposed = dp_ar_time - hidden
 
         step = warmup + steady + cooldown + dp_exposed
+        bubble = warmup + cooldown
         bubble_frac = bubble / step if step > 0 else 0.0
 
         return StepResult(
@@ -389,8 +408,8 @@ class DualPipeComposer(PipelineComposer):
             cooldown=cooldown,
             dp_exposed=dp_exposed,
             schedule_name="dualpipe",
-            warmup_steps=max(0, pp // 2 - 1),
-            cooldown_steps=max(0, pp // 2 - 1),
+            warmup_steps=max(0, int(pp // 2 - 1)),
+            cooldown_steps=max(0, int(pp // 2 - 1)),
             warmup_fwd=warmup,
             warmup_bwd=0.0,
             steady_fwd=M * t_fwd_max,
@@ -399,15 +418,23 @@ class DualPipeComposer(PipelineComposer):
             cooldown_bwd=cooldown,
             steady_fwd_per_mb=t_fwd_max,
             steady_bwd_per_mb=t_bwd_max,
-            steady_per_mb=t_stage_max,
+            steady_per_mb=F_and_B,
         )
 
 
 class DualPipeVComposer(PipelineComposer):
     """DualPipeV — DualPipe with virtual stage splitting.
 
-    Combines DualPipe's F/B parallelism with VPP's virtual stages.
-    Bubble ≈ (pp - 1) / (2 * V * M + pp - 1)
+    Reference formula (pipeline_bubble_formula_google.md):
+        warmup   = (PP/2 - 1) * (F&B - 2W)
+        steady   = M * F&B  (F&B = max(F, B))
+        cooldown = (PP/2 - 1) * (B - W)
+        bubble   = (PP/2 - 1) * (F&B + B - 3W)
+        devices  = PP / 2  (half the devices of DualPipe)
+
+    Combines DualPipe's bidirectional streams with VPP's virtual stages.
+    Each physical device holds V virtual stages and 2 DualPipe stages,
+    resulting in PP/2 physical devices instead of PP.
     """
 
     def compose(
@@ -425,21 +452,34 @@ class DualPipeVComposer(PipelineComposer):
             return OneF1BComposer().compose(stage_times, M, pp, dp_ar_time, strategy)
 
         t_fwd_max = max((st.fwd for st in stage_times), default=0.0)
+        t_b_dx_max = max((st.bwd_dx for st in stage_times), default=0.0)
         t_bwd_max = max((st.bwd for st in stage_times), default=0.0)
-        t_stage_max = t_fwd_max + t_bwd_max
+        t_w_max = max((st.bwd_dw for st in stage_times), default=0.0)
 
-        # Reference: DualPipeV README formula (PP/2-1)/V*t_stage
-        # pp=2: two anti-parallel streams perfectly fill each other → zero bubble
-        # pp=3: half-stage bubble (not floored to zero)
-        bubble = max(pp / 2 - 1, 0) / V * t_stage_max
-        warmup = bubble / 2.0
-        cooldown = bubble / 2.0
-        steady = M * t_stage_max
+        if t_b_dx_max == 0:
+            t_b_dx_max = t_bwd_max - t_w_max if t_bwd_max > t_w_max else t_bwd_max
+
+        F = t_fwd_max
+        B = t_b_dx_max
+        W = t_w_max
+
+        F_and_B = max(F, B)
+
+        ZB_BUBBLE_FLOOR_PER_TRANSITION = 2e-6
+
+        warmup_bubble_per_slot = max(F_and_B - 2 * W, ZB_BUBBLE_FLOOR_PER_TRANSITION)
+        cooldown_bubble_per_slot = max(B - W, ZB_BUBBLE_FLOOR_PER_TRANSITION)
+
+        warmup = max(pp / 2 - 1, 0) * warmup_bubble_per_slot
+        steady = M * F_and_B
+        cooldown = max(pp / 2 - 1, 0) * cooldown_bubble_per_slot
+
         steady_bwd_total = M * t_bwd_max
         hidden = _dp_hidden(dp_ar_time, cooldown, steady_bwd_total, strategy)
         dp_exposed = dp_ar_time - hidden
 
         step = warmup + steady + cooldown + dp_exposed
+        bubble = warmup + cooldown
         bubble_frac = bubble / step if step > 0 else 0.0
 
         return StepResult(
@@ -450,8 +490,8 @@ class DualPipeVComposer(PipelineComposer):
             cooldown=cooldown,
             dp_exposed=dp_exposed,
             schedule_name="dualpipev",
-            warmup_steps=max(0, (pp // 2 - 1 + V - 1) // V),
-            cooldown_steps=max(0, (pp // 2 - 1 + V - 1) // V),
+            warmup_steps=max(0, int(pp // 2 - 1)),
+            cooldown_steps=max(0, int(pp // 2 - 1)),
             warmup_fwd=warmup,
             warmup_bwd=0.0,
             steady_fwd=M * t_fwd_max,
@@ -460,21 +500,23 @@ class DualPipeVComposer(PipelineComposer):
             cooldown_bwd=cooldown,
             steady_fwd_per_mb=t_fwd_max,
             steady_bwd_per_mb=t_bwd_max,
-            steady_per_mb=t_stage_max,
+            steady_per_mb=F_and_B,
         )
 
 
 class ZeroBubbleComposer(PipelineComposer):
-    """ZeroBubble schedule with backward split into dX and dW phases.
+    """ZeroBubble (ZB-1P) schedule with backward split into B (dX) and W (dW) phases.
 
-    The critical path is the per-stage F+B time.  Weight-gradient work can
-    be delayed to fill pipeline bubbles, so the exposed bubble is reduced by
-    the bottleneck stage's dW time:
+    Reference formula (pipeline_bubble_formula_google.md):
+        warmup   = (PP - 1) * (F - W)
+        steady   = M * (F + B)
+        cooldown = (PP - 1) * (B - W)
+        bubble   = (PP - 1) * (F + B - 2W)
 
-        step = M * t_stage + (pp - 1) * max(t_stage - t_w, ZB_BUBBLE_FLOOR)
-
-    where ZB_BUBBLE_FLOOR represents the residual per-transition P2P latency
-    that ZB-1P/ZB-V cannot eliminate.
+    where F = t_fwd, B = t_bwd_dx (activation gradient), W = t_bwd_dw.
+    If bwd_dx not set, derive from bwd - bwd_dw.
+    Weight-gradient work (W) can be reordered to fill pipeline bubbles.
+    A small P2P latency residual is kept to avoid unrealistic zero-bubble.
     """
 
     def compose(
@@ -489,32 +531,27 @@ class ZeroBubbleComposer(PipelineComposer):
             return OneF1BComposer().compose(stage_times, M, pp, dp_ar_time, strategy)
 
         bottleneck = max(stage_times, key=lambda st: st.fwd + st.bwd) if stage_times else StageTime()
-        t_stage = bottleneck.fwd + bottleneck.bwd
         t_fwd = bottleneck.fwd
+        t_b_dx = bottleneck.bwd_dx if bottleneck.bwd_dx > 0 else (bottleneck.bwd - bottleneck.bwd_dw)
         t_bwd = bottleneck.bwd
         t_w = bottleneck.bwd_dw
+        t_stage = t_fwd + t_bwd
 
-        # ZB-1P/ZB-V keep a residual per-transition bubble even when t_w ≈ t_stage.
-        # The empirical floor is roughly 2 microseconds (P2P latency) per pp-1
-        # transition. We use 1e-6 s here as the minimum unit; callers that want
-        # a hardware-derived floor can pass it in via stage_times comm_bwd already
-        # baked into t_stage. This avoids the "0 bubble" artifact in search.
-        #
-        # Reference formula (F+B-2W) from DualPipe README: weight-gradient work
-        # (W) fills bubbles on BOTH forward and backward passes, so we subtract
-        # 2*t_w instead of t_w.
-        ZB_BUBBLE_FLOOR_PER_TRANSITION = 2e-6  # 2 µs P2P latency per pp transition
-        bubble = max((pp - 1) * max(t_stage - 2 * t_w, 0.0),
-                     (pp - 1) * ZB_BUBBLE_FLOOR_PER_TRANSITION)
-        warmup = bubble / 2.0
+        ZB_BUBBLE_FLOOR_PER_TRANSITION = 2e-6
+
+        warmup_bubble_per_stage = max(t_fwd - t_w, ZB_BUBBLE_FLOOR_PER_TRANSITION)
+        cooldown_bubble_per_stage = max(t_b_dx - t_w, ZB_BUBBLE_FLOOR_PER_TRANSITION)
+
+        warmup = (pp - 1) * warmup_bubble_per_stage
         steady = M * t_stage
-        cooldown = bubble / 2.0
+        cooldown = (pp - 1) * cooldown_bubble_per_stage
 
         steady_bwd_total = M * t_bwd
         hidden = _dp_hidden(dp_ar_time, cooldown, steady_bwd_total, strategy)
         dp_exposed = dp_ar_time - hidden
 
         step = warmup + steady + cooldown + dp_exposed
+        bubble = warmup + cooldown
         bubble_frac = bubble / step if step > 0 else 0.0
 
         return StepResult(

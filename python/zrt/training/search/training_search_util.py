@@ -617,6 +617,9 @@ def export_best_configs_excel(
         all_results: List[Dict],
         output_path: str
 ) -> None:
+    """
+    在寻优完成后，重新执行top配置，导出单套配置表格
+    """
     from zrt.training.ir.builders import build_graph
     from zrt.training.models.flops import op_cost as _op_cost
     from zrt.training.io.excel_exporter import export_estimate_excel
@@ -822,8 +825,8 @@ if __name__ == "__main__":
         "ep": [384],
         "dp": "auto",
         "micro_batch": [1, 16, 32],
-        "global_batch": [512, 1024, 2048, 4096, 8192, 65536],
-        "seq_len": [8192, 32768, 131072],
+        "global_batch": [512, 1024, 2048],
+        "seq_len": [8192],
         "zero_stage": [3],
         "pp_schedule": ["dualpipev"],
         "cp_kind": ["ulysses"],

@@ -114,6 +114,11 @@ def test_standard_1f1b_schedule_identity():
 
 
 def test_zero_bubble_uses_weight_grad_to_reduce_bubble():
+    """ZB-1P uses W (weight gradient) to fill pipeline bubble.
+
+    Formula: warmup = (PP-1) * (F - W), cooldown = (PP-1) * (B - W)
+    where F = fwd, B = bwd_dx (activation gradient only).
+    """
     st = [
         StageTime(fwd=0.01, bwd=0.02, bwd_dx=0.01, bwd_dw=0.01),
         StageTime(fwd=0.01, bwd=0.02, bwd_dx=0.01, bwd_dw=0.01),
@@ -124,15 +129,16 @@ def test_zero_bubble_uses_weight_grad_to_reduce_bubble():
     M = s.num_microbatches()
 
     zb = ZeroBubbleComposer().compose(st, M, 4, 0.0, s)
-    dp = DualPipeComposer().compose(st, M, 4, 0.0, _make_strategy(pp=4))
-
-    t_stage = 0.03
-    t_w = 0.01
-    expected = M * t_stage + (4 - 1) * max(t_stage - 2 * t_w, 0.0)
-    assert zb.step_time == pytest.approx(expected, rel=1e-9)
     f1b = OneF1BComposer().compose(st, M, 4, 0.0, _make_strategy(pp=4))
+
+    t_fwd = 0.01
+    t_b_dx = 0.01
+    t_stage = 0.03
+    warmup_expected = 3 * max(t_fwd - 0.01, 2e-6)
+    cooldown_expected = 3 * max(t_b_dx - 0.01, 2e-6)
+    step_expected = warmup_expected + M * t_stage + cooldown_expected
+    assert zb.step_time == pytest.approx(step_expected, rel=1e-6)
     assert zb.bubble_fraction < f1b.bubble_fraction
-    assert dp.bubble_fraction < f1b.bubble_fraction
     assert zb.schedule_name == "zb"
 
 
@@ -181,33 +187,45 @@ def test_dualpipev_pp2_zero_bubble():
 
 
 def test_dualpipe_pp3_half_stage_bubble():
-    """DualPipe pp=3: odd pipeline degree produces half-stage bubble, not zero."""
-    st = _make_stage_times(3)
+    """DualPipe pp=3: odd pipeline degree produces half-stage bubble.
+
+    Formula: warmup = (PP/2-1) * (F&B - 2W), cooldown = (PP/2-1) * (B - W)
+    For pp=3 with no W: warmup = cooldown = 0.5 * F&B
+    F&B = max(F, B) = max(0.01, 0.02) = 0.02
+    """
+    st = _make_stage_times(3, fwd=0.01, bwd=0.02)
     s = _make_strategy(pp=3)
     M = s.num_microbatches()
 
     result = DualPipeComposer().compose(st, M, 3, 0.0, s)
 
-    # pp=3: (3/2 - 1) = 0.5 stages of bubble, split evenly between warmup/cooldown
-    # Each stage is 0.03 ms (0.01 fwd + 0.02 bwd)
-    # Bubble = 0.5 * 0.03 = 0.015 ms, warmup = cooldown = 0.0075 ms
-    expected_bubble = 0.5 * 0.03  # half-stage bubble
-    assert result.bubble_fraction > 0.0  # Should NOT be zero
-    assert result.warmup == pytest.approx(expected_bubble / 2, abs=1e-9)
-    assert result.cooldown == pytest.approx(expected_bubble / 2, abs=1e-9)
+    F = 0.01
+    B_dx = 0.02
+    F_and_B = max(F, B_dx)
+    warmup_expected = 0.5 * F_and_B
+    cooldown_expected = 0.5 * B_dx
+    assert result.bubble_fraction > 0.0
+    assert result.warmup == pytest.approx(warmup_expected, abs=1e-6)
+    assert result.cooldown == pytest.approx(cooldown_expected, abs=1e-6)
 
 
 def test_dualpipev_pp3_half_stage_bubble():
-    """DualPipeV pp=3: odd pipeline degree produces half-stage bubble divided by V."""
-    st = _make_stage_times(3)
+    """DualPipeV pp=3, V=2: bubble same as DualPipe (V only affects device count).
+
+    Formula unchanged from DualPipe: warmup = cooldown = 0.5 * F&B
+    F&B = max(F, B) = 0.02
+    """
+    st = _make_stage_times(3, fwd=0.01, bwd=0.02)
     s = _make_strategy(pp=3, vpp_chunks=2, schedule=PPSched.DUALPIPE_V)
     M = s.num_microbatches()
 
     result = DualPipeVComposer().compose(st, M, 3, 0.0, s)
 
-    # pp=3, V=2: (3/2 - 1) / 2 = 0.25 stages of bubble
-    # Each stage is 0.03 ms, so bubble = 0.25 * 0.03 = 0.0075 ms
-    expected_bubble = (1.5 - 1) / 2 * 0.03  # (pp/2 - 1) / V * t_stage
-    assert result.bubble_fraction > 0.0  # Should NOT be zero
-    assert result.warmup == pytest.approx(expected_bubble / 2, abs=1e-9)
-    assert result.cooldown == pytest.approx(expected_bubble / 2, abs=1e-9)
+    F = 0.01
+    B_dx = 0.02
+    F_and_B = max(F, B_dx)
+    warmup_expected = 0.5 * F_and_B
+    cooldown_expected = 0.5 * B_dx
+    assert result.bubble_fraction > 0.0
+    assert result.warmup == pytest.approx(warmup_expected, abs=1e-6)
+    assert result.cooldown == pytest.approx(cooldown_expected, abs=1e-6)

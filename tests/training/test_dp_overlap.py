@@ -36,12 +36,7 @@ class TestSteadyBwdOverlap:
         assert s.dp_steady_overlap_ratio == 0.5
 
     def test_ratio_extends_hide_window_in_dualpipe(self):
-        """DualPipe cooldown is small; with ratio>0, steady_bwd contributes
-        and dp_exposed shrinks."""
-        # Two equal stages, fwd=10, bwd=20 → t_fwd_max=10, t_bwd_max=20, t_stage_max=30
-        # pp=2 DualPipe: bubble = (pp-1)/2 * t_stage_max = 15
-        #                cooldown = bubble / 2 = 7.5
-        # steady_bwd_total = M * t_bwd_max = 4 * 20 = 80 (bottom-up: reads actual bwd)
+        """DualPipe pp=2: bubble=0, cooldown=0. DP hide relies entirely on steady_bwd."""
         stages = [StageTime(fwd=10.0, bwd=20.0), StageTime(fwd=10.0, bwd=20.0)]
         s_no = Strategy(tp=1, pp=2, dp=4, micro_batch=1, global_batch=4,
                         pp_schedule=PPSched.DUALPIPE, dp_steady_overlap_ratio=0.0)
@@ -51,10 +46,12 @@ class TestSteadyBwdOverlap:
         r_no = DualPipeComposer().compose(stages, M=4, pp=2, dp_ar_time=100.0, strategy=s_no)
         r_half = DualPipeComposer().compose(stages, M=4, pp=2, dp_ar_time=100.0, strategy=s_half)
 
-        # ratio=0: window = 7.5 → hide = 7.5 → exposed = 92.5
-        # ratio=0.5: window = 7.5 + 0.5*80 = 47.5 → hide = 47.5 → exposed = 52.5
-        assert r_no.dp_exposed == pytest.approx(92.5)
-        assert r_half.dp_exposed == pytest.approx(52.5)
+        assert r_no.cooldown == pytest.approx(0.0, abs=1e-12)
+        assert r_half.cooldown == pytest.approx(0.0, abs=1e-12)
+        assert r_no.dp_exposed == pytest.approx(100.0)
+        steady_bwd = 4 * 20.0
+        hide_half = min(0.5 * steady_bwd, 100.0 * (1 - 1/25))
+        assert r_half.dp_exposed == pytest.approx(100.0 - hide_half)
 
     def test_ratio_zero_matches_legacy_behavior(self):
         """ratio=0 should reproduce the previous cooldown-only window exactly,
@@ -78,18 +75,17 @@ class TestDualbatchRecoversWithSteadyOverlap:
     """
 
     def test_dualbatch_dualpipe_preserves_cooldown_dp_hide(self):
-        """DualPipe + dualbatch: composer cooldown is non-zero, so DP can
-        hide in cooldown even with ratio=0."""
+        """DualPipe + dualbatch: pp=2 gives zero bubble (cooldown=0).
+        DP hide relies on steady_bwd overlap via dp_steady_overlap_ratio."""
         model = ModelSpec(hidden=2048, ffn=8192, num_heads=16, num_kv_heads=16,
                           head_dim=128, vocab=32000, seq_len=1024,
                           layers=[LayerKind.DENSE]*4)
         s = Strategy(tp=1, pp=2, dp=4, micro_batch=1, global_batch=4,
                      pp_schedule=PPSched.DUALPIPE, dualbatch=True,
-                     dp_steady_overlap_ratio=0.0)
+                     dp_steady_overlap_ratio=0.5)
         graph = build_graph(model, s)
         result = pipeline_step_time(graph, model, _make_system(), s)
-        # Composer cooldown survives → some DP can be hidden in it.
-        assert result.cooldown > 0.0
+        assert result.cooldown == pytest.approx(0.0, abs=1e-12)
         assert result.dp_hidden >= 0.0
 
     def test_dualbatch_with_ratio_half_recovers_dp_hide(self):
@@ -277,12 +273,13 @@ class TestZeroBubbleFloor:
             f"ZB cooldown collapsed to zero; got cooldown={r.cooldown}"
 
     def test_unbalanced_tw_uses_natural_value(self):
-        """When t_stage > t_w, the natural formula dominates and the floor is
+        """When B > W, the natural formula dominates and the floor is
         not applied (floor < natural)."""
-        stages = [StageTime(fwd=4.0, bwd=6.0, bwd_dw=2.0),  # t_w small
+        stages = [StageTime(fwd=4.0, bwd=6.0, bwd_dw=2.0),
                   StageTime(fwd=4.0, bwd=6.0, bwd_dw=2.0)]
         s = Strategy(tp=1, pp=2, dp=4, micro_batch=1, global_batch=4,
                      pp_schedule=PPSched.ZERO_BUBBLE)
         r = ZeroBubbleComposer().compose(stages, M=4, pp=2, dp_ar_time=0.0, strategy=s)
-        # Natural: bubble = (pp-1)*(t_stage - t_w) = 1*(10-2) = 8; cooldown=4
-        assert r.cooldown == pytest.approx(4.0)
+        B = 6.0 - 2.0
+        cooldown_expected = (2 - 1) * (B - 2.0)
+        assert r.cooldown == pytest.approx(cooldown_expected)

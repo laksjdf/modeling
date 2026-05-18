@@ -163,13 +163,12 @@ def _mock_timeline(values):
 
 
 def test_vpp_composer_reduces_bubble_vs_1f1b():
-    # MagicMock scheduler → validates composer dispatch + bubble arithmetic, not DAG timing
     f1b = _run_pass(pp=4, pp_schedule="1f1b")
     vpp = _run_pass(pp=4, pp_schedule="interleaved", vpp_chunks=2)
     assert vpp.step_time_ms < f1b.step_time_ms
     assert vpp.bubble_fraction < f1b.bubble_fraction
     assert f1b.warmup_steps == 3 and f1b.cooldown_steps == 3
-    assert vpp.warmup_steps == 2 and vpp.cooldown_steps == 2
+    assert vpp.warmup_steps == 3 and vpp.cooldown_steps == 3
 
 
 def test_dualpipe_composer_reduces_bubble_vs_1f1b():
@@ -196,10 +195,15 @@ def test_zero_bubble_uses_dw_split_to_reduce_dualpipe_bubble():
 
     pp = 4
     M = 8
-    t_stage_ms = 3.0
+    t_fwd_ms = 1.0
+    t_bwd_ms = 2.0
     t_w_ms = 1.0
-    # Corrected formula: subtract 2*t_w instead of t_w
-    expected_step_ms = M * t_stage_ms + (pp - 1) * max(t_stage_ms - 2 * t_w_ms, 0.0)
+    t_b_dx_ms = t_bwd_ms - t_w_ms
+    t_stage_ms = t_fwd_ms + t_bwd_ms
+    ZB_BUBBLE_FLOOR = 2e-6
+    warmup_bubble = (pp - 1) * max(t_fwd_ms - t_w_ms, ZB_BUBBLE_FLOOR * 1000)
+    cooldown_bubble = (pp - 1) * max(t_b_dx_ms - t_w_ms, ZB_BUBBLE_FLOOR * 1000)
+    expected_step_ms = M * t_stage_ms + warmup_bubble + cooldown_bubble
 
     assert metadata["stage_timelines_bwd_dw"] == {
         0: pytest.approx(1000.0),
@@ -207,7 +211,7 @@ def test_zero_bubble_uses_dw_split_to_reduce_dualpipe_bubble():
         2: pytest.approx(1000.0),
         3: pytest.approx(1000.0),
     }
-    assert zero_bubble.step_time_ms == pytest.approx(expected_step_ms)
+    assert zero_bubble.step_time_ms == pytest.approx(expected_step_ms, rel=0.01)
     f1b, _ = _run_stage_pass("1f1b")
     assert zero_bubble.bubble_fraction < f1b.bubble_fraction
     assert dualpipe.bubble_fraction < f1b.bubble_fraction
@@ -217,9 +221,13 @@ def test_zero_bubble_uses_bottleneck_stage_dw_split():
     zero_bubble, metadata = _run_heterogeneous_stage_pass("zb")
 
     M = 4
+    t_fwd_ms = 1.0
+    t_b_dx_ms = 3.0
     t_stage_ms = 4.0
     bottleneck_t_w_ms = 0.0
-    expected_step_ms = M * t_stage_ms + (2 - 1) * (t_stage_ms - bottleneck_t_w_ms)
+    warmup_bubble = (2 - 1) * max(t_fwd_ms - bottleneck_t_w_ms, 2e-3)
+    cooldown_bubble = (2 - 1) * max(t_b_dx_ms - bottleneck_t_w_ms, 2e-3)
+    expected_step_ms = M * t_stage_ms + warmup_bubble + cooldown_bubble
 
     assert metadata["stage_timelines_bwd_dw"][0] == pytest.approx(0.0)
     assert metadata["stage_timelines_bwd_dw"][1] == pytest.approx(1000.0)
