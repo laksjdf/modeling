@@ -945,7 +945,7 @@ def export_estimate_html(
         "exposed_comm_ms": report.exposed_comm_ms,
         "optimizer_time_ms": report.optimizer_time_ms,
         "optimizer_comm_ms": report.optimizer_comm_ms,
-        "bubble_ms": report.bubble_ms,
+        "bubble_ms": report.bubble_time_ms,
     }
     html = html.replace("{breakdown_json}", json.dumps(breakdown))
 

@@ -231,16 +231,16 @@ def test_search_report_surfaces_bubble_and_recompute():
     report = estimate(model, system, strategy)
 
     d = report_to_dict(report)
-    for key in ("bubble_ms", "recompute_time_ms", "recompute_time_raw_ms"):
+    for key in ("bubble_time_ms", "recompute_time_ms", "recompute_time_raw_ms"):
         assert key in d, f"{key} missing from report_to_dict"
-    assert d["bubble_ms"] > 0.0
+    assert d["bubble_time_ms"] > 0.0
     assert d["recompute_time_raw_ms"] > 0.0
 
     txt = report_summary(report)
     assert "Recompute (critical path)" in txt
     assert "Recompute (pre/post pipeline-hide)" in txt
     assert "raw (pre-hide, NOT in step)" in txt
-    assert f"({report.bubble_ms:.2f} ms)" in txt
+    assert f"({report.bubble_time_ms:.1f} ms)" in txt
     # The recompute/bubble lines we added must not introduce CJK (the
     # pre-existing table uses box-drawing '─' but no wide CJK that would
     # break <NNs> column alignment / crash GBK consoles).
