@@ -880,8 +880,7 @@ classDiagram
 cd /mnt/d/workspace/claude/modeling
 
 # 单配置评估
-PYTHONPATH=python:. python -m python.zrt \
-    --estimate-config python/zrt/training/configs/deepseek_v3_2_3d_h100.yaml
+PYTHONPATH=python:. python -m python.zrt --estimate-config python/zrt/training/configs/deepseek_v3_2_3d_h100.yaml
 
 # 输出
 # Console: Training Estimation Report (含 step time breakdown)

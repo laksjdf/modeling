@@ -15,7 +15,7 @@ from zrt.training.models.flops import total_training_flops, forward_backward_flo
 from zrt.training.models.memory import MemBreakdown
 from zrt.training.spec.model import ModelSpec
 from zrt.training.spec.report import TrainingReport
-from zrt.training.spec.strategy import Strategy
+from zrt.training.spec.strategy import Strategy, rank_product
 from zrt.training.spec.system import SystemSpec
 
 
@@ -58,7 +58,7 @@ def estimate(
         "model": f"hidden={model.hidden}, layers={len(model.layers)}, heads={model.num_heads}",
         "system": f"{system.gpu.name} x {system.world_size}",
         "strategy": f"TP={strategy.tp} CP={strategy.cp} PP={strategy.pp} EP={strategy.ep} DP={strategy.dp}",
-        "parallelism": f"TP*CP*PP*EP*DP = {strategy.tp * strategy.cp * strategy.pp * strategy.ep * strategy.dp}",
+        "parallelism": f"TP*CP*PP*DP = {rank_product(strategy.tp, strategy.cp, strategy.pp, strategy.ep, strategy.dp)} (EP={strategy.ep} shares ranks)",
         "micro_batch": strategy.micro_batch,
         "global_batch": strategy.global_batch,
         "num_microbatches": strategy.num_microbatches(),
