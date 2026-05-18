@@ -581,14 +581,6 @@ def format_results(reports: List[TrainingReport], configs: List[Dict]) -> pd.Dat
     if not df.empty:
         df = df.sort_values("mfu", ascending=False)
 
-    config_cols = [k for k in rows[0].keys() if k not in ["fwd_compute_ms", "bwd_compute_ms", "exposed_comm_ms",
-                                                          "tp_total_ms", "tp_exposed_ms", "cp_total_ms", "cp_exposed_ms",
-                                                          "ep_total_ms", "ep_exposed_ms", "pp_total_ms", "pp_exposed_ms",
-                                                          "dp_total_ms", "dp_exposed_ms", "optimizer_time_ms(compute)",
-                                                          "optimizer_comm_ms", "optimizer_comm_hidden_ms", "step_time_ms", "pipeline_time_ms",
-                                                          "mfu", "mfu_native", "hfu", "bubble_fraction", "tokens_per_sec",
-                                                          "weights_gb", "grads_gb", "opt_state_gb", "activations_gb",
-                                                          "comm_buffers_gb", "memory_gb", "mhc_recompute_ms"]] if rows else []
     metric_cols = ["fwd_compute_ms", "bwd_compute_ms", "exposed_comm_ms",
                    "tp_total_ms", "tp_exposed_ms", "cp_total_ms", "cp_exposed_ms",
                    "ep_total_ms", "ep_exposed_ms", "pp_total_ms", "pp_exposed_ms",
