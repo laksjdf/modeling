@@ -583,17 +583,46 @@ def pipeline_step_time(
 
     step.per_stage = stage_times
 
-    # Dual-batch overlap: two batches run simultaneously so the bubble of one
-    # is filled by the steady-state work of the other.
-    # Residual bubble = max(warmup + cooldown - steady, 0).
-    # When M >> PP-1 (typical), steady >> bubble → bubble fully hidden.
-    if strategy.dualbatch and pp > 1:
+    # Dual-batch overlap on pipeline bubble.
+    #
+    # Two micro-batch streams running in opposite pipeline directions can
+    # overlap each other's fill/drain, but the bubble can NEVER reach zero:
+    # at t=0 only stage 0 of stream-A and stage pp-1 of stream-B are busy;
+    # stages between them remain idle until the two fronts meet in the
+    # middle at t = (pp-1)/2 · t_stage. The symmetric drain at the end
+    # adds the same residual. No third stream exists to fill that
+    # fill/drain region, so the irreducible bubble is exactly the
+    # DualPipe(V) formula:  (pp-1)/(2·V) · t_stage_max.
+    #
+    
+    # The earlier formulation `residual = max(warmup + cooldown - steady, 0)`
+    # subtracted steady wall-time (busy slots) from bubble wall-time (idle
+    # slots) — dimensionally meaningless — and produced bubble_fraction=0
+    # whenever M >> pp-1, which is non-physical.
+    #
+    # Schedules that already model antiparallel streams (DualPipe,
+    # DualPipeV) bake this (pp-1)/(2·V) reduction into the composer; the
+    # `dualbatch` flag on those schedules only enables stage-level comm
+    # hiding (compose/stage.py). To avoid double-counting, we skip the
+    # pipeline-bubble adjustment for those schedules.
+    DUALBATCH_BAKED_IN = {PPSched.DUALPIPE, PPSched.DUALPIPE_V}
+    if (strategy.dualbatch and pp > 1
+            and strategy.pp_schedule not in DUALBATCH_BAKED_IN):
         original_bubble = step.warmup + step.cooldown
-        residual_bubble = max(original_bubble - step.steady, 0.0)
+        V = max(1, strategy.vpp_chunks)
+        t_stage_max = max(
+            (st.fwd + st.bwd for st in stage_times), default=0.0
+        )
+        # Antiparallel-stream floor — irreducible fill/drain.
+        target_bubble = (pp - 1) / (2.0 * V) * t_stage_max
+        # If the schedule's natural bubble is already at or below this
+        # floor (e.g., ZeroBubble), dualbatch yields no additional benefit.
+        residual_bubble = min(original_bubble, target_bubble)
         bubble_saved = original_bubble - residual_bubble
         new_cooldown = residual_bubble / 2.0
         # Recompute DP exposure through the same helper used by composers,
-        # so steady-BWD overlap is still available when dualbatch zeros the cooldown.
+        # so steady-BWD overlap continues even when dualbatch shrinks
+        # cooldown.
         steady_bwd_total_bot = max(0.0, step.steady_bwd_per_mb * M)
         if dp_ar_time > 0:
             new_dp_exposed = dp_ar_time - _dp_hidden(

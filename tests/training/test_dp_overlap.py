@@ -69,10 +69,17 @@ class TestSteadyBwdOverlap:
 
 
 class TestDualbatchRecoversWithSteadyOverlap:
-    """When dualbatch=True eats cooldown, DP can still overlap with steady BWD."""
+    """dualbatch + DP overlap interaction.
 
-    def test_dualbatch_with_ratio_zero_keeps_dp_fully_exposed(self):
-        """Backward-compat: ratio=0 → existing dualbatch behavior."""
+    Post-redesign: dualbatch on DualPipe/DualPipeV is a no-op for the
+    pipeline bubble (the antiparallel reduction is already baked into the
+    composer's (pp-1)/(2V) formula). The natural cooldown therefore
+    remains available for DP hiding even when dualbatch=True.
+    """
+
+    def test_dualbatch_dualpipe_preserves_cooldown_dp_hide(self):
+        """DualPipe + dualbatch: composer cooldown is non-zero, so DP can
+        hide in cooldown even with ratio=0."""
         model = ModelSpec(hidden=2048, ffn=8192, num_heads=16, num_kv_heads=16,
                           head_dim=128, vocab=32000, seq_len=1024,
                           layers=[LayerKind.DENSE]*4)
@@ -81,8 +88,9 @@ class TestDualbatchRecoversWithSteadyOverlap:
                      dp_steady_overlap_ratio=0.0)
         graph = build_graph(model, s)
         result = pipeline_step_time(graph, model, _make_system(), s)
-        # After dualbatch eats cooldown → new_cooldown=0 → exposed=dp_total
-        assert result.dp_hidden == pytest.approx(0.0, abs=1e-9)
+        # Composer cooldown survives → some DP can be hidden in it.
+        assert result.cooldown > 0.0
+        assert result.dp_hidden >= 0.0
 
     def test_dualbatch_with_ratio_half_recovers_dp_hide(self):
         model = ModelSpec(hidden=2048, ffn=8192, num_heads=16, num_kv_heads=16,
@@ -204,6 +212,47 @@ class TestLastBucketResidual:
                      dp_overlap_in_bubble=False, dp_grad_buckets=25)
         r = OneF1BComposer().compose(stages, M=4, pp=1, dp_ar_time=3.0, strategy=s)
         assert r.dp_exposed == pytest.approx(3.0)
+
+
+class TestDualbatchBubbleFloor:
+    """dualbatch cannot zero the pipeline bubble — there is always an
+    irreducible (pp-1)/(2V) · t_stage fill/drain even with two antiparallel
+    streams (no third stream exists to fill that region).
+    """
+
+    def test_1f1b_dualbatch_residual_bubble_is_dualpipe_floor(self):
+        """1F1B + dualbatch should reduce bubble to the DualPipe floor
+        (pp-1)/2 · t_stage_max, NOT to zero, regardless of M."""
+        model = ModelSpec(hidden=2048, ffn=8192, num_heads=16, num_kv_heads=16,
+                          head_dim=128, vocab=32000, seq_len=1024,
+                          layers=[LayerKind.DENSE] * 4)
+        # Large M to confirm bubble doesn't get "filled" by steady work.
+        s = Strategy(tp=1, pp=4, dp=2, micro_batch=1, global_batch=256,
+                     pp_schedule=PPSched.ONE_F_ONE_B, dualbatch=True)
+        graph = build_graph(model, s)
+        result = pipeline_step_time(graph, model, _make_system(), s)
+        assert result.bubble_fraction > 0.0, (
+            "dualbatch must not zero the pipeline bubble; got "
+            f"bubble_fraction={result.bubble_fraction}"
+        )
+        assert (result.warmup + result.cooldown) > 0.0
+
+    def test_dualpipev_dualbatch_skips_pipeline_adjustment(self):
+        """DualPipeV already bakes the antiparallel floor into the
+        composer's (pp-1)/(2V) bubble. dualbatch must not double-count
+        and zero it; the composer's bubble should pass through unchanged."""
+        model = ModelSpec(hidden=2048, ffn=8192, num_heads=16, num_kv_heads=16,
+                          head_dim=128, vocab=32000, seq_len=1024,
+                          layers=[LayerKind.DENSE] * 4)
+        s = Strategy(tp=1, pp=4, dp=2, micro_batch=1, global_batch=256,
+                     pp_schedule=PPSched.DUALPIPE_V, vpp_chunks=2,
+                     dualbatch=True)
+        graph = build_graph(model, s)
+        result = pipeline_step_time(graph, model, _make_system(), s)
+        # Composer gives bubble = (pp-1)/(2V) · t_stage > 0; dualbatch must
+        # leave it alone.
+        assert result.bubble_fraction > 0.0
+        assert (result.warmup + result.cooldown) > 0.0
 
 
 class TestZeroBubbleFloor:
