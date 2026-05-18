@@ -339,6 +339,7 @@ class TransformedGraphExcelWriter:
             ("Write Formula (sym)", 24),
             ("Write Formula (num)", 32),
             ("Activation (B)", 16),
+            ("Activation Memory (µs)", 20),
             # ── comm volume ───────────────────────────────────────────────────
             ("Comm Volume (B)", 14),
             # ── timing & bound ────────────────────────────────────────────────
@@ -388,7 +389,8 @@ class TransformedGraphExcelWriter:
             for key, val in node.annotations.items():
                 if key not in ("stream_id", "stream_type", "flops", "compute_us",
                                "memory_us", "latency_us", "arithmetic_intensity", "bound",
-                               "read_bytes", "write_bytes"):
+                               "read_bytes", "write_bytes", "saved_activation_bytes",
+                               "activation_memory_us"):
                     if isinstance(val, dict):
                         annotations_list.append(f"{key}={str(val)[:30]}")
                     else:
@@ -425,13 +427,14 @@ class TransformedGraphExcelWriter:
                 node.annotations.get("write_bytes", ""),
                 formulas["write_sym"],
                 formulas["write_num"],
-                0 if node.annotations.get("recompute") else sum(t.mem_bytes for t in node.outputs),
+                node.annotations.get("saved_activation_bytes", 0),
+                round(node.annotations.get("activation_memory_us", 0), 3) if node.annotations.get("activation_memory_us") else "",
                 # comm
                 comm_vol,
                 # timing & bound
                 round(node.annotations.get("compute_us", 0), 3) if node.annotations.get("compute_us") else "",
                 round(node.annotations.get("memory_us", 0), 3) if node.annotations.get("memory_us") else "",
-                round(node.annotations.get("latency_us", 0), 3) if node.annotations.get("latency_us") else "",
+                round(node.annotations.get("base_latency_us", 0), 3) if node.annotations.get("base_latency_us") else "",
                 round(node.annotations.get("latency_us", 0), 3) if node.annotations.get("latency_us") else "",
                 node.annotations.get("bound", ""),
                 round(node.annotations.get("arithmetic_intensity", 0), 2) if node.annotations.get("arithmetic_intensity") else "",
@@ -1332,7 +1335,7 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
                 comm_vol,
                 round(node.annotations.get("compute_us", 0), 3) if node.annotations.get("compute_us") else "",
                 round(node.annotations.get("memory_us", 0), 3) if node.annotations.get("memory_us") else "",
-                round(node.annotations.get("latency_us", 0), 3) if node.annotations.get("latency_us") else "",
+                round(node.annotations.get("base_latency_us", 0), 3) if node.annotations.get("base_latency_us") else "",
                 round(replay_us, 3) if replay_us else "",
                 round(node.annotations.get("latency_us", 0), 3) if node.annotations.get("latency_us") else "",
                 node.annotations.get("bound", ""),

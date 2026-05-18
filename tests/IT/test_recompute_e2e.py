@@ -174,6 +174,23 @@ def full_excel(tmp_path_factory, full_all):
 
 
 @pytest.fixture(scope="module")
+def none_excel(tmp_path_factory, none_all):
+    from python.zrt.transform.exporter import export_training_graphs
+
+    report, ctx, transformed = none_all
+    out = tmp_path_factory.mktemp("recompute_none_report")
+    graph = transformed["unified"]
+    paths = export_training_graphs(
+        fwd_graph=graph,
+        bwd_graph=graph,
+        ctx=ctx,
+        output_dir=out,
+        training_summary=report,
+    )
+    return paths["excel"], graph, report
+
+
+@pytest.fixture(scope="module")
 def full_final_excel(tmp_path_factory, full_all):
     from python.zrt.transform.exporter import export_training_graphs
 
@@ -319,17 +336,27 @@ class TestRecomputeE2E:
                    for n in g.nodes.values()
                    if n.annotations.get("phase") == phase)
 
-    def test_fwd_latency_unchanged(self, none_all, full_all, sel_all):
+    def _forward_activation_memory_sum(self, g):
+        return sum(n.annotations.get("activation_memory_us", 0.0) for n in _forward_nodes(g))
+
+    def test_fwd_activation_save_time_reduced_by_recompute(self, none_all, full_all, sel_all):
         u_none = none_all[2]["unified"]
         u_full = full_all[2]["unified"]
         u_sel  = sel_all[2]["unified"]
         f_none = self._phase_latency_sum(u_none, "fwd")
         f_full = self._phase_latency_sum(u_full, "fwd")
         f_sel  = self._phase_latency_sum(u_sel, "fwd")
-        assert f_none == f_full == f_sel, \
-            f"fwd latency differs: none={f_none} full={f_full} sel={f_sel}"
-        assert sum(n.annotations.get("checkpoint_activation_bytes", 0) for n in _forward_nodes(u_full)) == 0
-        assert sum(n.annotations.get("checkpoint_memory_us", 0) for n in _forward_nodes(u_none)) == 0
+        assert f_full < f_none, \
+            f"full recompute should reduce fwd activation save time: full={f_full} none={f_none}"
+        assert f_full <= f_sel <= f_none, \
+            f"fwd latency order broken: none={f_none} sel={f_sel} full={f_full}"
+
+        save_none = self._forward_activation_memory_sum(u_none)
+        save_full = self._forward_activation_memory_sum(u_full)
+        save_sel = self._forward_activation_memory_sum(u_sel)
+        assert save_none > 0
+        assert save_full == pytest.approx(0.0)
+        assert save_full <= save_sel <= save_none
 
     def test_bwd_latency_full_greater_than_none(self, none_all, full_all):
         b_none = self._phase_latency_sum(none_all[2]["unified"], "bwd")
@@ -445,11 +472,26 @@ class TestRecomputeE2E:
         for node_id in node_ids:
             assert not has_internal_recompute(graph.nodes[node_id])
 
-    def test_exported_forward_ops_show_reduced_activation(self, full_excel):
+    def test_forward_activation_save_time_is_per_node_final_latency(self, none_all, full_all):
+        for graph in (none_all[2]["unified"], full_all[2]["unified"]):
+            for node in _forward_nodes(graph):
+                activation_us = node.annotations.get("activation_memory_us", 0.0)
+                if node.annotations.get("recompute"):
+                    assert node.annotations.get("saved_activation_bytes", 0) == 0
+                    assert activation_us == pytest.approx(0.0)
+                else:
+                    assert activation_us >= 0
+                assert node.annotations.get("latency_us", 0.0) == pytest.approx(
+                    node.annotations.get("base_latency_us", 0.0) + activation_us,
+                    abs=1e-6,
+                )
+
+    def test_exported_forward_ops_show_reduced_activation(self, full_excel, none_excel):
         excel_path, graph, _report = full_excel
         rows = _sheet_rows(excel_path, "Forward Operators")
         for col in (
             "Activation (B)",
+            "Activation Memory (µs)",
             "Final Latency (µs)",
         ):
             assert col in rows[0]
@@ -462,12 +504,23 @@ class TestRecomputeE2E:
         ]
         assert recompute_rows
         assert all(float(row["Activation (B)"] or 0) == 0 for row in recompute_rows)
+        assert all(float(row["Activation Memory (µs)"] or 0) == 0 for row in recompute_rows)
         for row in recompute_rows[:20]:
             node = graph.nodes[row["Node ID"]]
             assert float(row["Final Latency (µs)"]) == pytest.approx(
                 node.annotations.get("latency_us", 0.0),
                 abs=1e-3,
             )
+
+        none_path, none_graph, _ = none_excel
+        none_rows = _sheet_rows(none_path, "Forward Operators")
+        activation_rows = [
+            row for row in none_rows
+            if row["Node ID"] in none_graph.nodes
+            and float(row.get("Activation (B)") or 0) > 0
+        ]
+        assert activation_rows
+        assert any(float(row["Activation Memory (µs)"] or 0) > 0 for row in activation_rows)
 
     def test_exported_backward_ops_show_recompute_replay(self, full_excel):
         excel_path, graph, _report = full_excel

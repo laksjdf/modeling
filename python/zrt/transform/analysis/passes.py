@@ -227,18 +227,11 @@ class RooflinePass(GraphPass):
                         recompute_read_b += src.annotations.get("read_bytes", 0)
                         recompute_write_b += src.annotations.get("write_bytes", 0)
 
-            flops = base_flops + recompute_flops
-            read_b = base_read_b + recompute_read_b
-            write_b = base_write_b + recompute_write_b
-            total_b = read_b + write_b
-
             # Use activation input dtype for compute throughput (INT8/FP8 vs BF16)
             dtype = _effective_compute_dtype(node)
             peak  = hw.peak_flops(dtype)   # ops/s
             bw    = hw.hbm_bandwidth()     # bytes/s
 
-            compute_us = (flops / peak  * 1e6) if peak > 0 else 0.0
-            memory_us  = (total_b / bw  * 1e6) if bw   > 0 else 0.0
             base_total_b = base_read_b + base_write_b
             base_compute_us = (base_flops / peak * 1e6) if peak > 0 else 0.0
             base_memory_us = (base_total_b / bw * 1e6) if bw > 0 else 0.0
@@ -253,14 +246,23 @@ class RooflinePass(GraphPass):
                 recompute_latency_us = max(recompute_compute_us, recompute_memory_us)
             else:
                 recompute_latency_us = 0.0
+
+            saved_activation_b = 0
+            if ctx.training and not is_bwd and not node.annotations.get("recompute"):
+                saved_activation_b = sum(t.mem_bytes for t in node.outputs)
+            activation_memory_us = (saved_activation_b / bw * 1e6) if bw > 0 else 0.0
+
+            compute_us = base_compute_us
+            memory_us = base_memory_us + activation_memory_us
             if is_bwd:
                 final_latency_us = base_latency_us + recompute_latency_us
-            elif compute_us > 0 or memory_us > 0:
-                final_latency_us = max(compute_us, memory_us, 1e-3)
+            elif base_compute_us > 0 or base_memory_us > 0 or activation_memory_us > 0:
+                final_latency_us = base_latency_us + activation_memory_us
             else:
                 final_latency_us = 0.0
 
-            ai = flops / total_b if total_b > 0 else math.inf
+            total_b = base_total_b + saved_activation_b
+            ai = base_flops / total_b if total_b > 0 else math.inf
 
             if compute_us > 0 or memory_us > 0:
                 bound = "compute" if compute_us >= memory_us else "memory"
@@ -272,6 +274,8 @@ class RooflinePass(GraphPass):
             node.annotations["base_compute_us"]      = base_compute_us
             node.annotations["base_memory_us"]       = base_memory_us
             node.annotations["base_latency_us"]      = base_latency_us
+            node.annotations["saved_activation_bytes"] = saved_activation_b
+            node.annotations["activation_memory_us"] = activation_memory_us
             node.annotations["checkpoint_activation_bytes"] = 0
             node.annotations["checkpoint_memory_us"] = 0.0
             node.annotations["recompute_flops"]      = recompute_flops
