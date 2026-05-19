@@ -164,7 +164,7 @@ class TestZeROCommunicationTopology:
 
         assert ag_count == 3, f"Expected ==3 AllGather nodes (1 per layer), got {ag_count}"
         assert rs_count == 3, f"Expected ==3 ReduceScatter nodes (1 per layer), got {rs_count}"
-        assert len(fsdp_nodes) >= 6, f"Expected >=6 FSDP comm nodes, got {len(fsdp_nodes)}"
+        assert len(fsdp_nodes) == 6, f"Expected ==6 FSDP comm nodes, got {len(fsdp_nodes)}"
 
     def test_zero3_fsdp_comm_per_layer_scope(self):
         """ZeRO-3: Each layer should have its own AG/RS nodes."""
