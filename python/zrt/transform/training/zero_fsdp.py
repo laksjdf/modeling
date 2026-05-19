@@ -92,27 +92,7 @@ class ZeroFSDPPass(GraphPass):
                 self._prepend_comm(graph, first_fwd.id, ag_fwd)
 
             if bwd_nodes:
-                first_bwd = bwd_nodes[0]
                 last_bwd = bwd_nodes[-1]
-
-                ag_bwd_id = f"comm_fsdp_ag_{first_bwd.id}"
-                ag_bwd = OpNode(
-                    id=ag_bwd_id,
-                    op_type="comm.all_gather",
-                    inputs=first_bwd.inputs.copy(),
-                    outputs=first_bwd.inputs.copy(),
-                    attrs={
-                        "group_size": dp,
-                        "collective": "all_gather",
-                        "role": "fsdp_ag",
-                    },
-                    scope=first_bwd.scope,
-                    category="communication",
-                )
-                ag_bwd.annotations["inserted_by"] = "zero_fsdp_pass"
-                ag_bwd.annotations["phase"] = "bwd"
-                self._prepend_comm(graph, first_bwd.id, ag_bwd)
-
                 rs_id = f"comm_fsdp_rs_{last_bwd.id}"
                 rs = OpNode(
                     id=rs_id,
