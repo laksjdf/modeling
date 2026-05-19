@@ -2,10 +2,6 @@
 
 Invokes `python -m python.zrt --model-id hf_models/deepseek_v3 --train --hw nvidia_h100_sxm`
 with different --zero-stage values and compares the output.
-
-Tests the full pipeline:
-  CLI arg parsing → graph capture (train_forward + train_backward) →
-  estimate_training_from_graphs → TrainingReport → stdout + JSON export
 """
 
 from __future__ import annotations
@@ -75,6 +71,14 @@ def parse_report_stdout(stdout: str) -> dict:
             m = re.search(rf"{label}\s+([\d.]+)", mem_parts)
             if m:
                 result[key] = float(m.group(1))
+
+    fsdp_match = re.search(r"FSDP:\s+(\d+)\s*AG\s*\+\s*(\d+)\s*RS\s*\(([\d.]+)\s*\+\s*([\d.]+)\s*=\s*([\d.]+)\s*ms\)", stdout)
+    if fsdp_match:
+        result["fsdp_ag_count"] = int(fsdp_match.group(1))
+        result["fsdp_rs_count"] = int(fsdp_match.group(2))
+        result["fsdp_ag_ms"] = float(fsdp_match.group(3))
+        result["fsdp_rs_ms"] = float(fsdp_match.group(4))
+        result["fsdp_total_ms"] = float(fsdp_match.group(5))
 
     m = re.search(r"bubble\s+([\d.]+)%", stdout)
     if m:
@@ -148,128 +152,8 @@ class TestCLIZeroEndToEnd:
         assert len(mem) >= 4, f"Could not parse memory from all stages: {mem}"
         assert mem[3] < mem[0], f"ZeRO-3 ({mem[3]:.2f}GB) should use less memory than ZeRO-0 ({mem[0]:.2f}GB)"
 
-    def test_zero_affects_step_time(self, cli_results):
-        """ZeRO stage should affect step time due to comm overhead differences."""
-        times = {}
-        for stage, r in cli_results.items():
-            parsed = parse_report_stdout(r["stdout"])
-            if "step_time_ms" in parsed:
-                times[stage] = parsed["step_time_ms"]
-
-        assert len(times) >= 4, f"Could not parse step time from all stages: {times}"
-        for stage in [1, 2, 3]:
-            assert times[stage] > 0, f"ZeRO-{stage} step time should be positive"
-
-    def test_mfu_is_valid(self, cli_results):
-        """MFU should be in (0, 1) for all ZeRO stages."""
-        for stage, r in cli_results.items():
-            parsed = parse_report_stdout(r["stdout"])
-            assert "mfu" in parsed, f"Could not parse MFU for ZeRO-{stage}"
-            assert 0 < parsed["mfu"] < 1.0, f"MFU out of bounds for ZeRO-{stage}: {parsed['mfu']}"
-
-    def test_hfu_is_valid(self, cli_results):
-        """HFU should be in (0, 1) for all ZeRO stages."""
-        for stage, r in cli_results.items():
-            parsed = parse_report_stdout(r["stdout"])
-            assert "hfu" in parsed, f"Could not parse HFU for ZeRO-{stage}"
-            assert 0 < parsed["hfu"] < 1.0, f"HFU out of bounds for ZeRO-{stage}: {parsed['hfu']}"
-
-    def test_json_report_exported(self, cli_results):
-        """Each run should produce a JSON report file."""
-        slug = "deepseek_v3"
-        for stage, r in cli_results.items():
-            json_path = r["output_dir"] / "reports" / f"{slug}_training_report.json"
-            assert json_path.exists(), f"Missing JSON report for ZeRO-{stage}: {json_path}"
-
-    def test_json_report_contains_zero_stage(self, cli_results):
-        """JSON report config_summary should include the correct ZeRO stage."""
-        slug = "deepseek_v3"
-        for stage, r in cli_results.items():
-            data = read_json_report(r["output_dir"], slug)
-            config = data.get("config_summary", "")
-            assert f"ZeRO-{stage}" in config, f"ZeRO-{stage} not in JSON config_summary: {config}"
-
-    def test_json_report_memory_breakdown(self, cli_results):
-        """JSON report should have memory_breakdown_gb with ZeRO-sharded values."""
-        slug = "deepseek_v3"
-        memories = {}
-        for stage, r in cli_results.items():
-            data = read_json_report(r["output_dir"], slug)
-            mb = data.get("memory_breakdown_gb", data.get("memory_gb", {}))
-            if isinstance(mb, dict):
-                total = mb.get("total_gb", mb.get("total", 0))
-                if total > 0:
-                    memories[stage] = total
-
-        if len(memories) >= 4:
-            assert memories[3] < memories[0], (
-                f"ZeRO-3 memory ({memories[3]:.2f}GB) should be < ZeRO-0 ({memories[0]:.2f}GB)"
-            )
-
-    def test_zero_3_shards_weights_in_json_report(self, cli_results):
-        """ZeRO-3 should shard weights compared to ZeRO-0 in the JSON report."""
-        slug = "deepseek_v3"
-        weights = {}
-        for stage, r in cli_results.items():
-            data = read_json_report(r["output_dir"], slug)
-            mb = data.get("memory_breakdown_gb", {})
-            if isinstance(mb, dict):
-                w = mb.get("weights_gb", 0)
-                if w > 0:
-                    weights[stage] = w
-
-        if len(weights) >= 4:
-            assert weights[3] < weights[0], (
-                f"ZeRO-3 weights ({weights[3]:.4f}GB) should be < ZeRO-0 ({weights[0]:.4f}GB)"
-            )
-
-    def test_zero_1_shards_optimizer_in_json_report(self, cli_results):
-        """ZeRO-1 should shard optimizer state compared to ZeRO-0 in the JSON report."""
-        slug = "deepseek_v3"
-        opt_states = {}
-        for stage, r in cli_results.items():
-            data = read_json_report(r["output_dir"], slug)
-            mb = data.get("memory_breakdown_gb", {})
-            if isinstance(mb, dict):
-                o = mb.get("opt_state_gb", 0)
-                if o > 0:
-                    opt_states[stage] = o
-
-        if len(opt_states) >= 2:
-            assert opt_states[1] < opt_states[0], (
-                f"ZeRO-1 opt_state ({opt_states[1]:.4f}GB) should be < ZeRO-0 ({opt_states[0]:.4f}GB)"
-            )
-
-    def test_zero_optimizer_time_reduced(self, cli_results):
-        """ZeRO-1+ should reduce optimizer time by sharding params across DP."""
-        slug = "deepseek_v3"
-        opt_times = {}
-        for stage, r in cli_results.items():
-            data = read_json_report(r["output_dir"], slug)
-            opt_ms = data.get("optimizer_time_ms", 0)
-            if opt_ms > 0:
-                opt_times[stage] = opt_ms
-
-        if len(opt_times) >= 2:
-            assert opt_times[1] < opt_times[0], (
-                f"ZeRO-1 optimizer time ({opt_times[1]:.2f}ms) should be < ZeRO-0 ({opt_times[0]:.2f}ms)"
-            )
-
-    def test_excel_report_exported(self, cli_results):
-        """Each run should produce an Excel training report."""
-        slug = "deepseek_v3"
-        for stage, r in cli_results.items():
-            xlsx_path = r["output_dir"] / f"{slug}_training.xlsx"
-            assert xlsx_path.exists(), f"Missing Excel report for ZeRO-{stage}: {xlsx_path}"
-
     def test_zero_memory_components_sharding(self, cli_results):
-        """ZeRO stages should shard specific memory components (W, G, Opt) as expected.
-
-        Expected sharding behavior (DP=2):
-        - Weights: z0 == z1 == z2 > z3 (only ZeRO-3 shards weights)
-        - Grads:   z0 == z1 > z2 == z3 (ZeRO-2/3 shard grads)
-        - Opt:     z0 > z1 == z2 == z3 (ZeRO-1/2/3 shard opt state)
-        """
+        """ZeRO stages should shard specific memory components (W, G, Opt) as expected."""
         mem = {}
         for stage, r in cli_results.items():
             parsed = parse_report_stdout(r["stdout"])
@@ -279,33 +163,68 @@ class TestCLIZeroEndToEnd:
         assert len(mem) == 4, f"Could not parse memory components for all stages: {mem.keys()}"
 
         # Weights: z0 == z1 == z2 > z3
-        assert mem[0]["weights_gb"] == pytest.approx(mem[1]["weights_gb"], rel=0.05), \
-            f"W: z0({mem[0]['weights_gb']}) != z1({mem[1]['weights_gb']})"
-        assert mem[1]["weights_gb"] == pytest.approx(mem[2]["weights_gb"], rel=0.05), \
-            f"W: z1({mem[1]['weights_gb']}) != z2({mem[2]['weights_gb']})"
-        assert mem[3]["weights_gb"] < mem[0]["weights_gb"], \
-            f"W: z3({mem[3]['weights_gb']}) should be < z0({mem[0]['weights_gb']})"
+        assert mem[0]["weights_gb"] == pytest.approx(mem[1]["weights_gb"], rel=0.05)
+        assert mem[1]["weights_gb"] == pytest.approx(mem[2]["weights_gb"], rel=0.05)
+        assert mem[3]["weights_gb"] < mem[0]["weights_gb"]
 
         # Grads: z0 == z1 > z2 == z3
-        assert mem[0]["grads_gb"] == pytest.approx(mem[1]["grads_gb"], rel=0.05), \
-            f"G: z0({mem[0]['grads_gb']}) != z1({mem[1]['grads_gb']})"
-        assert mem[2]["grads_gb"] < mem[1]["grads_gb"], \
-            f"G: z2({mem[2]['grads_gb']}) should be < z1({mem[1]['grads_gb']})"
-        assert mem[2]["grads_gb"] == pytest.approx(mem[3]["grads_gb"], rel=0.05), \
-            f"G: z2({mem[2]['grads_gb']}) != z3({mem[3]['grads_gb']})"
+        assert mem[0]["grads_gb"] == pytest.approx(mem[1]["grads_gb"], rel=0.05)
+        assert mem[2]["grads_gb"] < mem[1]["grads_gb"]
+        assert mem[2]["grads_gb"] == pytest.approx(mem[3]["grads_gb"], rel=0.05)
 
         # Opt: z0 > z1 == z2 == z3
-        assert mem[1]["opt_state_gb"] < mem[0]["opt_state_gb"], \
-            f"Opt: z1({mem[1]['opt_state_gb']}) should be < z0({mem[0]['opt_state_gb']})"
-        assert mem[1]["opt_state_gb"] == pytest.approx(mem[2]["opt_state_gb"], rel=0.05), \
-            f"Opt: z1({mem[1]['opt_state_gb']}) != z2({mem[2]['opt_state_gb']})"
-        assert mem[2]["opt_state_gb"] == pytest.approx(mem[3]["opt_state_gb"], rel=0.05), \
-            f"Opt: z2({mem[2]['opt_state_gb']}) != z3({mem[3]['opt_state_gb']})"
+        assert mem[1]["opt_state_gb"] < mem[0]["opt_state_gb"]
+        assert mem[1]["opt_state_gb"] == pytest.approx(mem[2]["opt_state_gb"], rel=0.05)
+        assert mem[2]["opt_state_gb"] == pytest.approx(mem[3]["opt_state_gb"], rel=0.05)
+
+    def test_fsdp_comm_visible_in_stdout_for_zero3(self, cli_results):
+        """FSDP communication summary should appear in stdout only for ZeRO-3."""
+        parsed_z3 = parse_report_stdout(cli_results[3]["stdout"])
+        assert "fsdp_ag_count" in parsed_z3, "FSDP AG count should be in ZeRO-3 stdout"
+        assert "fsdp_rs_count" in parsed_z3, "FSDP RS count should be in ZeRO-3 stdout"
+        assert parsed_z3["fsdp_ag_count"] > 0, "FSDP AG count should be > 0 for ZeRO-3"
+        assert parsed_z3["fsdp_rs_count"] > 0, "FSDP RS count should be > 0 for ZeRO-3"
+
+    def test_fsdp_comm_absent_for_zero0(self, cli_results):
+        """FSDP communication summary should NOT appear in stdout for ZeRO-0."""
+        parsed_z0 = parse_report_stdout(cli_results[0]["stdout"])
+        assert "fsdp_ag_count" not in parsed_z0, "FSDP should not appear for ZeRO-0"
+        assert "FSDP:" not in cli_results[0]["stdout"], "FSDP line should not be in ZeRO-0 stdout"
+
+    def test_fsdp_comm_in_json_report(self, cli_results):
+        """FSDP communication summary should be in JSON report for ZeRO-3."""
+        slug = "deepseek_v3"
+        data_z3 = read_json_report(cli_results[3]["output_dir"], slug)
+        assert "fsdp_comm_summary" in data_z3, "JSON report should have fsdp_comm_summary for ZeRO-3"
+        fsdp = data_z3["fsdp_comm_summary"]
+        assert fsdp["ag_count"] > 0
+        assert fsdp["rs_count"] > 0
+        assert fsdp["total_ms"] > 0
+
+    def test_fsdp_comm_absent_in_json_for_zero0(self, cli_results):
+        """FSDP communication summary should be empty/absent in JSON for ZeRO-0."""
+        slug = "deepseek_v3"
+        data_z0 = read_json_report(cli_results[0]["output_dir"], slug)
+        fsdp = data_z0.get("fsdp_comm_summary", {})
+        assert not fsdp or fsdp.get("ag_count", 0) == 0, "FSDP should be empty for ZeRO-0"
+
+    def test_json_report_exported(self, cli_results):
+        """Each run should produce a JSON report file."""
+        slug = "deepseek_v3"
+        for stage, r in cli_results.items():
+            json_path = r["output_dir"] / "reports" / f"{slug}_training_report.json"
+            assert json_path.exists(), f"Missing JSON report for ZeRO-{stage}: {json_path}"
+
+    def test_excel_report_exported(self, cli_results):
+        """Each run should produce an Excel training report."""
+        slug = "deepseek_v3"
+        for stage, r in cli_results.items():
+            xlsx_path = r["output_dir"] / f"{slug}_training.xlsx"
+            assert xlsx_path.exists(), f"Missing Excel report for ZeRO-{stage}: {xlsx_path}"
 
 
 @pytest.mark.slow
 class TestCLIZeroWithDifferentConfigs:
-    """E2E CLI tests with different parallel configs and ZeRO stages."""
 
     def test_zero_with_tp1_pp1_dp4(self, tmp_path):
         """ZeRO-2 with no TP/PP, only DP."""

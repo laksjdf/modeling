@@ -222,6 +222,9 @@ def estimate_training_from_graphs(
     # can show what fusion produced and how it scales.
     fused_ops_summary = _summarise_fused_ops(results)
 
+    # ── FSDP/ZeRO-3 communication summary ─────────────────────────────────────
+    fsdp_comm_summary = _summarise_fsdp_comm(results)
+
     report = TrainingReport(
         config_summary=config_summary,
         step_time_ms=step_time_ms,
@@ -239,6 +242,7 @@ def estimate_training_from_graphs(
         bubble_fraction=bubble_fraction,
         total_params=total_params,
         fused_ops_summary=fused_ops_summary,
+        fsdp_comm_summary=fsdp_comm_summary,
         exposed_comm_ms=exposed_comm_ms,
         hidden_comm_ms=hidden_comm_ms,
         total_comm_volume_ms=total_comm_ms,
@@ -310,3 +314,41 @@ def _summarise_fused_ops(graphs: dict) -> dict:
                 entry["module_class"] = node.module_class
 
     return summary
+
+
+def _summarise_fsdp_comm(graphs: dict) -> dict:
+    """Aggregate FSDP/ZeRO-3 communication statistics across all transformed graphs.
+
+    Walks the graph(s) and collects nodes inserted by ``zero_fsdp_pass``,
+    summing their latency and counting by collective type.
+
+    Returns ``{ag_count, rs_count, ag_total_ms, rs_total_ms, total_ms}``.
+    """
+    ag_count = 0
+    rs_count = 0
+    ag_total_us = 0.0
+    rs_total_us = 0.0
+
+    for g in graphs.values():
+        for node in g.nodes.values():
+            if node.annotations.get("inserted_by") != "zero_fsdp_pass":
+                continue
+            collective = node.attrs.get("collective", "")
+            latency_us = node.annotations.get("latency_us", 0.0) or 0.0
+            if collective == "all_gather":
+                ag_count += 1
+                ag_total_us += latency_us
+            elif collective == "reduce_scatter":
+                rs_count += 1
+                rs_total_us += latency_us
+
+    if ag_count == 0 and rs_count == 0:
+        return {}
+
+    return {
+        "ag_count": ag_count,
+        "rs_count": rs_count,
+        "ag_total_ms": ag_total_us / 1000.0,
+        "rs_total_ms": rs_total_us / 1000.0,
+        "total_ms": (ag_total_us + rs_total_us) / 1000.0,
+    }
