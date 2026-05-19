@@ -48,8 +48,7 @@ class ZeroFSDPPass(GraphPass):
         """Insert FSDP all-gather / reduce-scatter collectives for ZeRO-3.
 
         Forward:  all_gather before first fwd node (gather sharded weights).
-        Backward: all_gather before first bwd node (re-gather weights) +
-                  reduce_scatter after last bwd node (scatter gradients).
+        Backward: reduce_scatter after last bwd node (scatter gradients).
 
         Args:
             graph: OpGraph to modify
