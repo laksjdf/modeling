@@ -1,8 +1,7 @@
-"""DataParallelPass: per-gradient-group communication insertion."""
+"""DataParallelPass: global gradient reduction communication insertion."""
 from __future__ import annotations
 
 import logging
-from collections import defaultdict
 
 from python.zrt.ir.edge import Edge
 from python.zrt.ir.graph import OpGraph
@@ -16,19 +15,17 @@ _BWD_PHASES = {"bwd", "backward", "train_backward"}
 
 
 class DataParallelPass(GraphPass):
-    """Insert per-group gradient reduction comm nodes for data parallelism.
+    """Insert global gradient reduction comm node for data parallelism.
 
-    Instead of one global tail node, groups backward/gradient-producing nodes
-    by layer and inserts a comm node after each group boundary.
-
-    ZeRO mapping:
-      - ZeRO-0 → all_reduce
-      - ZeRO-2/3 → reduce_scatter
+    ZeRO-0/1: Single communication at the **end of the entire backward pass**.
+      - ZeRO-0/1 → all_reduce (full gradient sync)
+      - ZeRO-2   → reduce_scatter (gradient sharding)
+    ZeRO-3: Skipped here; handled by ZeroFSDPPass (per-layer FSDP communication).
 
     Annotations written:
       - node.annotations["dp_comm"] = True
       - node.annotations["dp_overlap_in_bubble"] = bool (if training.dp_overlap_in_bubble)
-      - attrs["bucket_bytes"] = gradient tensor bytes
+      - attrs["bucket_bytes"] = total gradient tensor bytes
     """
     name = "data_parallel"
 
@@ -40,92 +37,64 @@ class DataParallelPass(GraphPass):
         dp = ctx.parallel.dp
         zero_stage = ctx.training.zero_stage if ctx.training else 0
 
+        # ZeRO-3 handled by ZeroFSDPPass (per-layer FSDP communication)
+        if zero_stage >= 3:
+            return g
+
         # Check if we should process this graph (backward-phase only)
         graph_phase = g.metadata.get("phase", "")
         if graph_phase and graph_phase not in ("train_backward", "backward"):
             return g
 
-        collective = "all_reduce" if zero_stage == 0 else "reduce_scatter"
+        # ZeRO mapping:
+        #   ZeRO-0/1 → all_reduce (full gradient sync)
+        #   ZeRO-2   → reduce_scatter (gradient sharding)
+        collective = "all_reduce" if zero_stage <= 1 else "reduce_scatter"
 
-        # 1. Find all forward parameter nodes (is_param=True, phase=fwd)
-        param_nodes = {
-            nid for nid, n in g.nodes.items()
-            if n.annotations.get("is_param") and n.annotations.get("phase") == "fwd"
-        }
+        # 1. Find all backward nodes in topological order
+        bwd_nodes = [n for n in g.topo_sort() if self._is_backward_node(n)]
+        if not bwd_nodes:
+            return g
 
-        if param_nodes:
-            # New path: Use cross-graph edges to find true parameter gradients
-            param_grad_nodes: dict[str, list[OpNode]] = defaultdict(list)
+        # 2. Find the last backward node in topological order
+        last_bwd_node = bwd_nodes[-1]
 
-            for edge in g.edges:
-                # Check if edge goes from param node to backward node
-                if edge.src in param_nodes and edge.dst.startswith("bwd_"):
-                    bwd_node = g.nodes.get(edge.dst)
-                    if bwd_node:
-                        # Group by layer
-                        layer = bwd_node.layer if bwd_node.layer else "0"
-                        param_grad_nodes[layer].append(bwd_node)
+        # 3. Calculate total gradient bytes from all backward node outputs
+        total_grad_bytes = sum(
+            o.mem_bytes for n in bwd_nodes for o in n.outputs
+            if hasattr(o, 'mem_bytes')
+        )
 
-            if not param_grad_nodes:
-                return g  # No parameter gradient nodes found
+        comm_node = OpNode(
+            id="comm_dp_grad_reduce",
+            op_type=f"comm.{collective}",
+            inputs=[],
+            outputs=[],
+            attrs={
+                "group_size": dp,
+                "collective": collective,
+                "role": "dp_grad_reduce",
+                "bucket_bytes": total_grad_bytes,
+                "dp_grad_group_idx": 0,
+            },
+            scope="data_parallel.grad_reduce.global",
+            category="communication",
+        )
 
-            grad_groups = param_grad_nodes
-        else:
-            # Fallback path: Use phase annotation (for non-stitched graphs)
-            grad_groups: dict[str, list[OpNode]] = defaultdict(list)
-            for node in g.topo_sort():
-                if self._is_backward_node(node):
-                    layer = node.layer if node.layer else "0"
-                    grad_groups[layer].append(node)
+        comm_node.annotations["inserted_by"] = "data_parallel_pass"
+        comm_node.annotations["dp_comm"] = True
+        comm_node.annotations["phase"] = "bwd"
 
-            if not grad_groups:
-                return g
+        dp_overlap = getattr(ctx.training, "dp_overlap_in_bubble", True) if ctx.training else True
+        if dp_overlap:
+            comm_node.annotations["overlap_in_bubble"] = True
 
-        # 2. For each layer group, create a comm node after the last grad node
-        for group_idx, (layer_key, nodes) in enumerate(
-            sorted(grad_groups.items(), key=lambda kv: int(kv[0]) if kv[0].isdigit() else 0)
-        ):
-            last_node = nodes[-1]
-
-            # Calculate gradient bytes from grad node outputs
-            grad_bytes = sum(
-                o.mem_bytes for n in nodes for o in n.outputs
-                if hasattr(o, 'mem_bytes')
-            )
-
-            comm_node = OpNode(
-                id=f"comm_grad_reduce_layer_{layer_key}",
-                op_type=f"comm.{collective}",
-                inputs=[],
-                outputs=[],
-                attrs={
-                    "group_size": dp,
-                    "collective": collective,
-                    "role": "dp_grad_reduce",
-                    "bucket_bytes": grad_bytes,
-                    "dp_grad_group_idx": group_idx,
-                },
-                scope=f"data_parallel.grad_reduce.layer_{layer_key}",
-                category="communication",
-            )
-
-            comm_node.annotations["inserted_by"] = "data_parallel_pass"
-            comm_node.annotations["dp_comm"] = True
-            comm_node.annotations["phase"] = "bwd"
-
-            dp_overlap = getattr(ctx.training, "dp_overlap_in_bubble", True) if ctx.training else True
-            if dp_overlap:
-                comm_node.annotations["overlap_in_bubble"] = True
-
-            self._insert_after(g, last_node, comm_node)
+        self._insert_after(g, last_bwd_node, comm_node)
 
         return g
 
     def _is_backward_node(self, node: OpNode) -> bool:
-        """Check if a node is a backward-phase node.
-
-        Used for fallback when graph is not stitched (no is_param annotations).
-        """
+        """Check if a node is a backward-phase node."""
         # Check node-level phase annotation
         phase = node.annotations.get("phase", "")
         if phase in _BWD_PHASES:
