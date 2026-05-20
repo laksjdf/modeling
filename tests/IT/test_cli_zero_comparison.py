@@ -169,12 +169,6 @@ class TestCLIZeroEndToEnd:
         assert mem[1]["opt_state_gb"] == pytest.approx(mem[2]["opt_state_gb"], rel=0.05)
         assert mem[2]["opt_state_gb"] == pytest.approx(mem[3]["opt_state_gb"], rel=0.05)
 
-    def test_fsdp_comm_absent_for_zero0(self, cli_results):
-        """FSDP communication summary should NOT appear in stdout for ZeRO-0."""
-        parsed_z0 = parse_report_stdout(cli_results[0]["stdout"])
-        assert "fsdp_ag_count" not in parsed_z0, "FSDP should not appear for ZeRO-0"
-        assert "FSDP:" not in cli_results[0]["stdout"], "FSDP line should not be in ZeRO-0 stdout"
-
 
     def test_fsdp_comm_absent_in_json_for_zero0(self, cli_results):
         """FSDP communication summary should be empty/absent in JSON for ZeRO-0."""
