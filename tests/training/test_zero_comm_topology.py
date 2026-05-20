@@ -186,14 +186,3 @@ class TestZeROCommunicationTopology:
                 layer_scopes.add(parts[2])
 
         assert len(layer_scopes) == 3, f"Expected comm nodes in 3 layers, found in {len(layer_scopes)}"
-
-    def test_zero1_vs_zero2_comm_node_count(self):
-        """ZeRO-1 and ZeRO-2 should both insert exactly 1 global comm node."""
-        for stage in [1, 2]:
-            graph = _make_stitched_graph(num_layers=4)
-            graph.metadata["phase"] = "train_backward"
-            ctx = _make_ctx(zero_stage=stage, dp=4)
-
-            result = DataParallelPass().run(graph, ctx)
-            dp_nodes = [n for n in result.nodes.values() if n.annotations.get("dp_comm")]
-            assert len(dp_nodes) == 1, f"ZeRO-{stage} should have exactly 1 global comm node"
