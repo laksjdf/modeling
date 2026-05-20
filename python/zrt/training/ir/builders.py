@@ -6,6 +6,7 @@ from zrt.training.ir.training_graph import Graph, Op, Tensor
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import LayerKind, ModelSpec
 from zrt.training.spec.strategy import Strategy
+from zrt.training.ir.cast_pass import insert_cast_pass
 from zrt.training.ir.shard import ShardPlan, insert_collectives
 
 
@@ -561,6 +562,12 @@ def dense_block(
     h = hidden
     prefix = f"L{layer_id}"
 
+    # v2 region dispatch: attention sub-block runs in its own activation
+    # dtype (FP8 in mixed quant configs); residual stream stays at the
+    # block's ``act_dtype`` (BF16). Cast_pass splices casts at the
+    # residual boundaries when these differ.
+    attn_act = model.effective_attn_act_dtype() if model is not None else act_dtype
+
     # ── HC pre-attn ────────────────────────────────────────────────────
     if use_hc:
         ops.append(_mhc_pre_op(
@@ -572,18 +579,19 @@ def dense_block(
         ln1_in = _tensor("x", (seq, h), act_dtype)
 
     # ── Pre-attention RMSNorm ──────────────────────────────────────────
+    # Fused LN epilog produces the attention region's dtype directly.
     ops.append(Op(
         name=f"{prefix}.ln1", kind=_norm_kind(model),
         inputs=[ln1_in],
-        outputs=[_tensor("x_ln1", (seq, h), act_dtype)],
-        meta={"bytes_fwd": seq * h * act_dtype.bytes * 2},
+        outputs=[_tensor("x_ln1", (seq, h), attn_act)],
+        meta={"bytes_fwd": seq * h * (act_dtype.bytes + attn_act.bytes)},
         layer_id=layer_id, layer_kind=LayerKind.DENSE,
     ))
 
     # ── Attention sub-block ────────────────────────────────────────────
     if model is not None:
         attn_ops = _build_attn_ops(model, layer_id, seq, LayerKind.DENSE,
-                                    prefix, act_dtype)
+                                    prefix, attn_act)
     else:
         # Legacy path — standard MHA
         h_attn = num_heads * head_dim
@@ -622,6 +630,7 @@ def dense_block(
     ops.extend(attn_ops)
 
     # ── Residual add OR mhc_post_attn ──────────────────────────────────
+    # attn_proj is in attention region dtype; ``x`` residual is in act_dtype.
     if use_hc:
         ops.append(_mhc_post_op(
             seq, h, hc_mult, layer_id, LayerKind.DENSE, prefix, "attn", act_dtype,
@@ -634,15 +643,18 @@ def dense_block(
     else:
         ops.append(Op(
             name=f"{prefix}.residual1", kind="add",
-            inputs=[_tensor("attn_proj", (seq, h), act_dtype),
+            inputs=[_tensor("attn_proj", (seq, h), attn_act),
                     _tensor("x", (seq, h), act_dtype)],
             outputs=[_tensor("x_attn", (seq, h), act_dtype)],
-            meta={"bytes_fwd": seq * h * act_dtype.bytes * 3},
+            meta={"bytes_fwd": seq * h * (attn_act.bytes + 2 * act_dtype.bytes)},
             layer_id=layer_id, layer_kind=LayerKind.DENSE,
         ))
         ln2_in = _tensor("x_attn", (seq, h), act_dtype)
 
     # ── Post-attention RMSNorm ─────────────────────────────────────────
+    # Dense FFN stays at the block's act_dtype (no quant by default for
+    # dense FFN in V4; if quant is desired here, add a dense_ffn_dtype
+    # field to ModelSpec).
     ops.append(Op(
         name=f"{prefix}.ln2", kind=_norm_kind(model),
         inputs=[ln2_in],
@@ -723,6 +735,14 @@ def _moe_block(
     h = hidden
     prefix = f"L{layer_id}"
 
+    # v2: region-level activation dtype dispatch. ``act_dtype`` represents
+    # the residual-stream dtype (BF16 in V4); attention and MoE sub-blocks
+    # can run in their own dtype (FP8/FP4) and cast_pass will splice cast
+    # ops at the residual boundaries. Fallback to act_dtype when model is
+    # None (legacy test path) so existing IR tests keep working.
+    attn_act = model.effective_attn_act_dtype() if model is not None else act_dtype
+    moe_act = model.effective_moe_act_dtype() if model is not None else act_dtype
+
     # ── HC pre-attn ────────────────────────────────────────────────────
     if use_hc:
         ops.append(_mhc_pre_op(
@@ -734,18 +754,20 @@ def _moe_block(
         ln1_in = _tensor("x", (seq, h), act_dtype)
 
     # ── Pre-attention RMSNorm ──────────────────────────────────────────
+    # LN epilog produces the attention region's activation dtype directly
+    # (fused LN + cast is the V4/Megatron-Core baseline).
     ops.append(Op(
         name=f"{prefix}.ln1", kind=_norm_kind(model),
         inputs=[ln1_in],
-        outputs=[_tensor("x_ln1", (seq, h), act_dtype)],
-        meta={"bytes_fwd": seq * h * act_dtype.bytes * 2},
+        outputs=[_tensor("x_ln1", (seq, h), attn_act)],
+        meta={"bytes_fwd": seq * h * (act_dtype.bytes + attn_act.bytes)},
         layer_id=layer_id, layer_kind=LayerKind.MOE,
     ))
 
     # ── Attention sub-block ────────────────────────────────────────────
     if model is not None:
         attn_ops = _build_attn_ops(model, layer_id, seq, LayerKind.MOE,
-                                    prefix, act_dtype)
+                                    prefix, attn_act)
     else:
         h_attn = num_heads * head_dim
         h_kv = num_kv_heads * head_dim
@@ -783,6 +805,8 @@ def _moe_block(
     ops.extend(attn_ops)
 
     # ── Residual add OR mhc_post_attn ──────────────────────────────────
+    # attn_proj arrives in attention region dtype; residual ``x`` is in
+    # the residual stream dtype. The mismatched ``add`` triggers cast_pass.
     if use_hc:
         ops.append(_mhc_post_op(
             seq, h, hc_mult, layer_id, LayerKind.MOE, prefix, "attn", act_dtype,
@@ -795,27 +819,29 @@ def _moe_block(
     else:
         ops.append(Op(
             name=f"{prefix}.residual1", kind="add",
-            inputs=[_tensor("attn_proj", (seq, h), act_dtype),
+            inputs=[_tensor("attn_proj", (seq, h), attn_act),
                     _tensor("x", (seq, h), act_dtype)],
             outputs=[_tensor("x_attn", (seq, h), act_dtype)],
-            meta={"bytes_fwd": seq * h * act_dtype.bytes * 3},
+            meta={"bytes_fwd": seq * h * (attn_act.bytes + 2 * act_dtype.bytes)},
             layer_id=layer_id, layer_kind=LayerKind.MOE,
         ))
         ln2_in = _tensor("x_attn", (seq, h), act_dtype)
 
     # ── Post-attention RMSNorm ─────────────────────────────────────────
+    # Same epilog-fuses-cast pattern as ln1: read residual dtype, write MoE
+    # region dtype.
     ops.append(Op(
         name=f"{prefix}.ln2", kind=_norm_kind(model),
         inputs=[ln2_in],
-        outputs=[_tensor("x_ln2", (seq, h), act_dtype)],
-        meta={"bytes_fwd": seq * h * act_dtype.bytes * 2},
+        outputs=[_tensor("x_ln2", (seq, h), moe_act)],
+        meta={"bytes_fwd": seq * h * (act_dtype.bytes + moe_act.bytes)},
         layer_id=layer_id, layer_kind=LayerKind.MOE,
     ))
 
     # ── MoE FFN ────────────────────────────────────────────────────────
     if model is not None:
         ops.extend(_build_moe_ffn_ops(model, layer_id, seq, prefix,
-                                       LayerKind.MOE, act_dtype))
+                                       LayerKind.MOE, moe_act))
     else:
         # Legacy path
         ops.append(Op(
@@ -900,6 +926,10 @@ def _moe_block(
             ))
 
     # ── Residual add OR mhc_post_ffn ───────────────────────────────────
+    # ffn_out is in MoE region dtype; x_attn is in residual stream dtype.
+    # Cast at the boundary (the V4 routed_expert → residual cast we want
+    # to surface in unfused diagnostics) happens via cast_pass when these
+    # two dtypes differ.
     if use_hc:
         ops.append(_mhc_post_op(
             seq, h, hc_mult, layer_id, LayerKind.MOE, prefix, "ffn", act_dtype,
@@ -907,10 +937,10 @@ def _moe_block(
     else:
         ops.append(Op(
             name=f"{prefix}.residual2", kind="add",
-            inputs=[_tensor("ffn_out", (seq, h), act_dtype),
+            inputs=[_tensor("ffn_out", (seq, h), moe_act),
                     _tensor("x_attn", (seq, h), act_dtype)],
             outputs=[_tensor("y", (seq, h), act_dtype)],
-            meta={"bytes_fwd": seq * h * act_dtype.bytes * 3},
+            meta={"bytes_fwd": seq * h * (moe_act.bytes + 2 * act_dtype.bytes)},
             layer_id=layer_id, layer_kind=LayerKind.MOE,
         ))
 
@@ -1084,6 +1114,12 @@ def build_graph(model: ModelSpec, strategy: Strategy) -> Graph:
     all_ops.append(_lm_head_op(model.vocab, h, s, act_dtype))
 
     graph = Graph(ops=all_ops, collectives=[], layer_index=layer_index)
+
+    # v2: splice cast ops at dtype boundaries BEFORE collective insertion.
+    # ``QuantPolicy.assume_all_casts_fused`` (default True) marks every
+    # cast as fused → 0 cost, preserving v1 numerics. Users opt into
+    # unfused diagnostics via ``strategy.quant.assume_all_casts_fused=false``.
+    insert_cast_pass(graph, model, getattr(strategy, "quant", None))
 
     # Apply sharding and insert collectives
     shard = ShardPlan(strategy)

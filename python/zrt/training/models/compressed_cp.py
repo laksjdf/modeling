@@ -220,6 +220,9 @@ class CompressedCPTimeEstimator:
         allgather_latency_us: float = 10.0,
     ):
         self.analyzer = comm_analyzer
+        # Standalone estimator (test-only instantiation): bandwidth is a
+        # constructor arg, not LinkSpec-derived. Intentionally NOT routed
+        # through LinkSpec.effective_bw_bps — outside the estimate pipeline.
         self.p2p_bw = p2p_bandwidth_GBps * 1e9
         self.ag_bw = allgather_bandwidth_GBps * 1e9
         self.p2p_lat = p2p_latency_us * 1e-6

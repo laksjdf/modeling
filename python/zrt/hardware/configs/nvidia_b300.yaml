@@ -6,6 +6,7 @@ device_type: "gpu"
 # Per-die dense (no 2:4 sparsity); B300 = ~1.5x B200 compute.
 # Values approximate; refine when authoritative datasheet is committed.
 compute:
+  # compute_efficiency: 0.5   # uncomment to override the achieved-FLOPs heuristic
   fp16_tflops: 5000
   bf16_tflops: 5000
   fp32_tflops: 250
@@ -19,6 +20,7 @@ compute:
   # tune anchors, fall back to homogeneous peak.
 
 memory:
+  # mem_bw_efficiency: 0.7    # uncomment to override the achieved-bandwidth heuristic
   capacity_gb: 288             # HBM3e per die
   hbm_bandwidth_gbps: 8000     # ~8 TB/s
   l2_cache_mb: 64
@@ -32,10 +34,13 @@ interconnect:
     bandwidth_gbps: 1800       # 1.8 TB/s aggregate
     latency_us: 1
     topology: "all_to_all"
+    kb_efficiency: 0.7        # bandwidth utilization (effective/peak)
     num_devices: 8
   inter_node:
     type: "InfiniBand_XDR"
     bandwidth_gbps: 800        # XDR-class IB / Spectrum-X (placeholder)
     latency_us: 2
     topology: "fat_tree"
+    kb_efficiency: 0.7       # bandwidth utilization (effective/peak)
+    # oversubscription: 4.0  # uncomment for an over-subscribed spine (non-clos)
     num_devices: 0

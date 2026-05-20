@@ -137,6 +137,11 @@ def estimate(
         tokens_per_sec=tokens_per_sec,
         effective_params=model.effective_params_for_flops(),
         flops_per_token=flops_per_token,
+        # v2 HBM traffic diagnostics
+        weight_hbm_gb=s.weight_hbm_gb,
+        act_hbm_gb=s.act_hbm_gb,
+        grad_hbm_gb=s.grad_hbm_gb,
+        cast_hbm_gb=s.cast_hbm_gb,
     )
 
 

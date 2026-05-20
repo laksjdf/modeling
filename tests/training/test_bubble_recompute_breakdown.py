@@ -4,10 +4,15 @@ RED→GREEN regression for:
   1. StepResult.bubble = warmup + cooldown (absolute seconds), 0 when pp=1.
   2. StepResult.recompute_time = 0 with no recompute policy, > 0 when
      full/partial recompute is enabled.
-  3. recompute attributed OUT of bwd_compute:
+  3. bubble attributed OUT of compute_time:
+     pipeline_time == compute_time + exposed_comm + bubble
+  4. recompute attributed OUT of bwd_compute:
      compute_time == fwd_compute + bwd_compute + recompute_time
-  4. step_time identity preserved (attribution does not change totals).
+  5. step_time identity preserved (attribution does not change totals).
 """
+
+import shutil
+from pathlib import Path
 
 import pytest
 
@@ -108,6 +113,22 @@ def test_recompute_excluded_from_bwd_compute_invariant():
     )
 
 
+def test_pipeline_bubble_excluded_from_compute_time_invariant():
+    model, system = _model(), _system()
+    strategy = Strategy(tp=1, pp=2, dp=4, micro_batch=1, global_batch=8)
+    graph = build_graph(model, strategy)
+
+    step = pipeline_step_time(graph, model, system, strategy)
+
+    assert step.bubble > 0.0
+    assert step.pipeline_time == pytest.approx(
+        step.compute_time + step.exposed_comm + step.bubble, rel=1e-6
+    )
+    assert step.compute_time == pytest.approx(
+        step.fwd_compute + step.bwd_compute + step.recompute_time, rel=1e-6
+    )
+
+
 def test_recompute_raw_zero_without_policy():
     model, system = _model(), _system()
     strategy = Strategy(tp=1, pp=1, dp=1, micro_batch=1, global_batch=4)
@@ -175,10 +196,132 @@ def test_recompute_attribution_preserves_step_time():
 
     step = pipeline_step_time(graph, model, system, strategy)
 
-    # pipeline_time = compute_time + exposed_comm, with compute_time now
-    # carrying the recompute term explicitly.
+    # pipeline_time = useful compute + exposed comm + pipeline bubble.
     assert step.pipeline_time == pytest.approx(
-        step.compute_time + step.exposed_comm, rel=1e-6
+        step.compute_time + step.exposed_comm + step.bubble, rel=1e-6
     )
     assert step.recompute_time > 0.0
     assert step.bubble == pytest.approx(step.warmup + step.cooldown)
+
+
+def test_recompute_critical_path_does_not_include_pipeline_bubble():
+    """Critical recompute is actual bottleneck-stage recompute work.
+
+    Pipeline schedule/bubble amplification belongs in bubble/schedule terms;
+    it must not make recompute_time exceed raw recompute work.
+    """
+    model, system = _model(), _system()
+    strategy = Strategy(
+        tp=1, pp=2, dp=1, micro_batch=1, global_batch=8,
+        recompute=RecomputePolicy(per_layer={"dense": {"full"}}),
+    )
+    graph = build_graph(model, strategy)
+
+    step = pipeline_step_time(graph, model, system, strategy)
+    s_bot = max(step.per_stage, key=lambda st: st.fwd + st.bwd)
+
+    assert step.recompute_time_raw > 0.0
+    assert step.recompute_time == pytest.approx(8 * s_bot.recompute)
+    assert step.recompute_time <= step.recompute_time_raw + 1e-9
+
+
+def test_html_export_surfaces_recompute_and_bubble():
+    """The HTML report must visibly carry recompute + bubble: JS constants,
+    the metric cards, and the step-time breakdown section."""
+    from zrt.training.io.html_exporter import export_estimate_html
+    from zrt.training.models.flops import op_cost
+
+    model, system = _model(), _system()
+    # TP*CP*PP*DP must equal world_size (8) for estimate()'s validate().
+    strategy = Strategy(
+        tp=1, cp=1, pp=2, ep=1, dp=4, micro_batch=1, global_batch=8,
+        recompute=RecomputePolicy(per_layer={"dense": {"full"}}),
+    )
+    graph = build_graph(model, strategy)
+    from zrt.training.search.estimator import estimate
+    report = estimate(model, system, strategy, graph=graph)
+    op_costs = {op.name: op_cost(op, model, system) for op in graph.ops}
+
+    out_dir = Path("output") / "test_html_bubble_recompute"
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    try:
+        out = out_dir / "r.html"
+        export_estimate_html(report=report, graph=graph, model=model,
+                             system=system, strategy=strategy,
+                             op_costs=op_costs, output_path=out)
+        html = out.read_text(encoding="utf-8")
+
+        assert '"recompute_time_ms"' in html
+        assert '"recompute_time_raw_ms"' in html
+        assert "Recompute (crit. path)" in html
+        assert "step time breakdown" in html
+        assert "pipeline bubble" in html
+        assert report.recompute_time_ms > 0.0  # this config does recompute
+    finally:
+        if out_dir.exists():
+            shutil.rmtree(out_dir)
+
+
+def test_search_report_surfaces_bubble_and_recompute():
+    """grid-search / estimate result report (search/report.py) must carry
+    bubble absolute time and recompute pre/post-hide times."""
+    from zrt.training.search.estimator import estimate
+    from zrt.training.search.report import report_to_dict, report_summary
+
+    model, system = _model(), _system()
+    strategy = Strategy(
+        tp=1, cp=1, pp=2, ep=1, dp=4, micro_batch=1, global_batch=8,
+        recompute=RecomputePolicy(per_layer={"dense": {"full"}}),
+    )
+    report = estimate(model, system, strategy)
+
+    d = report_to_dict(report)
+    for key in ("bubble_time_ms", "recompute_time_ms", "recompute_time_raw_ms"):
+        assert key in d, f"{key} missing from report_to_dict"
+    assert d["bubble_time_ms"] > 0.0
+    assert d["recompute_time_raw_ms"] > 0.0
+
+    txt = report_summary(report)
+    assert "Recompute (critical path)" in txt
+    assert "Pipeline Bubble" in txt
+    assert "Recompute (pre/post pipeline-hide)" in txt
+    assert "raw (pre-hide, NOT in step)" in txt
+    assert f"({report.bubble_time_ms:.1f} ms)" in txt
+    # The recompute/bubble lines we added must not introduce CJK (the
+    # pre-existing table uses box-drawing '─' but no wide CJK that would
+    # break <NNs> column alignment / crash GBK consoles).
+    added = [l for l in txt.splitlines()
+             if "Recompute" in l or "pre-hide" in l or "Bubble:" in l]
+    for line in added:
+        assert all(ord(c) < 0x2E80 for c in line), f"CJK in: {line!r}"
+
+
+def test_search_results_table_has_recompute_columns():
+    """grid-search results DataFrame (training_search_util.format_results)
+    must expose recompute critical + raw alongside bubble.
+
+    Regression guard for the columns added in PR #109 — keeps the search
+    results table (results_summary.csv / printed top-5 / best-config Excel
+    grouping) from silently dropping recompute time again.
+    """
+    from zrt.training.search.estimator import estimate
+    from zrt.training.search.training_search_util import format_results
+
+    model, system = _model(), _system()
+    strategy = Strategy(
+        tp=1, cp=1, pp=2, ep=1, dp=4, micro_batch=1, global_batch=8,
+        recompute=RecomputePolicy(per_layer={"dense": {"full"}}),
+    )
+    report = estimate(model, system, strategy)
+    df = format_results([report], [{"model": "m"}])
+
+    for col in ("compute_time_ms", "recompute_time_ms", "recompute_time_raw_ms",
+                "bubble_time_ms", "bubble_fraction"):
+        assert col in df.columns, f"{col} missing from results table"
+    row = df.iloc[0]
+    assert row["pipeline_time_ms"] == pytest.approx(
+        row["compute_time_ms"] + row["exposed_comm_ms"] + row["bubble_time_ms"],
+        abs=0.01,
+    )
+    assert df.iloc[0]["recompute_time_raw_ms"] > 0.0

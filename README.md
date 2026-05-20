@@ -141,12 +141,13 @@ python -m python.zrt --model v3.2
 - `output/<model_slug>/reports/<slug>_<phase>_report.html` — HTML 报告
 - `output/<model_slug>/reports/<slug>_<phase>_trace.json` — Chrome Trace（可在 `chrome://tracing` 中加载）
 
-`--estimate-config` 默认输出 Excel 到 `output/estimate/<config名>_<时间戳>.xlsx`，包含 5 个 sheet：
+`--estimate-config` 默认输出 Excel 到 `output/estimate/<config名>_<时间戳>.xlsx`，包含 6 个 sheet：
 - **Summary** — Step time, MFU, HFU, FLOPs, Memory (per GPU), Pipeline schedule；Step Time Breakdown 含独立的 **Recompute (act. redo)** 行，Pipeline 段含 **Bubble Time (ms)**（HTML 报告顶部亦有 Bubble / Recompute 指标卡）
 - **Ops** — 每个算子的 name, kind, layer, FLOPs, bytes, bound, latency (μs)
 - **Model** — 完整模型参数（几何、MoE、HC、MLA、压缩比、dtype 等）
 - **Hardware** — GPU 算力/HBM/网络 tier
 - **Strategy** — 并行配置、batch、schedule、recompute、offload
+- **Comm Domains** — 按 EP / PP / DP / TP / CP 展示通信域 group size、tier 和 rank sample
 
 ### Python API
 
@@ -372,6 +373,12 @@ curl -X POST http://localhost:8000/search \
 }
 ```
 
+`--search-config` 中的 `world_size` 表示参与训练的 active ranks。
+Search 路线不再接受 `gpus_per_node` 配置；资源分配单元由硬件 YAML
+的最内层 bounded interconnect tier 推导，节点数按
+`ceil(world_size / hardware_first_tier_num_devices)` 计算。若不能整除，
+系统会保留 active `world_size` 并记录 idle GPUs warning。
+
 ### 轮询任务状态
 
 ```bash
@@ -513,6 +520,99 @@ print(report.summary())
 
 ---
 
+## 多 tier 互联拓扑与通信域（estimate 路线）
+
+`estimate` 路线（`--estimate-config` / `--search-config`）的通信成本经由统一接口
+`zrt.training.topology.CommDomain` 分派。设计目标：
+
+- **拓扑表达**：硬件 YAML 支持任意层数互联（NVL576 4-tier、Ascend SuperPod 3-tier、H100 2-tier），原有 2-tier YAML 完全兼容。
+- **通信域构建**：参考 Megatron-Core `RankGenerator`，按默认 axis order `tp-cp-ep-dp-pp` 显式枚举每个并行组的 rank 集合（`process_groups.ParallelGroups`）。
+- **代价分派**：3+ tier 系统沿用每 tier 解构（AG/RS 由内向外逐 tier 累加，AR=RS+AG，P2P/A2A 落在所跨最外 tier）；2-tier 系统保持 legacy 2 段 intra+inter 公式逐值不变（anchor 安全）。
+
+### YAML 写法
+
+**Legacy 2-tier（H100/A100/910B/910C/B300 现状）：**
+
+```yaml
+interconnect:
+  intra_node:
+    type: "NVLink4"
+    bandwidth_gbps: 900
+    latency_us: 1
+    topology: "all_to_all"
+    num_devices: 8
+  inter_node:
+    type: "InfiniBand_NDR"
+    bandwidth_gbps: 400
+    latency_us: 2
+    topology: "fat_tree"
+    num_devices: 0     # 0 = 无界（外层 tier）
+```
+
+**N-tier（NVL576 / Ascend SuperPod）：**
+
+```yaml
+interconnect:
+  tiers:
+    - name: "nvlink_tray"      # tier 0（最内）
+      bandwidth_gbps: 1800
+      latency_us: 0.5
+      topology: "all_to_all"
+      num_devices: 4
+    - name: "nvswitch_rack"    # tier 1
+      bandwidth_gbps: 900
+      latency_us: 1.0
+      topology: "all_to_all"
+      num_devices: 72
+    - name: "ib_rail"          # tier 2
+      bandwidth_gbps: 800
+      latency_us: 2.0
+      topology: "fat_tree"
+      num_devices: 576
+    - name: "ib_spine"         # tier 3（最外，无界）
+      bandwidth_gbps: 400
+      latency_us: 5.0
+      topology: "fat_tree"
+      oversubscription: 4.0
+      num_devices: 0
+```
+
+> `num_devices` 单调递增；最外层用 `0` 表示无界（域大小不限）。
+> Search 路线使用第一个 bounded tier 的 `num_devices` 作为 allocation unit；
+> 72/384/576 等更大的拓扑边界应写在 `interconnect.tiers` 中，而不是
+> 在 search config 里写 `gpus_per_node`。
+> 两种写法共存时同源加载器 `_parse_interconnect` 自动识别。
+
+### CommDomain 接口
+
+`CommDomain(system, strategy)` 一次构建、贯穿整个 `estimate()` 调用：
+
+```python
+from zrt.training.topology import build_comm_domain
+
+domain = build_comm_domain(system, strategy)
+
+domain.time(collective)        # 计算一次集合通信耗时（自动按 tier 派发）
+domain.ranks("TP")             # TP 组的显式 rank 列表（首实例）
+domain.tier("EP")              # EP 组落在哪一层 tier（最小可容纳）
+domain.link("DP")              # DP 组使用的 LinkSpec
+domain.group_size("EXPERT_DP") # routed-Muon 的 expert-DP 组大小（dp/ep）
+domain.pp_p2p_link()           # PP 相邻 stage 的 P2P 链路
+domain.summary()               # 每个并行维度的 tier 选取结果（调试/报表用）
+```
+
+主要消费点（均已经过 5 处迁移完毕）：
+
+- `compose.stage.stage_time()` — TP/CP/EP 暴露通信
+- `models.comm.total_comm_time()` — 每层各并行组聚合
+- `models.comm.optimizer_comm_time()` — Adam/Muon 优化器 AG/RS（含路由专家走 EXPERT_DP）
+- `models.comm.pp_p2p_time()` — 流水线 P2P
+- `compose.schedules.pipeline_step_time()` — 顶层每 `estimate()` 建一次 domain
+
+设计细节见 `docs/comm_modeling_spec.md`。
+
+---
+
 ## 图模式（torch.compile）
 
 默认的 eager 路径通过 `TorchDispatchMode` 逐 op 拦截，产生扁平的算子列表。  
@@ -618,10 +718,12 @@ print(f"捕获算子数: {len(records)}")
 **总卡数公式**
 
 ```
-TP × CP × PP × DP = world_size（nodes × gpus_per_node）
+TP × CP × PP × DP = world_size
 ```
 
-EP 不占用独立 rank，在 DP group 内部运行，不参与上述乘积。
+EP 不占用独立 rank，在 DP group 内部运行，不参与上述乘积。Search
+路线里 `world_size` 是 active ranks；`nodes` 由硬件最内层 bounded tier
+容量推导，可能因向上取整产生 idle GPUs。
 
 **约束汇总**
 
@@ -631,10 +733,10 @@ EP 不占用独立 rank，在 DP group 内部运行，不参与上述乘积。
 | TP | `num_heads % TP == 0` | 错误 |
 | TP | `num_kv_heads % TP == 0`（当 `num_kv_heads >= TP` 时）| 错误 |
 | TP | `ffn % TP == 0` | 错误 |
-| TP | `TP > gpus_per_node`（跨节点 TP，性能损失严重）| 警告 |
+| TP | `TP` 跨越硬件最内层 tier（性能损失严重）| 警告 |
 | EP | `num_experts % EP == 0` | 错误 |
 | EP | `DP % EP == 0`（EP group 必须是 DP group 的子集）| 警告 |
-| EP | `EP > gpus_per_node`（跨节点 A2A）| 警告 |
+| EP | `EP` 跨越硬件最内层 tier（A2A 性能损失）| 警告 |
 | PP | `PP ≤ num_layers` | 错误 |
 | PP | `num_layers % PP == 0`（否则各 stage 层数不均）| 警告 |
 | PP | `num_microbatches ≥ PP`，其中 `num_microbatches = global_batch / (micro_batch × DP)` | 警告 |
@@ -645,7 +747,7 @@ EP 不占用独立 rank，在 DP group 内部运行，不参与上述乘积。
 | CP(Ulysses) | `(num_heads // TP) % CP == 0` | 警告 |
 | CP(Ring) | `seq_len % (CP × 128) == 0` | 警告 |
 | CP(Hybrid) | 同时满足 Ulysses + Ring 两条规则 | 警告 |
-| CP | `CP > gpus_per_node`（跨节点 CP 通信）| 警告 |
+| CP | `CP` 跨越硬件最内层 tier（跨 tier CP 通信）| 警告 |
 | CP + EP | 两者同时存在时 A2A pattern 需人工确认 | 警告 |
 
 ### 硬件规格
@@ -656,13 +758,18 @@ EP 不占用独立 rank，在 DP group 内部运行，不参与上述乘积。
 
 #### 可用硬件
 
-| 名称 | 描述 |
-|------|------|
-| `nvidia_h100_sxm` | NVIDIA H100 SXM5 80GB |
-| `nvidia_h800` | NVIDIA H800 80GB |
-| `nvidia_a100_80g` | NVIDIA A100 80GB SXM |
-| `ascend_910b` | 华为昇腾 910B |
-| `ascend_910c` | 华为昇腾 910C |
+| 名称 | 描述 | 互联拓扑 |
+|------|------|----------|
+| `nvidia_h100_sxm` | NVIDIA H100 SXM5 80GB | 2-tier（NVLink4 / IB-NDR） |
+| `nvidia_h800` | NVIDIA H800 80GB | 2-tier（NVLink4 阉割带宽 / IB） |
+| `nvidia_a100_80g` | NVIDIA A100 80GB SXM | 2-tier（NVLink3 / IB-HDR） |
+| `nvidia_b300` | NVIDIA Blackwell Ultra B300 | 2-tier（NVLink5 / IB-XDR） |
+| `nvidia_gb300_nvl576` | NVIDIA GB300 NVL576 系统 | **4-tier**（tray → rack → IB rail → IB spine） |
+| `ascend_910b` | 华为昇腾 910B | 2-tier（HCCS / RoCE） |
+| `ascend_910c` | 华为昇腾 910C | 2-tier（HCCS / RoCE） |
+| `ascend_910c_superpod` | 华为昇腾 910C SuperPod（CloudMatrix 384） | **3-tier**（HCCS supernode → RoCE pod → RoCE spine） |
+
+> 2-tier 配置使用 legacy `intra_node:` / `inter_node:` 字段；3+ tier 使用新 `tiers:` 列表，详见下一节。
 
 ### 训练建模专属参数（`--train --hw` 时生效）
 
@@ -1043,7 +1150,10 @@ modeling/
 │       ├── io/config_loader.py      # YAML 加载
 │       ├── configs/models/          # 模型规格 YAML
 │       ├── configs/*.yaml           # 训练配置
-│       └── ...                      # search/ spec/ compose/ 模块
+│       ├── topology/                # 通信域 + 进程组构建
+│       │   ├── comm_domain.py       # CommDomain（统一通信成本入口）
+│       │   └── process_groups.py    # Megatron-style RankGenerator 端口
+│       └── ...                      # search/ spec/ compose/ models/ 等模块
 │
 └── hf_models/                       # 模型本地副本（只读！）
     ├── deepseek_v3/

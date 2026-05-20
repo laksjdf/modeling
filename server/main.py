@@ -121,7 +121,7 @@ def get_hardware_spec(name: str):
     cfg = Path(__file__).parent.parent / "python" / "zrt" / "hardware" / "configs" / f"{name}.yaml"
     if not cfg.exists():
         raise HTTPException(404, detail=f"Hardware '{name}' not found")
-    data = _yaml.safe_load(cfg.read_text())
+    data = _yaml.safe_load(cfg.read_text(encoding="utf-8"))
     compute = data.get("compute", {})
     memory  = data.get("memory",  {})
     intra   = data.get("interconnect", {}).get("intra_node", {})
@@ -145,7 +145,7 @@ def get_hardware_raw(name: str):
     cfg = Path(__file__).parent.parent / "python" / "zrt" / "hardware" / "configs" / f"{name}.yaml"
     if not cfg.exists():
         raise HTTPException(404, detail=f"Hardware '{name}' not found")
-    return {"content": cfg.read_text()}
+    return {"content": cfg.read_text(encoding="utf-8")}
 
 
 @app.get("/models", tags=["utility"], summary="List training model configs")
@@ -156,7 +156,7 @@ def list_models():
     result = []
     for f in sorted(models_dir.glob("*.yaml")):
         try:
-            d = _yaml.safe_load(f.read_text())
+            d = _yaml.safe_load(f.read_text(encoding="utf-8"))
             # Parse layers string e.g. "[dense]*3+[moe]*57+[mtp]*1"
             layers_raw = d.get("layers", "")
             layer_counts: dict = {}
@@ -202,7 +202,7 @@ def get_model_raw(key: str):
     cfg = Path(__file__).parent.parent / "python" / "zrt" / "training" / "configs" / "models" / f"{key}.yaml"
     if not cfg.exists():
         raise HTTPException(404, detail=f"Model '{key}' not found")
-    return {"content": cfg.read_text()}
+    return {"content": cfg.read_text(encoding="utf-8")}
 
 
 # ── Job polling ───────────────────────────────────────────────────────────────

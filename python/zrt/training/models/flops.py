@@ -10,6 +10,7 @@ import math
 from dataclasses import dataclass
 
 from zrt.training.ir.training_graph import Graph, Op
+from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import ModelSpec
 from zrt.training.spec.strategy import Strategy
 from zrt.training.spec.system import SystemSpec
@@ -52,13 +53,13 @@ def _bytes_from_tensors(op: Op) -> float:
 def op_cost(op: Op, model: ModelSpec, system: SystemSpec | None = None) -> OpCost:
     """Compute raw cost per op (FLOPs + bytes for roofline timing)."""
     if op.kind == "matmul":
-        return _matmul_cost(op)
+        return _matmul_cost(op, model)
     if op.kind == "sparse_attn":
-        return _sparse_attn_cost(op, system)
+        return _sparse_attn_cost(op, system, model)
     if op.kind == "hca_attn":
-        return _hca_attn_cost(op, system)
+        return _hca_attn_cost(op, system, model)
     if op.kind == "swa_attn":
-        return _swa_attn_cost(op, system)
+        return _swa_attn_cost(op, system, model)
     if op.kind == "attn_core":
         return _attn_cost(op, model, system)
     if op.kind == "mhc_pre":
@@ -67,20 +68,64 @@ def op_cost(op: Op, model: ModelSpec, system: SystemSpec | None = None) -> OpCos
         return _mhc_post_cost(op)
     if op.kind == "mhc_head":
         return _mhc_head_cost(op)
-    if op.kind in ("ln", "rmsnorm", "softmax", "rope", "swiglu", "add", "hc_expand"):
+    if op.kind in ("ln", "rmsnorm", "softmax"):
+        return _promote_aware_elementwise_cost(op, model, system)
+    if op.kind in ("rope", "swiglu", "add", "hc_expand"):
         return _elementwise_cost(op)
     if op.kind == "embed":
         return _embed_cost(op)
     if op.kind == "lm_head":
-        return _matmul_cost(op)
+        return _matmul_cost(op, model)
     if op.kind == "compressor_pool":
         return _compressor_pool_cost(op)
     if op.kind == "indexer_topk":
         return _indexer_topk_cost(op)
     if op.kind == "hash_route":
         return OpCost()  # table lookup, negligible FLOPs
+    if op.kind == "cast":
+        return _cast_cost(op)
     # Unknown ops: zero cost
     return OpCost()
+
+
+def _cast_cost(op: Op) -> OpCost:
+    """Dtype-boundary cast / quantize / dequantize op.
+
+    fwd_bytes = n × (src.bytes + dst.stored_bytes)   if not fused
+              + n × src.bytes                         if needs_amax (BF16→FP8/FP4)
+
+    When ``op.meta["fused"]`` is True (e.g., LN epilog absorbs the cast,
+    GEMM epilog fused), returns 0 — the kernel does not consume extra
+    HBM bandwidth. ``QuantPolicy.assume_all_casts_fused`` (default True)
+    sets this flag everywhere → cast ops are present in the IR for the
+    reports but cost nothing, exactly matching v1 behaviour.
+
+    dx_bytes mirrors fwd (the inverse cast happens during backward).
+    dw_bytes = 0 (cast never produces a weight gradient).
+    """
+    if op.meta.get("fused", False):
+        return OpCost(bound="memory")
+
+    n = float(op.meta.get("num_elements", 0))
+    src = op.meta.get("src_dtype")
+    dst = op.meta.get("dst_dtype")
+    if n <= 0 or src is None or dst is None:
+        return OpCost(bound="memory")
+
+    src_b = src.bytes
+    dst_b = dst.stored_bytes
+    needs_amax = bool(op.meta.get("needs_amax", False))
+
+    main_bytes = n * (src_b + dst_b)
+    amax_bytes = (n * src_b) if needs_amax else 0.0
+
+    fwd_bytes = main_bytes + amax_bytes
+    return OpCost(
+        fwd_bytes=fwd_bytes,
+        dx_bytes=fwd_bytes,        # reverse cast during backward
+        dw_bytes=0.0,
+        bound="memory",
+    )
 
 
 def _embed_cost(op: Op) -> OpCost:
@@ -106,7 +151,24 @@ def _embed_cost(op: Op) -> OpCost:
     )
 
 
-def _matmul_cost(op: Op) -> OpCost:
+def _matmul_cost(op: Op, model: "ModelSpec | None" = None) -> OpCost:
+    """Per-operand byte accounting for matmul (v2 mixed-quant).
+
+    Forward GEMM: C[m,n] = A[m,k] @ W[k,n]
+      fwd_bytes = m*k * in_act.bytes
+                + k*n * weight.stored_bytes        ← FP4 block-scale aware
+                + m*n * out_act.bytes
+      dx_bytes  = m*n * grad_in.bytes
+                + k*n * weight.stored_bytes
+                + m*k * grad_act.bytes
+      dw_bytes  = m*n * grad_in.bytes
+                + m*k * in_act.bytes
+                + k*n * grad_weight.stored_bytes
+
+    Default bundle ``grad_in == grad_act == grad_weight == in_act`` so
+    BF16 baseline reduces to v1's ``(mk+kn+mn) * act.bytes``. Per-component
+    overrides (FP4 weight, FP8 act) reshape the formula naturally.
+    """
     # Fused ops (routed_expert) and grouped matmuls (wo_a) have meta
     # dimensions that don't correspond to tensor shapes — must read from meta.
     meta_k = op.meta.get("k", 0)
@@ -124,17 +186,47 @@ def _matmul_cost(op: Op) -> OpCost:
         m = op.inputs[0].shape_local[0]
         k = op.inputs[0].shape_local[-1]
         n = op.outputs[0].shape_local[-1]
-    bpe = _bpe(op)
-    fwd = 2.0 * m * n * k * op.meta.get("fwd_multiplier", 1.0)
-    # read A(m×k) + B(k×n), write C(m×n) — symmetric for fwd/dx/dw
-    total_bytes = (m * k + k * n + m * n) * bpe
+
+    mult = op.meta.get("fwd_multiplier", 1.0)
+    fwd = 2.0 * m * n * k * mult
+    dx = 2.0 * m * n * k * mult
+    dw = 2.0 * m * n * k * mult
+
+    # Resolve per-operand dtypes via the centralized bundle. When ``model``
+    # is None (legacy test harness), fall back to ``_bpe(op)`` for v1
+    # behaviour.
+    if model is None:
+        bpe = _bpe(op)
+        total_bytes = (m * k + k * n + m * n) * bpe
+        return OpCost(
+            fwd_bytes=total_bytes,
+            dx_bytes=total_bytes,
+            dw_bytes=total_bytes,
+            fwd_cube_flops=fwd,
+            dx_cube_flops=dx,
+            dw_cube_flops=dw,
+        )
+
+    from zrt.training.models.quant import resolve_op_dtypes
+    d = resolve_op_dtypes(op, model)
+    A_b = d.in_act.bytes
+    W_b = d.weight.stored_bytes
+    C_b = d.out_act.bytes
+    dC_b = d.grad_in.bytes
+    dA_b = d.grad_act.bytes
+    dW_b = d.grad_weight.stored_bytes
+
+    fwd_bytes = m * k * A_b + k * n * W_b + m * n * C_b
+    dx_bytes = m * n * dC_b + k * n * W_b + m * k * dA_b
+    dw_bytes = m * n * dC_b + m * k * A_b + k * n * dW_b
+
     return OpCost(
-        fwd_bytes=total_bytes,
-        dx_bytes=total_bytes,
-        dw_bytes=total_bytes,
+        fwd_bytes=fwd_bytes,
+        dx_bytes=dx_bytes,
+        dw_bytes=dw_bytes,
         fwd_cube_flops=fwd,
-        dx_cube_flops=fwd,
-        dw_cube_flops=fwd,
+        dx_cube_flops=dx,
+        dw_cube_flops=dw,
     )
 
 
@@ -150,6 +242,23 @@ def _fa_tile_shape(head_dim: int, act_bpe: int, sram_bytes: int) -> tuple[int, i
     Bc = max(16, min(128, sram_bytes // (4 * head_dim * act_bpe)))
     Br = max(16, min(128, sram_bytes // (3 * head_dim * act_bpe)))
     return Br, Bc
+
+
+def _attn_region_bytes(op: Op, model: "ModelSpec | None") -> tuple[float, float, float]:
+    """Return per-element bytes for (Q/K/V reads, O write, grad activations).
+
+    Attention has no weight matrix (QKV/O proj are separate matmul ops),
+    so byte accounting only tracks activation tensors. The bundle's
+    ``in_act`` covers Q/K/V reads, ``out_act`` covers the O write, and
+    ``grad_in/grad_act`` cover bwd tensors. Default bundle keeps these
+    all at the region's activation dtype so BF16 baseline matches v1.
+    """
+    if model is None:
+        bpe = _bpe(op)
+        return bpe, bpe, bpe
+    from zrt.training.models.quant import resolve_op_dtypes
+    d = resolve_op_dtypes(op, model)
+    return d.in_act.bytes, d.out_act.bytes, d.grad_in.bytes
 
 
 def _attn_cost(op: Op, model: ModelSpec | None, system: SystemSpec | None = None) -> OpCost:
@@ -212,11 +321,12 @@ def _attn_cost(op: Op, model: ModelSpec | None, system: SystemSpec | None = None
     else:
         kv_len = s  # standard attention: K, V same length as Q
 
-    bpe = _bpe(op)
+    qkv_b, o_b, grad_b = _attn_region_bytes(op, model)
+    bpe_tile = _bpe(op)  # SRAM tile sizing uses fwd activation precision
 
     # Tile-aware byte formula: K,V are re-read per Q-block in FlashAttention.
     sram_bytes = int(system.gpu.sram_kb_per_sm * 1024) if system and system.gpu.sram_kb_per_sm > 0 else 0
-    Br, Bc = _fa_tile_shape(d, bpe, sram_bytes)
+    Br, Bc = _fa_tile_shape(d, bpe_tile, sram_bytes)
     Tr = math.ceil(s / Br)
     Tc = math.ceil(kv_len / Bc)
     # Causal: average K-blocks per Q-block is (Tc+1)/2 for dense contiguous mask,
@@ -226,12 +336,15 @@ def _attn_cost(op: Op, model: ModelSpec | None, system: SystemSpec | None = None
     else:
         tc_eff = (Tc + 1) / 2 if causal else Tc
 
-    q_bytes  = b * h * s * d
-    o_bytes  = b * h * s * d
-    kv_bytes = b * h * Tr * tc_eff * Bc * d
-    fwd_bytes = (q_bytes + o_bytes + 2.0 * kv_bytes) * bpe
-    # Backward: ≈2× fwd minus small saved-state (M, L) overhead
-    dx_bytes = (2.0 * q_bytes + 4.0 * kv_bytes) * bpe
+    q_elems  = b * h * s * d
+    o_elems  = b * h * s * d
+    kv_elems = b * h * Tr * tc_eff * Bc * d
+    # fwd: read Q + 2×KV at fwd-act dtype; write O at out_act dtype.
+    fwd_bytes = (q_elems + 2.0 * kv_elems) * qkv_b + o_elems * o_b
+    # Backward: ≈2× fwd minus small saved-state (M, L) overhead. dO and
+    # dQ/dK/dV all live at the grad activation dtype (= in_act by default,
+    # preserving v1 baseline). Halves the bwd traffic when bwd runs in FP8.
+    dx_bytes = (2.0 * q_elems + 4.0 * kv_elems) * grad_b
 
     return OpCost(
         fwd_bytes=fwd_bytes,
@@ -250,7 +363,8 @@ def _attn_compression_ratio(value: float) -> float:
     return ratio
 
 
-def _sparse_attn_cost(op: Op, system: SystemSpec | None = None) -> OpCost:
+def _sparse_attn_cost(op: Op, system: SystemSpec | None = None,
+                       model: "ModelSpec | None" = None) -> OpCost:
     """CSA / DSA: sparse attention over indexer top-k KV + sliding window.
 
     Q: (seq, heads, head_dim)
@@ -267,24 +381,25 @@ def _sparse_attn_cost(op: Op, system: SystemSpec | None = None) -> OpCost:
     swa = op.meta.get("swa_window", 0)
 
     if topk <= 0:
-        return _attn_cost(op, None, system)
+        return _attn_cost(op, model, system)
 
     effective_len = topk + swa
     fwd = 2.0 * b * s * effective_len * h * d
     cube_fwd = fwd
     vector_fwd = 5.0 * b * h * s * effective_len
 
-    bpe = _bpe(op)
+    qkv_b, o_b, grad_b = _attn_region_bytes(op, model)
+    bpe_tile = _bpe(op)
     sram_bytes = int(system.gpu.sram_kb_per_sm * 1024) if system and system.gpu.sram_kb_per_sm > 0 else 0
-    Br, Bc = _fa_tile_shape(d, bpe, sram_bytes)
+    Br, Bc = _fa_tile_shape(d, bpe_tile, sram_bytes)
     Tr = math.ceil(s / Br)
     Tc = math.ceil(effective_len / Bc)
     tc_eff = Tc  # top-k positions are scattered, no causal halving
-    q_bytes = b * h * s * d
-    o_bytes = b * h * s * d
-    kv_bytes = b * h * Tr * tc_eff * Bc * d
-    fwd_bytes = (q_bytes + o_bytes + 2.0 * kv_bytes) * bpe
-    dx_bytes = (2.0 * q_bytes + 4.0 * kv_bytes) * bpe
+    q_elems = b * h * s * d
+    o_elems = b * h * s * d
+    kv_elems = b * h * Tr * tc_eff * Bc * d
+    fwd_bytes = (q_elems + 2.0 * kv_elems) * qkv_b + o_elems * o_b
+    dx_bytes = (2.0 * q_elems + 4.0 * kv_elems) * grad_b
 
     return OpCost(
         fwd_bytes=fwd_bytes,
@@ -296,7 +411,8 @@ def _sparse_attn_cost(op: Op, system: SystemSpec | None = None) -> OpCost:
     )
 
 
-def _hca_attn_cost(op: Op, system: SystemSpec | None = None) -> OpCost:
+def _hca_attn_cost(op: Op, system: SystemSpec | None = None,
+                    model: "ModelSpec | None" = None) -> OpCost:
     """HCA: dense attention on compressed KV (seq/ratio) + sliding window.
 
     Q: (seq, heads, head_dim)
@@ -311,7 +427,7 @@ def _hca_attn_cost(op: Op, system: SystemSpec | None = None) -> OpCost:
     swa = op.meta.get("swa_window", 0)
 
     if ratio <= 0:
-        return _attn_cost(op, None, system)
+        return _attn_cost(op, model, system)
 
     compressed_len = max(1, s // ratio)
     effective_len = compressed_len + swa
@@ -319,17 +435,18 @@ def _hca_attn_cost(op: Op, system: SystemSpec | None = None) -> OpCost:
     cube_fwd = fwd
     vector_fwd = 5.0 * b * h * s * effective_len
 
-    bpe = _bpe(op)
+    qkv_b, o_b, grad_b = _attn_region_bytes(op, model)
+    bpe_tile = _bpe(op)
     sram_bytes = int(system.gpu.sram_kb_per_sm * 1024) if system and system.gpu.sram_kb_per_sm > 0 else 0
-    Br, Bc = _fa_tile_shape(d, bpe, sram_bytes)
+    Br, Bc = _fa_tile_shape(d, bpe_tile, sram_bytes)
     Tr = math.ceil(s / Br)
     Tc = math.ceil(effective_len / Bc)
     tc_eff = (Tc + 1) / 2  # always causal
-    q_bytes = b * h * s * d
-    o_bytes = b * h * s * d
-    kv_bytes = b * h * Tr * tc_eff * Bc * d
-    fwd_bytes = (q_bytes + o_bytes + 2.0 * kv_bytes) * bpe
-    dx_bytes = (2.0 * q_bytes + 4.0 * kv_bytes) * bpe
+    q_elems = b * h * s * d
+    o_elems = b * h * s * d
+    kv_elems = b * h * Tr * tc_eff * Bc * d
+    fwd_bytes = (q_elems + 2.0 * kv_elems) * qkv_b + o_elems * o_b
+    dx_bytes = (2.0 * q_elems + 4.0 * kv_elems) * grad_b
 
     return OpCost(
         fwd_bytes=fwd_bytes,
@@ -341,7 +458,8 @@ def _hca_attn_cost(op: Op, system: SystemSpec | None = None) -> OpCost:
     )
 
 
-def _swa_attn_cost(op: Op, system: SystemSpec | None = None) -> OpCost:
+def _swa_attn_cost(op: Op, system: SystemSpec | None = None,
+                    model: "ModelSpec | None" = None) -> OpCost:
     """SWA-only: pure sliding window attention.
 
     Q: (seq, heads, head_dim)
@@ -355,23 +473,24 @@ def _swa_attn_cost(op: Op, system: SystemSpec | None = None) -> OpCost:
     swa = op.meta.get("swa_window", 0)
 
     if swa <= 0:
-        return _attn_cost(op, None, system)
+        return _attn_cost(op, model, system)
 
     fwd = 2.0 * b * s * swa * h * d
     cube_fwd = fwd
     vector_fwd = 5.0 * b * h * s * swa
 
-    bpe = _bpe(op)
+    qkv_b, o_b, grad_b = _attn_region_bytes(op, model)
+    bpe_tile = _bpe(op)
     sram_bytes = int(system.gpu.sram_kb_per_sm * 1024) if system and system.gpu.sram_kb_per_sm > 0 else 0
-    Br, Bc = _fa_tile_shape(d, bpe, sram_bytes)
+    Br, Bc = _fa_tile_shape(d, bpe_tile, sram_bytes)
     Tr = math.ceil(s / Br)
     Tc = math.ceil(swa / Bc)
     tc_eff = (Tc + 1) / 2  # always causal
-    q_bytes = b * h * s * d
-    o_bytes = b * h * s * d
-    kv_bytes = b * h * Tr * tc_eff * Bc * d
-    fwd_bytes = (q_bytes + o_bytes + 2.0 * kv_bytes) * bpe
-    dx_bytes = (2.0 * q_bytes + 4.0 * kv_bytes) * bpe
+    q_elems = b * h * s * d
+    o_elems = b * h * s * d
+    kv_elems = b * h * Tr * tc_eff * Bc * d
+    fwd_bytes = (q_elems + 2.0 * kv_elems) * qkv_b + o_elems * o_b
+    dx_bytes = (2.0 * q_elems + 4.0 * kv_elems) * grad_b
 
     return OpCost(
         fwd_bytes=fwd_bytes,
@@ -488,6 +607,52 @@ def _elementwise_cost(op: Op) -> OpCost:
     )
 
 
+def _promote_aware_elementwise_cost(
+    op: Op, model: "ModelSpec | None", system: SystemSpec | None = None,
+) -> OpCost:
+    """Softmax / LN / RMSNorm with optional FP32 promote on quantized input.
+
+    When ``Strategy.quant.ln_softmax_promote_fp32`` is True (the default —
+    matches production fused LN/softmax kernels) and the op's first input
+    arrives in a quantized dtype (FP8 / FP4), we add an extra read of the
+    input tensor's elements to model the per-tensor max-abs reduction
+    plus FP32 promotion. The cost is:
+
+      LN/RMSNorm: +1× input elements (one reduce pass for mean/var)
+      Softmax:    +2× input elements (max + sum-of-exp passes)
+
+    When the input is BF16/FP32 (no promote needed), behavior is
+    identical to ``_elementwise_cost`` — preserving the v1 baseline.
+    """
+    base = _elementwise_cost(op)
+
+    if model is None or not op.inputs:
+        return base
+
+    # QuantPolicy lives on Strategy but isn't reachable from op_cost; for
+    # now, gate on whether input dtype is quantized. The strategy-level
+    # toggle will be threaded through in Stage E when reports surface
+    # cast/promote bytes.
+    in_dtype = op.inputs[0].dtype
+    QUANT_DTYPES = {Dtype.FP4, Dtype.FP8_E4M3, Dtype.FP8_E5M2}
+    if in_dtype not in QUANT_DTYPES:
+        return base
+
+    n_in = op.inputs[0].num_elements()
+    extra_reads = 2 if op.kind == "softmax" else 1
+    extra_bytes = extra_reads * n_in * in_dtype.bytes
+    return OpCost(
+        fwd_bytes=base.fwd_bytes + extra_bytes,
+        dx_bytes=base.dx_bytes + extra_bytes,
+        dw_bytes=base.dw_bytes,
+        bound="memory",
+        fwd_cube_flops=base.fwd_cube_flops,
+        fwd_vector_flops=base.fwd_vector_flops,
+        dx_cube_flops=base.dx_cube_flops,
+        dx_vector_flops=base.dx_vector_flops,
+    )
+
+
 def _compressor_pool_cost(op: Op) -> OpCost:
     """KV compressor gated pooling: softmax + weighted sum over compression windows."""
     s = op.meta.get("s", 0)
@@ -524,6 +689,8 @@ def _is_compute_bound(cost: OpCost, phase: str, system: SystemSpec) -> bool:
 
     Uses peak FLOPS and peak BW (no efficiency curves) so that bound is a
     structural property of the op shape, not dependent on the efficiency model.
+    Intentionally excluded from the unified effective_flops/effective_hbm_bw
+    entries for this reason.
     """
     flops = getattr(cost, f"{phase}_cube_flops") + getattr(cost, f"{phase}_vector_flops")
     bytes_ = getattr(cost, f"{phase}_bytes")
@@ -623,6 +790,10 @@ def recompute_overhead_flops(
     for op in graph.ops:
         # Look up the layer kind for this op
         if op.layer_id < 0 or op.layer_id >= len(model.layers):
+            continue
+        if op.kind == "cast":
+            # See §12.7 of mixed_quant_v2_op_bytes_zh.md — v2 first cut
+            # skips cast in recompute accounting (small 2nd-order effect).
             continue
         lk = model.layers[op.layer_id].value
         cats = rc.per_layer.get(lk)

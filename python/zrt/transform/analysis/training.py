@@ -410,6 +410,9 @@ class PipelineStepMetrics:
     exposed_comm_ms: float = 0.0
     hidden_comm_ms: float = 0.0
     total_comm_ms: float = 0.0
+    optimizer_time_ms: float = 0.0
+    optimizer_comm_ms: float = 0.0
+    optimizer_comm_hidden_ms: float = 0.0
 
     def to_dict(self) -> dict[str, float]:
         return {
@@ -429,6 +432,9 @@ class PipelineStepMetrics:
             "exposed_comm_ms": self.exposed_comm_ms,
             "hidden_comm_ms": self.hidden_comm_ms,
             "total_comm_ms": self.total_comm_ms,
+            "optimizer_time_ms": self.optimizer_time_ms,
+            "optimizer_comm_ms": self.optimizer_comm_ms,
+            "optimizer_comm_hidden_ms": self.optimizer_comm_hidden_ms,
         }
 
 
@@ -750,61 +756,92 @@ class TrainingPipelinePass(GraphPass):
         g.metadata["recompute_compute_ms"] = recompute_compute_ms
 
         # Add optimizer step time (per §5.5.2 of design doc)
-        opt_step_time_us = self._compute_optimizer_step_time(g, hw, ctx)
-        if opt_step_time_us > 0:
-            g.metadata["optimizer_step_time_us"] = opt_step_time_us
-            step_time_us += opt_step_time_us
+        compute_us, ag_us, rs_us = self._compute_optimizer_step_time(g, hw, ctx)
+        total_opt_us = compute_us + ag_us + rs_us
+        if total_opt_us > 0:
+            g.metadata["optimizer_step_time_us"] = total_opt_us
+            fwd_window_us = max(step_result.warmup_fwd, step_result.steady_fwd_per_mb) * 1e6
+            opt_node = g.nodes.get("optimizer_step")
+            rotation = opt_node.attrs.get("ns_rotation", True) if opt_node else True
+
+            from zrt.training.models.optimizer import moonshot_optimizer_hiding
+            opt_comm_exposed_us, opt_comm_hidden_us = moonshot_optimizer_hiding(
+                compute_us=compute_us,
+                ag_us=ag_us,
+                rs_us=rs_us,
+                fwd_window_us=fwd_window_us,
+                rotation=rotation,
+            )
+            step_time_us += compute_us + opt_comm_exposed_us
             metrics.step_time_ms = step_time_us / 1000.0
+            metrics.optimizer_time_ms = compute_us / 1000.0
+            metrics.optimizer_comm_ms = opt_comm_exposed_us / 1000.0
+            metrics.optimizer_comm_hidden_ms = opt_comm_hidden_us / 1000.0
 
         return g
 
     @staticmethod
     def _compute_optimizer_step_time(
         g: "OpGraph", hw: "HardwareSpec", ctx: "TransformContext",
-    ) -> float:
-        """Compute optimizer step time in microseconds.
+    ) -> tuple[float, float, float]:
+        """Compute optimizer step time. Returns (compute_us, ag_us, rs_us).
 
-        Includes:
-        1. Optimizer compute FLOPs (Adam: memory-bound; Muon: compute-bound)
-        2. Muon AllGather/ReduceScatter communication (Muon + ZeRO + DP>1)
+        Uses Stack A's calibrated ``muon_comm_times_from_params`` for the
+        Muon AG/RS communication when the routed/non-routed split is
+        available in node attrs. Falls back to raw bandwidth estimate.
         """
         opt_node = g.nodes.get("optimizer_step")
         if opt_node is None:
-            return 0.0
+            return 0.0, 0.0, 0.0
 
         optimizer = opt_node.attrs.get("optimizer", "adam")
         step_flops = float(opt_node.attrs.get("step_flops", 0))
 
         from python.zrt.ir.types import DType
         if optimizer == "muon":
-            # Muon NS is compute-bound (large GEMMs)
             peak_flops = hw.peak_flops(DType.BF16)
-            compute_time_us = (step_flops / peak_flops) * 1e6 if peak_flops > 0 else 0.0
+            compute_us = (step_flops / peak_flops) * 1e6 if peak_flops > 0 else 0.0
         else:
-            # Adam is memory-bound (element-wise ops)
             opt_state_bytes = float(opt_node.attrs.get("state_bytes", 0))
             hbm_bw = hw.memory.hbm_bandwidth_gbps * 1e9 / 8
-            compute_time_us = (opt_state_bytes / hbm_bw) * 1e6 if hbm_bw > 0 else 0.0
+            compute_us = (opt_state_bytes / hbm_bw) * 1e6 if hbm_bw > 0 else 0.0
+            return compute_us, 0.0, 0.0
 
-        # Muon additional communication (AllGather momentum)
-        comm_time_us = 0.0
-        if optimizer == "muon":
+        # Muon comm: use calibrated Stack A helper when split attrs are present
+        P_non_routed = opt_node.attrs.get("muon_ag_bytes_non_routed", 0) // 4
+        P_routed = opt_node.attrs.get("muon_ag_bytes_routed", 0) // 4
+        expert_dp = opt_node.attrs.get("expert_dp", ctx.parallel.dp if ctx.parallel else 1)
+        rotation = opt_node.attrs.get("ns_rotation", True)
+        dp = ctx.parallel.dp if ctx.parallel else 1
+
+        if P_non_routed + P_routed > 0 and dp > 1:
+            from zrt.training.models.comm import muon_comm_times_from_params
+            comm = muon_comm_times_from_params(
+                P_muon_non_routed=P_non_routed,
+                P_muon_routed=P_routed,
+                dp=dp,
+                expert_dp=expert_dp,
+                rotation=rotation,
+                system=hw,
+            )
+            ag_us = comm["muon_ag"] * 1e6
+            rs_us = comm["muon_rs"] * 1e6
+        else:
+            # Legacy fallback: raw bandwidth estimate
             ag_bytes = float(opt_node.attrs.get("muon_ag_bytes", 0))
-            ns_rotation = opt_node.attrs.get("ns_rotation", True)
+            ag_us = 0.0
+            rs_us = 0.0
             if ag_bytes > 0:
-                dp = ctx.parallel.dp if ctx.parallel else 1
                 gpus_per_node = hw.interconnect.intra_node.num_devices
                 link = hw.interconnect.inter_node if dp > gpus_per_node else hw.interconnect.intra_node
                 dp_bw = link.bandwidth_gbps * 1e9 / 8
-                # Ring factor: AG always, RS only when rotation=True
-                # AG: (dp-1)/dp factor; RS: same factor when rotation=True
-                if ns_rotation:
-                    ring_factor = 2.0 * (dp - 1) / dp  # AG + RS
-                else:
-                    ring_factor = 1.0 * (dp - 1) / dp  # AG only (Moonshot optimization)
-                comm_time_us = (ring_factor * ag_bytes / dp_bw) * 1e6 if dp_bw > 0 else 0.0
+                if dp_bw > 0:
+                    ring_factor = 2.0 * (dp - 1) / dp if rotation else 1.0 * (dp - 1) / dp
+                    comm_us = (ring_factor * ag_bytes / dp_bw) * 1e6
+                    ag_us = comm_us * 0.5
+                    rs_us = comm_us * 0.5
 
-        return compute_time_us + comm_time_us
+        return compute_us, ag_us, rs_us
 
     @staticmethod
     def _estimate_stage_dw_us(

@@ -150,10 +150,15 @@ class TestHideWindowConsistency:
         """After fix #3, dualbatch's new_dp_exposed should go through the same
         helper (cooldown + ratio*steady_bwd), so it can still hide DP in steady_bwd
         even when cooldown collapses to 0."""
+        # seq_len/micro_batch scaled up so the backward-compute hide window
+        # (steady_bwd) still dominates DP grad volume after kb_efficiency=0.7
+        # grew DP AllReduce ~1.43×. DP grad volume is param-bound (unchanged
+        # by token count), so more tokens restore the documented
+        # "steady_bwd >> dp_total" regime without weakening the assertion.
         model = ModelSpec(hidden=2048, ffn=8192, num_heads=16, num_kv_heads=16,
-                          head_dim=128, vocab=32000, seq_len=1024,
+                          head_dim=128, vocab=32000, seq_len=4096,
                           layers=[LayerKind.DENSE]*4)
-        s = Strategy(tp=1, pp=2, dp=4, micro_batch=1, global_batch=16,
+        s = Strategy(tp=1, pp=2, dp=4, micro_batch=4, global_batch=64,
                      pp_schedule=PPSched.DUALPIPE, dualbatch=True,
                      dp_steady_overlap_ratio=1.0)
         graph = build_graph(model, s)

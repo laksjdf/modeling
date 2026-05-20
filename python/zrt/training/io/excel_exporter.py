@@ -1,11 +1,12 @@
 """Excel exporter for spec-based training estimation (--estimate-config).
 
-Produces a single workbook with five sheets:
+Produces a single workbook with six sheets:
   1. Summary   — E2E timing, MFU, memory, pipeline, FLOPs
   2. Ops       — Per-op details (name, kind, layer, flops, bytes, bound, latency)
   3. Model     — Model geometry, MoE, HC, MLA, dtype
   4. Hardware  — GPU specs, network, memory bandwidth
   5. Strategy  — Parallel config, micro_batch, recompute, zero_stage
+  6. Comm Domains — Per-axis communication-domain tier and rank sample
 """
 from __future__ import annotations
 
@@ -135,6 +136,8 @@ def export_estimate_excel(
          f"{report.pp_exposed_ms / report.step_time_ms * 100:.1f}%" if report.step_time_ms > 0 and report.pp_exposed_ms > 0 else "-"],
         ["    DP (AR/RS)", f"{report.dp_exposed_ms:.2f}" if report.dp_exposed_ms > 0 else "-",
          f"{report.dp_exposed_ms / report.step_time_ms * 100:.1f}%" if report.step_time_ms > 0 and report.dp_exposed_ms > 0 else "-"],
+        ["  Pipeline Bubble", f"{report.bubble_time_ms:.2f}" if report.bubble_time_ms > 0 else "0.00",
+         f"{report.bubble_time_ms / report.step_time_ms * 100:.1f}%" if report.step_time_ms > 0 and report.bubble_time_ms > 0 else "0.0%"],
         ["  Optimizer (compute)", f"{report.optimizer_time_ms:.2f}" if report.optimizer_time_ms > 0 else "-",
          f"{report.optimizer_time_ms / report.step_time_ms * 100:.1f}%" if report.step_time_ms > 0 and report.optimizer_time_ms > 0 else "-"],
         ["  Optimizer (comm)", f"{report.optimizer_comm_ms:.2f}" if report.optimizer_comm_ms > 0 else "-",
@@ -403,6 +406,22 @@ def export_estimate_excel(
     else:
         strat_rows.append(["  None", "", ""])
     _write_sheet(ws5, strat_rows, col_widths=[30, 45, 10])
+
+    # Sheet 6: Communication Domains
+    from zrt.training.topology import comm_domain_report
+
+    ws6 = wb.create_sheet("Comm Domains")
+    comm_kinds = ("EP", "PP", "DP", "TP", "CP")
+    comm = comm_domain_report(system, strategy, kinds=comm_kinds)
+    comm_rows = [
+        ["Metric", *comm_kinds],
+        ["Group Size", *[comm[k]["group_size"] for k in comm_kinds]],
+        ["Tier", *[comm[k]["tier"] for k in comm_kinds]],
+        ["Tier Index", *[comm[k]["tier_idx"] for k in comm_kinds]],
+        ["Tier Name", *[comm[k]["tier_name"] for k in comm_kinds]],
+        ["Rank Sample", *[comm[k]["rank_sample"] for k in comm_kinds]],
+    ]
+    _write_sheet(ws6, comm_rows, col_widths=[18, 28, 28, 28, 28, 28])
 
     wb.save(str(output_path))
     return output_path

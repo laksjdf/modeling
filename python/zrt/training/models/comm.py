@@ -1,17 +1,38 @@
 """Alpha-beta communication model.
 
 Per-collective cost using topology-aware latency and bandwidth.
+
+The model has three layers, in order of generality:
+
+1. :func:`collective_time` — flat α-β cost for one collective on ONE
+   link (the leaf primitive; topology-class determines latency steps
+   and bandwidth-derate).
+
+2. :func:`collective_time_hierarchical` — legacy 2-tier decomposition
+   (intra/inter) used when only group SIZE is known. Preserved
+   bit-for-bit so existing anchors stay green.
+
+3. :func:`collective_time_multi_tier` — N-tier hierarchical
+   decomposition over an EXPLICIT rank set. Used when the caller
+   provides a :class:`ParallelGroups` (built by
+   ``zrt.training.topology.build_process_groups``). The collective
+   decomposes innermost → outermost across each tier the group spans.
 """
 
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
 
-from zrt.hardware.spec import LinkSpec
+from zrt.hardware.spec import LinkSpec, TopologyTier
 from zrt.training.ir.training_graph import Collective, Graph
 from zrt.training.spec.model import ModelSpec
 from zrt.training.spec.strategy import Strategy
 from zrt.training.spec.system import SystemSpec
+
+if TYPE_CHECKING:
+    from zrt.training.topology.comm_domain import CommDomain
+    from zrt.training.topology.process_groups import ParallelGroups
 
 
 def collective_time(c: Collective, group_size: int, link: LinkSpec) -> float:
@@ -22,21 +43,24 @@ def collective_time(c: Collective, group_size: int, link: LinkSpec) -> float:
       S = total post-collective bytes per rank (AG output, RS input)
       Bandwidth term for AG/RS = S × (N-1)/N × beta   (bus-bw form)
 
-    Topology-aware algorithm selection:
-      full_connectivity ("all_to_all"/"nvswitch"/"full_mesh"): single-step
+    Topology-class latency-step selection (``link.topology_class``):
+      switched_full ("all_to_all"/"nvswitch"/"full_mesh"): single-step
         AG/RS:  α + S·(N-1)/N · β
         AR:     2α + 2·S·(N-1)/N · β
-        A2A:    α + S·(N-1)/N · β
-      ring/fat_tree (default):
+      switched_tree ("fat_tree"/"clos"): recursive-doubling / tree
+        AG/RS:  ⌈log2 N⌉·α + S·(N-1)/N · β
+        AR:     2·⌈log2 N⌉·α + 2·S·(N-1)/N · β
+      ring/torus/unknown (default):
         AG/RS:  (N-1)·α + S·(N-1)/N · β
         AR:     2(N-1)·α + 2·S·(N-1)/N · β
-        A2A (N>16, Bruck): ⌈log2 N⌉·α + S·(N-1)/N · β
-        A2A (N≤16, pairwise): (N-1)·α + S·(N-1)/N · β
+      A2A: switched_full → α ; else Bruck (N>16, ⌈log2 N⌉) / pairwise (N-1).
 
-    P2P: rounds × (α + S·β).
+    β uses ``link.effective_bw_bps(N)`` — peak × kb_efficiency, plus the
+    non-clos switched-fabric over-subscription derate once N exceeds the
+    non-blocking radix. P2P: rounds × (α + S·β).
     """
     alpha = link.latency_us * 1e-6
-    bw_bytes = link.bandwidth_gbps * 1e9 / 8
+    bw_bytes = link.effective_bw_bps(group_size)
     beta = 1.0 / bw_bytes if bw_bytes > 0 else float("inf")
 
     N = group_size
@@ -46,19 +70,24 @@ def collective_time(c: Collective, group_size: int, link: LinkSpec) -> float:
     if N <= 1 or S <= 0:
         return 0.0
 
-    full_connectivity = link.topology in ("all_to_all", "nvswitch", "full_mesh")
+    cls = link.topology_class
+    if cls == "switched_full":
+        steps = 1
+    elif cls in ("switched_tree", "clos"):
+        # clos: non-blocking switched → tree latency, full bandwidth.
+        steps = max(1, math.ceil(math.log2(N)))
+    else:  # ring / torus / unknown
+        steps = N - 1
     bw_term = S * (N - 1) / N * beta  # NCCL bus-bw factor
 
     if c.kind in ("AG", "RS"):
-        latency = alpha if full_connectivity else (N - 1) * alpha
-        return latency + bw_term
+        return steps * alpha + bw_term
 
     if c.kind == "AR":
-        latency = 2 * alpha if full_connectivity else 2 * (N - 1) * alpha
-        return latency + 2 * bw_term
+        return 2 * steps * alpha + 2 * bw_term
 
     if c.kind == "A2A":
-        if full_connectivity:
+        if cls == "switched_full":
             return alpha + bw_term
         # NCCL/HCCL use Bruck (log2 rounds) above ~16 ranks; below that,
         # pairwise-exchange is competitive.
@@ -118,6 +147,125 @@ def collective_time_hierarchical(
     )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# N-tier multi-level α-β decomposition (for explicit rank sets)
+# ─────────────────────────────────────────────────────────────────────
+
+def _tier_breakdown(
+    ranks: list[int], tiers: list[TopologyTier],
+) -> list[tuple[int, LinkSpec]]:
+    """Decompose a group's ranks into a per-tier branching schedule.
+
+    Returns ``[(d_0, link_0), (d_1, link_1), ...]`` innermost → outermost,
+    where ``d_i`` is the fanout the collective handles at tier ``i`` and
+    ``link_i`` is that tier's interconnect link. The product of all
+    ``d_i`` (skipping the suppressed ``d_i == 1`` steps) equals the
+    group size ``N``.
+
+    Algorithm: at each tier ``i`` with per-instance domain
+    ``D_i = link.num_devices``, count how many tier-``i`` instances
+    the group occupies (= ``|{r // D_i : r ∈ ranks}|``). The branching
+    factor at tier ``i`` is ``inst_{i-1} / inst_i`` — i.e. how many
+    tier-``i-1`` islands fit into one tier-``i`` island under the
+    current group. A tier with ``D_i == 0`` is unbounded and folds
+    "everything else" into one instance.
+
+    For a 2-tier system with ``ranks = range(N)`` and ``N % D == 0``,
+    this yields ``[(D, intra), (N/D, inter)]`` — matching the legacy
+    :func:`collective_time_hierarchical` decomposition bit-for-bit.
+    """
+    if not ranks or not tiers:
+        return []
+
+    N = len(ranks)
+    # Per-tier instance counts. The outermost tier is by convention
+    # cluster-spanning (one global instance); we treat its
+    # ``num_devices == 0`` *or* unset (default ``1`` in LinkSpec when the
+    # legacy 2-tier ``inter_node`` is built without an explicit
+    # num_devices) as "unbounded → one instance covers everything".
+    inst_counts: list[int] = []
+    last_idx = len(tiers) - 1
+    for i, tier in enumerate(tiers):
+        D = tier.link.num_devices
+        is_outermost = i == last_idx
+        if D == 0 or (is_outermost and D <= 1):
+            inst_counts.append(1)  # unbounded → one instance covers everything
+        else:
+            inst_counts.append(len({r // D for r in ranks}))
+
+    breakdown: list[tuple[int, LinkSpec]] = []
+    prev_inst = N
+    for tier, inst in zip(tiers, inst_counts):
+        if inst <= 0:
+            continue
+        d_i = prev_inst // inst if inst > 0 else 1
+        if d_i > 1:
+            breakdown.append((d_i, tier.link))
+        prev_inst = inst
+    return breakdown
+
+
+def collective_time_multi_tier(
+    c: Collective,
+    ranks: list[int],
+    system: SystemSpec,
+) -> float:
+    """N-tier α-β cost for AG/RS/AR/P2P/A2A over an explicit rank set.
+
+    AG/RS decomposes hierarchically across each tier the group spans
+    (Megatron-Core / NCCL pattern, generalized to N ≥ 2 tiers): at
+    each stage the per-rank output-byte volume is
+    ``S × (∏_{j≤i} d_j) / N``. AR runs as RS + AG, each hierarchical.
+
+    P2P / A2A pick the *outermost* tier the group spans and run flat —
+    A2A hierarchy is non-trivial and not modeled here. Cost is
+    additive across tier steps; this assumes the simulator wants a
+    sequential decomposition (worst-case for non-overlapping
+    implementations), matching the existing 2-tier formula.
+
+    For a 2-tier system this is bit-for-bit identical to
+    :func:`collective_time_hierarchical` when ``ranks = range(N)``
+    and ``N`` is a multiple of the intra-node domain size — the
+    common case the legacy path was tuned for.
+    """
+    N = len(ranks)
+    S = c.bytes_
+    if N <= 1 or S <= 0:
+        return 0.0
+
+    tiers = system.interconnect.tiers
+    breakdown = _tier_breakdown(ranks, tiers)
+    if not breakdown:
+        # No useful decomposition (group fits a single trivial domain).
+        return collective_time(c, N, system.interconnect.tiers[0].link)
+
+    # P2P / A2A — pick the outermost spanned tier, run flat.
+    if c.kind not in ("AG", "RS", "AR"):
+        outermost_link = breakdown[-1][1]
+        return collective_time(c, N, outermost_link)
+
+    if c.kind == "AR":
+        rs_c = Collective(name=c.name + "_rs", kind="RS", group=c.group, bytes_=S)
+        ag_c = Collective(name=c.name + "_ag", kind="AG", group=c.group, bytes_=S)
+        return (
+            collective_time_multi_tier(rs_c, ranks, system)
+            + collective_time_multi_tier(ag_c, ranks, system)
+        )
+
+    # AG / RS — hierarchical decomposition.
+    total = 0.0
+    prod_inner = 1
+    for d_i, link_i in breakdown:
+        prod_inner *= d_i
+        out_bytes = S * prod_inner // N if N > 0 else 0
+        sub_c = Collective(
+            name=f"{c.name}_t{prod_inner}", kind=c.kind, group=c.group,
+            bytes_=out_bytes,
+        )
+        total += collective_time(sub_c, d_i, link_i)
+    return total
+
+
 def tier_for_group(
     group: str, group_size: int, system: SystemSpec,
 ) -> LinkSpec:
@@ -139,15 +287,26 @@ def tier_for_group(
 
 def total_comm_time(
     graph: Graph, model: ModelSpec, system: SystemSpec, strategy: Strategy,
+    *,
+    domain: "CommDomain | None" = None,
 ) -> dict[str, float]:
-    """Return per-collective time in seconds."""
+    """Return per-collective time in seconds.
+
+    Pricing routes through :class:`CommDomain` so the dispatch (N-tier
+    explicit-ranks vs legacy 2-tier size-only) lives in ONE place. The
+    optional ``domain`` parameter lets the caller share a pre-built
+    resolver with the rest of the estimate path
+    (:func:`pipeline_step_time` does this so ParallelGroups is built
+    once per estimate() call, not per function).
+    """
+    from zrt.training.topology.comm_domain import CommDomain
+    if domain is None:
+        domain = CommDomain(system=system, strategy=strategy)
     result: dict[str, float] = {}
+    groups = domain.groups
 
     for c in graph.collectives:
-        group_size = _group_size_for(c.group, strategy)
-        link = tier_for_group(c.group, group_size, system)
-        t = collective_time(c, group_size, link)
-        result[c.name] = t
+        result[c.name] = domain.time(c)
 
     # DP gradient reduction (at step end)
     if strategy.dp > 1:
@@ -166,29 +325,81 @@ def total_comm_time(
             name="dp_grad_reduce", kind="AR" if strategy.zero_stage == 0 else "RS",
             group="DP", bytes_=grad_bytes, inserted_after="optimizer_step",
         )
-        result[dp_c.name] = collective_time_hierarchical(dp_c, strategy.dp, system)
+        result[dp_c.name] = domain.time(dp_c)
 
     # Muon optimizer ZeRO-1 AllGather/ReduceScatter
     if strategy.optimizer.value == "muon" and strategy.dp > 1 and strategy.zero_stage >= 1:
-        muon_comm = optimizer_comm_time(model, system, strategy)
+        muon_comm = optimizer_comm_time(model, system, strategy, domain=domain)
         result["muon_ag"] = muon_comm.get("muon_ag", 0.0)
         result["muon_rs"] = muon_comm.get("muon_rs", 0.0)
 
     # PP P2P activation transfer between adjacent stages
     if strategy.pp > 1:
-        result["pp_p2p"] = pp_p2p_time(model, system, strategy)
+        result["pp_p2p"] = pp_p2p_time(model, system, strategy, domain=domain)
 
     return result
 
 
+def muon_comm_times_from_params(
+    P_muon_non_routed: int,
+    P_muon_routed: int,
+    dp: int,
+    expert_dp: int,
+    rotation: bool,
+    system,
+) -> dict[str, float]:
+    """Primitive-typed Muon AG/RS collective times (seconds).
+
+    Args:
+        P_muon_non_routed: Muon-eligible non-routed params on this rank (FP32 count)
+        P_muon_routed:     Muon-eligible routed expert params on this rank
+        dp:                Full DP group size (for non-routed params)
+        expert_dp:         Expert-DP group size = max(1, dp // ep)
+        rotation:          Whether Moonshot RS is active
+        system:            Any object with .interconnect.intra_node / .inter_node
+
+    Returns:
+        {"muon_ag": ag_seconds, "muon_rs": rs_seconds}
+    """
+    param_bytes = 4  # FP32 master copy
+
+    def _ag_rs(bytes_: int, group_size: int) -> tuple[float, float]:
+        if group_size <= 1 or bytes_ <= 0:
+            return 0.0, 0.0
+        ag = collective_time_hierarchical(
+            Collective(name="muon_ag", kind="AG", group="DP",
+                       bytes_=bytes_, inserted_after="backward_end"),
+            group_size, system,
+        )
+        rs = collective_time_hierarchical(
+            Collective(name="muon_rs", kind="RS", group="DP",
+                       bytes_=bytes_, inserted_after="optimizer_step"),
+            group_size, system,
+        ) if rotation else 0.0
+        return ag, rs
+
+    ag_dense, rs_dense = _ag_rs(P_muon_non_routed * param_bytes, dp)
+    ag_routed, rs_routed = _ag_rs(P_muon_routed * param_bytes, expert_dp)
+    return {"muon_ag": ag_dense + ag_routed, "muon_rs": rs_dense + rs_routed}
+
+
 def optimizer_comm_time(
     model: ModelSpec, system: SystemSpec, strategy: Strategy,
+    *,
+    domain: "CommDomain | None" = None,
+    groups: "ParallelGroups | None" = None,
 ) -> dict[str, float]:
     """Return Muon optimizer communication time in seconds.
 
-    Muon with ZeRO-1 requires:
-      - AllGather before optimizer step to gather full Muon parameters
-      - ReduceScatter after optimizer step to distribute updated gradients
+    Whenever ZeRO stage ≥ 1 (1, 2, or FSDP/ZeRO-3), the FP32 master copy
+    is sharded across DP, so Muon-rotation must:
+      - AllGather full FP32 master params before the NS step
+      - ReduceScatter updated params after the NS step (when rotation=True)
+
+    The byte count and group sizes are identical across ZeRO 1/2/3 — they
+    all shard the optimizer state by ``strategy.dp``. ZeRO-3 additionally
+    shards forward-pass weights, but that AG is per-layer in fwd/bwd and
+    is accounted for as graph-level collectives, not here.
 
     Sharding groups (matches Megatron-Core distributed optimizer):
       - Non-routed params (dense + shared experts + embed/lm_head):
@@ -197,13 +408,7 @@ def optimizer_comm_time(
         ``max(1, dp // ep)``. When ``dp == ep`` the expert-DP group has a
         single rank and routed AG/RS is free.
 
-    Args:
-        model: ModelSpec with hidden dimension and param count
-        system: SystemSpec with network tiers
-        strategy: Strategy with optimizer config and muon_config
-
-    Returns:
-        Dict with "muon_ag" and "muon_rs" time in seconds
+    Returns: dict with "muon_ag" and "muon_rs" time in seconds.
     """
     if strategy.optimizer.value != "muon" or strategy.dp <= 1 or strategy.zero_stage < 1:
         return {"muon_ag": 0.0, "muon_rs": 0.0}
@@ -215,7 +420,6 @@ def optimizer_comm_time(
         else 0.85
     )
     rotation = muon_config.rotation if muon_config else True
-    param_bytes = 4  # FP32 master copy
 
     P_total = _params_on_rank_for_dp(model, strategy)
 
@@ -228,69 +432,83 @@ def optimizer_comm_time(
 
     P_muon_non_routed = int(P_non_routed * f_muon)
     P_muon_routed = int(P_routed * f_muon)
+    param_bytes = 4  # FP32 master copy
 
-    def _ag_rs(bytes_, group_size: int) -> tuple[float, float]:
+    # Build/reuse the resolver. Callers from pipeline_step_time pass
+    # `domain=` already built so groups are shared; legacy callers
+    # (groups=…) get a temp resolver to keep back-compat.
+    if domain is None:
+        from zrt.training.topology.comm_domain import CommDomain
+        domain = CommDomain(system=system, strategy=strategy)
+
+    def _ag_rs(bytes_: int, group_size: int, group_kind: str) -> tuple[float, float]:
+        """Cost the AG (+optional RS) over `group_kind` via the resolver."""
         if group_size <= 1 or bytes_ <= 0:
             return 0.0, 0.0
-        ag = collective_time_hierarchical(
-            Collective(name="muon_ag", kind="AG", group="DP",
-                       bytes_=bytes_, inserted_after="backward_end"),
-            group_size, system,
+        ag_c = Collective(
+            name="muon_ag", kind="AG", group=group_kind,
+            bytes_=bytes_, inserted_after="backward_end",
         )
-        if rotation:
-            rs = collective_time_hierarchical(
-                Collective(name="muon_rs", kind="RS", group="DP",
-                           bytes_=bytes_, inserted_after="optimizer_step"),
-                group_size, system,
-            )
-        else:
-            rs = 0.0
+        rs_c = Collective(
+            name="muon_rs", kind="RS", group=group_kind,
+            bytes_=bytes_, inserted_after="optimizer_step",
+        )
+        ag = domain.time(ag_c)
+        rs = domain.time(rs_c) if rotation else 0.0
         return ag, rs
 
-    ag_dense, rs_dense = _ag_rs(P_muon_non_routed * param_bytes, strategy.dp)
+    # Non-routed params share the full DP group; routed-expert params
+    # are sharded across the **expert-DP** group (Megatron-Core
+    # distributed optimizer convention) — size dp/ep, ranks orthogonal
+    # to EP within a DP block. CommDomain knows both groups so the
+    # tier resolution and α-β decomposition are correct for each.
     expert_dp = max(1, strategy.dp // strategy.ep) if strategy.ep > 1 else strategy.dp
-    ag_routed, rs_routed = _ag_rs(P_muon_routed * param_bytes, expert_dp)
+    ag_dense, rs_dense = _ag_rs(P_muon_non_routed * param_bytes, strategy.dp, "DP")
+    ag_routed, rs_routed = _ag_rs(P_muon_routed * param_bytes, expert_dp, "EXPERT_DP")
 
-    return {
-        "muon_ag": ag_dense + ag_routed,
-        "muon_rs": rs_dense + rs_routed,
-    }
+    return {"muon_ag": ag_dense + ag_routed, "muon_rs": rs_dense + rs_routed}
 
 
-def pp_p2p_time(model: ModelSpec, system: SystemSpec, strategy: Strategy) -> float:
+def pp_p2p_time(
+    model: ModelSpec, system: SystemSpec, strategy: Strategy,
+    *,
+    domain: "CommDomain | None" = None,
+    groups: "ParallelGroups | None" = None,
+) -> float:
     """One-way P2P activation transfer time between adjacent pipeline stages (seconds).
 
     Activation shape per PP boundary: (micro_batch, seq_len/cp, hidden/tp).
     CP shards the sequence, so each rank only transfers its local token slice.
 
-    Tier selection: in Megatron layout [DP, PP, CP, TP] (outer→inner), adjacent PP
-    stages are separated by cp*tp GPUs. They are intra-node only when both stages'
-    full CP×TP groups fit within one node: cp*tp*2 <= gpus_per_node.
+    Tier selection runs through :meth:`CommDomain.pp_p2p_link`:
+    - For 3+ tier systems the PP group's primary tier is the inter-stage link.
+    - For 2-tier systems the legacy ``tp*cp*2 ≤ intra_domain`` heuristic applies.
 
-    Returns the per-microbatch P2P overhead added to each stage's fwd and bwd time.
+    ``groups`` kept for back-compat but ignored when ``domain`` is set.
     """
     if strategy.pp <= 1:
         return 0.0
 
     cp = max(strategy.cp, 1)
+    # v2: PP transfers the residual stream between adjacent stages. Use
+    # ``effective_residual_dtype()`` so a future "FP8 residual" experiment
+    # can swap this without touching the call sites; today it resolves to
+    # ``act_dtype`` (BF16) and the numerical result is unchanged.
+    residual_bytes = model.effective_residual_dtype().bytes
     act_bytes = (
         strategy.micro_batch * (model.seq_len // cp) * model.hidden
-        * model.act_dtype.bytes // max(strategy.tp, 1)
+        * residual_bytes // max(strategy.tp, 1)
     )
 
-    # Adjacent PP stages span cp*tp GPUs; intra-node only if both fit in one node.
-    intra_domain = system.interconnect.intra_node.num_devices
-    if intra_domain <= 0:
-        intra_domain = system.gpus_per_node
-    if strategy.tp * cp * 2 <= intra_domain:
-        link = system.interconnect.intra_node
-    else:
-        link = system.interconnect.inter_node
+    if domain is None:
+        from zrt.training.topology.comm_domain import CommDomain
+        domain = CommDomain(system=system, strategy=strategy)
+    link = domain.pp_p2p_link()
 
-    if link.bandwidth_gbps <= 0:
+    bw_bytes = link.effective_bw_bps(2)  # adjacent-stage point-to-point
+    if bw_bytes <= 0:
         return 0.0
 
-    bw_bytes = link.bandwidth_gbps * 1e9 / 8
     latency = link.latency_us * 1e-6
     return latency + act_bytes / bw_bytes
 

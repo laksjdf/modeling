@@ -90,7 +90,7 @@ class TrainingReport:
     # Step time breakdown (milliseconds)
     # Invariants:
     #   step_time_ms     = pipeline_time_ms + optimizer_time_ms + optimizer_comm_ms
-    #   pipeline_time_ms = compute_time_ms + exposed_comm_ms
+    #   pipeline_time_ms = compute_time_ms + exposed_comm_ms + bubble_time_ms
     #   compute_time_ms  = fwd_compute_ms + bwd_compute_ms + recompute_time_ms
     #   bubble_ms        = warmup_ms + cooldown_ms   (absolute pipeline idle)
     #   exposed_comm_ms  = Σ *_exposed_ms fields
@@ -119,7 +119,7 @@ class TrainingReport:
     steady_per_mb_ms: float = 0.0
 
     # Compute / comm breakdown (milliseconds)
-    compute_time_ms: float = 0.0        # Pure compute on critical path
+    compute_time_ms: float = 0.0        # Useful compute on critical path, excluding bubble
     fwd_compute_ms: float = 0.0         # Forward compute only (excludes all comm)
     bwd_compute_ms: float = 0.0         # Backward compute (excludes comm AND recompute)
     recompute_time_ms: float = 0.0      # Activation-recompute fwd redo on critical path.
@@ -165,6 +165,12 @@ class TrainingReport:
     tokens_per_sec: float = 0.0      # Training throughput
     effective_params: int = 0        # P_eff used for MoE-aware accounting
     flops_per_token: float = 0.0     # Actual FLOPs consumed per token
+
+    # v2 mixed-quant HBM traffic diagnostics (per step, in GiB)
+    weight_hbm_gb: float = 0.0
+    act_hbm_gb: float = 0.0
+    grad_hbm_gb: float = 0.0
+    cast_hbm_gb: float = 0.0
 
     # Fused-operator summary (graph-native runs only).
     # Maps fused op_type → {count, sample_names, total_flops_pct, dtype, module_class}.

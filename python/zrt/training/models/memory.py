@@ -276,25 +276,40 @@ def _shared_expert_params(model: ModelSpec) -> int:
     return n_moe * n_shared * per_expert
 
 
+def routed_expert_params(
+    n_moe: int,
+    hidden: int,
+    moe_ffn: int,
+    num_experts: int,
+    tp: int,
+    ep: int,
+    pp: int,
+    n_layers: int,
+) -> int:
+    """Primitive-typed routed expert param count on one rank after TP+EP+PP sharding."""
+    if num_experts <= 0 or moe_ffn <= 0 or n_moe <= 0:
+        return 0
+    per_expert = 2 * hidden * moe_ffn
+    total = n_moe * num_experts * per_expert
+    if tp > 1:
+        total //= tp
+    if ep > 1:
+        total //= ep
+    if pp > 1 and n_layers > 0:
+        total = int(total * (n_layers / pp) / n_layers)
+    return total
+
+
 def _routed_expert_params_on_rank(model: ModelSpec, strategy: Strategy) -> int:
     """Routed expert parameters on one rank after TP + EP + PP sharding."""
     if model.num_experts <= 0:
         return 0
     n_moe = sum(1 for lk in model.layers if lk.value == "moe")
-    per_expert = 2 * model.hidden * model.moe_ffn
-    routed_total = n_moe * model.num_experts * per_expert
-
-    if strategy.tp > 1:
-        routed_total //= strategy.tp
-
-    if strategy.ep > 1:
-        routed_total //= strategy.ep
-
-    if strategy.pp > 1:
-        n_layers = len(model.layers)
-        routed_total = int(routed_total * (n_layers / strategy.pp) / n_layers)
-
-    return routed_total
+    return routed_expert_params(
+        n_moe=n_moe, hidden=model.hidden, moe_ffn=model.moe_ffn,
+        num_experts=model.num_experts, tp=strategy.tp, ep=strategy.ep,
+        pp=strategy.pp, n_layers=len(model.layers),
+    )
 
 
 # Also need to store n_shared_experts on ModelSpec for the config loader

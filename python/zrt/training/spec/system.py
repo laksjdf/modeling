@@ -30,6 +30,11 @@ class GPU:
     # overlap (e.g. Ascend HCCS). Mirrors HardwareSpec.compute.ep_overlap_waves.
     ep_overlap_waves: int = 0
 
+    # Explicit utilization overrides (None = use achieved_* heuristic curve).
+    # Mirror HardwareSpec.compute.compute_efficiency / memory.mem_bw_efficiency.
+    compute_efficiency: float | None = None
+    mem_bw_efficiency: float | None = None
+
 
 @dataclass
 class SystemSpec:
@@ -38,10 +43,31 @@ class SystemSpec:
     interconnect: InterconnectSpec
     nodes: int
     gpus_per_node: int
+    world_size_override: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.world_size_override is not None:
+            if self.world_size_override <= 0:
+                raise ValueError("world_size_override must be positive")
+            if self.world_size_override > self.allocated_gpus:
+                raise ValueError(
+                    "world_size_override cannot exceed allocated GPUs "
+                    f"({self.world_size_override} > {self.allocated_gpus})"
+                )
+
+    @property
+    def allocated_gpus(self) -> int:
+        return self.nodes * self.gpus_per_node
 
     @property
     def world_size(self) -> int:
-        return self.nodes * self.gpus_per_node
+        if self.world_size_override is not None:
+            return self.world_size_override
+        return self.allocated_gpus
+
+    @property
+    def idle_gpus(self) -> int:
+        return self.allocated_gpus - self.world_size
 
     def intra_tier(self) -> LinkSpec:
         return self.interconnect.intra_node

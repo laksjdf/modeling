@@ -126,9 +126,14 @@ def test_zero_bubble_uses_weight_grad_to_reduce_bubble():
     zb = ZeroBubbleComposer().compose(st, M, 4, 0.0, s)
     dp = DualPipeComposer().compose(st, M, 4, 0.0, _make_strategy(pp=4))
 
-    t_stage = 0.03
+    t_fwd = 0.01
+    t_bwd_dx = 0.01
     t_w = 0.01
-    expected = M * t_stage + (4 - 1) * max(t_stage - 2 * t_w, 0.0)
+    t_stage = 0.03
+    ZB_FLOOR = 2e-6
+    warmup = (4 - 1) * max(t_fwd - t_w, ZB_FLOOR)
+    cooldown = (4 - 1) * max(t_bwd_dx - t_w, ZB_FLOOR)
+    expected = M * t_stage + warmup + cooldown
     assert zb.step_time == pytest.approx(expected, rel=1e-9)
     f1b = OneF1BComposer().compose(st, M, 4, 0.0, _make_strategy(pp=4))
     assert zb.bubble_fraction < f1b.bubble_fraction

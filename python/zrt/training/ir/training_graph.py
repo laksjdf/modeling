@@ -33,6 +33,9 @@ class Op:
                 # | "softmax" | "ln" | "rope" | "swiglu" | "router" | "dispatch"
                 # | "combine" | "embed" | "lm_head" | "add"
                 # | "compressor_pool" | "indexer_topk" | "hash_route"
+                # | "cast" (v2 mixed-quant: inserted by ir/cast_pass.py at
+                #           dtype boundaries; src_dtype/dst_dtype/fused/
+                #           num_elements live in op.meta)
     inputs: list[Tensor] = field(default_factory=list)
     outputs: list[Tensor] = field(default_factory=list)
     meta: dict[str, Any] = field(default_factory=dict)

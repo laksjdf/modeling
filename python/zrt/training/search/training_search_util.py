@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import itertools
 import logging
+import math
 import multiprocessing
 import os
 import time
@@ -35,13 +36,160 @@ from zrt.training.spec.strategy import (
     TPOverlap,
 )
 from zrt.training.spec.system import GPU, SystemSpec
+from zrt.training.topology import comm_domain_report, format_comm_domain_entry
 
 logger = logging.getLogger(__name__)
 
 _WORKER_MODEL_CACHE: Dict[Tuple[str, Optional[str]], ModelSpec] = {}
-_WORKER_HW_CACHE: Dict[str, SystemSpec] = {}
+_WORKER_HW_CACHE: Dict[Tuple[str, int], SystemSpec] = {}
 
 _MODELS_DIR = Path(__file__).parent.parent / "configs" / "models"
+_DEFAULT_POD_PACKING_AXES = ("tp", "cp")
+_COMM_DOMAIN_AXES = ("ep", "pp", "dp", "tp", "cp")
+
+
+def _ceil_nodes_for_world_size(world_size: int, gpus_per_node: int) -> int:
+    if gpus_per_node <= 0:
+        raise ValueError("gpus_per_node must be positive")
+    return max(1, math.ceil(world_size / gpus_per_node))
+
+
+def _inferred_gpus_per_node(hw: Any) -> int:
+    """Search allocation unit inferred from the innermost hardware tier."""
+    try:
+        n = int(hw.interconnect.tiers[0].link.num_devices)
+    except (AttributeError, IndexError, TypeError, ValueError):
+        n = 0
+    return n if n > 0 else 8
+
+
+def _reject_gpus_per_node_config(config_or_grid: Dict[str, Any]) -> None:
+    if "gpus_per_node" in config_or_grid:
+        raise ValueError(
+            "gpus_per_node has been removed from search configs; express "
+            "hardware topology via the hardware YAML interconnect.tiers"
+        )
+
+
+def _warn_if_partial_allocation(system: SystemSpec) -> None:
+    if system.idle_gpus > 0:
+        logger.warning(
+            "Search allocation has idle GPUs: world_size=%s allocated_gpus=%s "
+            "idle_gpus=%s nodes=%s gpus_per_node=%s",
+            system.world_size,
+            system.allocated_gpus,
+            system.idle_gpus,
+            system.nodes,
+            system.gpus_per_node,
+        )
+
+
+def _system_from_hw(
+    hw: Any,
+    *,
+    nodes: int,
+    gpus_per_node: int,
+    world_size_override: int | None,
+    host_mem_gb: float,
+    warn_partial: bool = True,
+) -> SystemSpec:
+    system = SystemSpec(
+        gpu=GPU(
+            name=hw.name,
+            flops_bf16=hw.compute.bf16_tflops,
+            flops_fp8=hw.compute.fp8_tops or hw.compute.bf16_tflops * 2,
+            flops_fp4=hw.compute.fp4_tops,
+            hbm_gb=hw.memory.capacity_gb,
+            hbm_bw_gbps=hw.memory.hbm_bandwidth_gbps,
+            cube_tflops=hw.compute.cube_bf16_tflops,
+            vector_tflops=hw.compute.vector_bf16_tflops,
+            overlap_ratio=dict(hw.compute.overlap_ratio),
+            compute_efficiency=hw.compute.compute_efficiency,
+            mem_bw_efficiency=hw.memory.mem_bw_efficiency,
+        ),
+        interconnect=hw.interconnect,
+        nodes=nodes,
+        gpus_per_node=gpus_per_node,
+        world_size_override=world_size_override,
+        host_mem_gb=host_mem_gb,
+    )
+    if warn_partial:
+        _warn_if_partial_allocation(system)
+    return system
+
+
+def _normalize_pod_packing_axes(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return _DEFAULT_POD_PACKING_AXES
+    if isinstance(value, str):
+        parts = [p.strip().lower() for p in value.split(",")]
+    else:
+        parts = [str(p).strip().lower() for p in value]
+    axes = tuple(p for p in parts if p)
+    allowed = {"tp", "cp", "pp", "dp"}
+    invalid = [axis for axis in axes if axis not in allowed]
+    if invalid:
+        raise ValueError(
+            f"Unsupported pod_packing_axes {invalid}; expected subset of {sorted(allowed)}"
+        )
+    return axes or _DEFAULT_POD_PACKING_AXES
+
+
+def _pod_packing_group_size(
+    axes: tuple[str, ...],
+    *,
+    tp: int,
+    cp: int,
+    pp: int,
+    dp: int,
+) -> int:
+    values = {"tp": tp, "cp": cp, "pp": pp, "dp": dp}
+    group_size = 1
+    for axis in axes:
+        group_size *= values[axis]
+    return group_size
+
+
+def _passes_pod_packing(
+    *,
+    tp: int,
+    cp: int,
+    pp: int,
+    dp: int,
+    target_ws: int,
+    system: SystemSpec | None,
+    other_config: Dict[str, Any] | None,
+) -> bool:
+    cfg = other_config or {}
+    if system is None:
+        raise ValueError("_passes_pod_packing requires system for tier-aware checks")
+    if target_ws % system.gpus_per_node == 0:
+        return True
+    axes = _normalize_pod_packing_axes(cfg.get("pod_packing_axes"))
+    if _pod_packing_group_size(axes, tp=tp, cp=cp, pp=pp, dp=dp) <= 1:
+        return True
+
+    try:
+        from zrt.training.topology.process_groups import build_process_groups
+
+        # EP shares physical ranks, so tier assignment is independent of EP.
+        strategy = Strategy(tp=tp, cp=cp, pp=pp, dp=dp, ep=1)
+        groups = build_process_groups(target_ws, strategy, system)
+    except ValueError:
+        return False
+
+    outermost = len(system.interconnect.tiers) - 1
+    degrees = {"tp": tp, "cp": cp, "pp": pp, "dp": dp}
+    for axis in axes:
+        if degrees[axis] <= 1:
+            continue
+        assignment = groups.tier.get(axis.upper())
+        if assignment is None:
+            return False
+        tier = system.interconnect.tiers[assignment.primary_tier]
+        if assignment.primary_tier >= outermost and tier.link.num_devices == 0:
+            return False
+    return True
 
 
 def _load_model_spec(model_name: str, quant_preset: Optional[str] = None) -> ModelSpec:
@@ -59,32 +207,26 @@ def _load_model_spec(model_name: str, quant_preset: Optional[str] = None) -> Mod
     return _parse_model(d)
 
 
-def _make_system_from_config(config: Dict) -> SystemSpec:
+def _make_system_from_config(config: Dict, *, warn_partial: bool = True) -> SystemSpec:
+    _reject_gpus_per_node_config(config)
     hw_name = config.get("hw", "nvidia_h100_sxm")
     hw = load_hw(hw_name)
 
-    gpus_per_node = config.get("gpus_per_node", 8)
+    gpus_per_node = _inferred_gpus_per_node(hw)
+    world_size_override = None
     if "world_size" in config:
-        nodes = config["world_size"] // gpus_per_node
+        world_size_override = int(config["world_size"])
+        nodes = _ceil_nodes_for_world_size(world_size_override, gpus_per_node)
     else:
         nodes = config.get("nodes", 1)
 
-    return SystemSpec(
-        gpu=GPU(
-            name=hw.name,
-            flops_bf16=hw.compute.bf16_tflops,
-            flops_fp8=hw.compute.fp8_tops or hw.compute.bf16_tflops * 2,
-            flops_fp4=hw.compute.fp4_tops,
-            hbm_gb=hw.memory.capacity_gb,
-            hbm_bw_gbps=hw.memory.hbm_bandwidth_gbps,
-            cube_tflops=hw.compute.cube_bf16_tflops,
-            vector_tflops=hw.compute.vector_bf16_tflops,
-            overlap_ratio=dict(hw.compute.overlap_ratio),
-        ),
-        interconnect=hw.interconnect,
+    return _system_from_hw(
+        hw,
         nodes=nodes,
         gpus_per_node=gpus_per_node,
+        world_size_override=world_size_override,
         host_mem_gb=config.get("host_mem_gb", 256.0),
+        warn_partial=warn_partial,
     )
 
 
@@ -129,6 +271,29 @@ def _make_strategy_from_config(config: Dict) -> Strategy:
         dp_overlap_in_bubble=config.get("dp_overlap_in_bubble", True),
         dp_grad_buckets=config.get("dp_grad_buckets", 25),
     )
+
+
+def _empty_comm_domain_columns() -> dict[str, str]:
+    return {f"{axis}_comm_domain": "" for axis in _COMM_DOMAIN_AXES}
+
+
+def _comm_domain_columns_from_config(config: Dict[str, Any]) -> dict[str, str]:
+    try:
+        system = _make_system_from_config(config, warn_partial=False)
+        strategy = _make_strategy_from_config(config)
+        report = comm_domain_report(
+            system,
+            strategy,
+            kinds=tuple(axis.upper() for axis in _COMM_DOMAIN_AXES),
+        )
+    except Exception as exc:
+        logger.debug("Unable to derive communication-domain columns: %s", exc)
+        return _empty_comm_domain_columns()
+
+    return {
+        f"{axis}_comm_domain": format_comm_domain_entry(report[axis.upper()])
+        for axis in _COMM_DOMAIN_AXES
+    }
 
 
 @dataclass
@@ -188,7 +353,12 @@ class TrainingConfigManager:
             dp_grad_buckets=other_config.get("dp_grad_buckets", 25),
         )
 
-    def _expand_auto_values_optimized(self, grid: Dict[str, List[Any]], world_size: int) -> None:
+    def _expand_auto_values_optimized(
+        self,
+        grid: Dict[str, List[Any]],
+        world_size: int,
+        model: ModelSpec | None = None,
+    ) -> None:
         """
         核心优化：基于已知维度的最小值，动态裁剪并收紧 auto 变量的选择范围。
         避免盲目扩展成全量 world_size 的约数，将 auto 并行搜索空间缩减 90% 以上。
@@ -247,13 +417,19 @@ class TrainingConfigManager:
 
         # 5. EP 特殊处理：EP 独立扩展，不参与 rank 计算
         if auto_ep:
+            if model is None:
+                ep_candidates = optimized_divisors
+            elif model.num_experts > 0:
+                ep_candidates = self._get_divisors(model.num_experts)
+            else:
+                ep_candidates = [1]
+
             vals = grid["ep"]
             if isinstance(vals, list):
                 clean_vals = [v for v in vals if v != "auto"]
-                # EP 可以是任意值，通常基于 num_experts 的约束
-                grid["ep"] = sorted(list(set(clean_vals + optimized_divisors)))
+                grid["ep"] = sorted(list(set(clean_vals + ep_candidates)))
             else:
-                grid["ep"] = optimized_divisors
+                grid["ep"] = ep_candidates
 
     def _enumerate_valid_parallel_configs(
             self, grid: Dict[str, List[Any]], target_ws: int,
@@ -300,6 +476,13 @@ class TrainingConfigManager:
                         if tp * cp * pp * dp != target_ws:
                             continue
 
+                        if not _passes_pod_packing(
+                            tp=tp, cp=cp, pp=pp, dp=dp,
+                            target_ws=target_ws, system=system,
+                            other_config=other_config,
+                        ):
+                            continue
+
                         if global_batch > 0:
                             if global_batch % (micro_batch * dp) != 0:
                                 continue
@@ -328,9 +511,18 @@ class TrainingConfigManager:
 
     def count_total_configs(self) -> int:
         grid = {k: (v if isinstance(v, list) else [v]) for k, v in self.param_grid.items()}
+        _reject_gpus_per_node_config(grid)
         world_sizes = grid.get("world_size", [1])
         target_ws = world_sizes[0]
-        self._expand_auto_values_optimized(grid, target_ws)
+        model_name = grid.get("model", ["unknown"])[0] if grid.get("model") else "unknown"
+        seq_len = grid.get("seq_len", [4096])[0] if grid.get("seq_len") else 4096
+        model_for_auto = None
+        try:
+            model_for_auto = _load_model_spec(model_name)
+            model_for_auto.seq_len = seq_len
+        except Exception:
+            pass
+        self._expand_auto_values_optimized(grid, target_ws, model_for_auto)
 
         parallel_keys = ["tp", "cp", "pp", "ep", "dp"]
         
@@ -341,35 +533,28 @@ class TrainingConfigManager:
         if has_total_token and "seq_len" in other_keys:
             other_keys.remove("seq_len")
 
-        model_name = grid.get("model", ["unknown"])[0] if grid.get("model") else "unknown"
         hw_name = grid.get("hw", ["nvidia_h100_sxm"])[0] if grid.get("hw") else "nvidia_h100_sxm"
-        seq_len = grid.get("seq_len", [4096])[0] if grid.get("seq_len") else 4096
 
+        model = None
         try:
             model = _load_model_spec(model_name)
             model.seq_len = seq_len
+        except Exception:
+            pass
+
+        system = None
+        try:
             hw = load_hw(hw_name)
-            gpus_per_node = grid.get("gpus_per_node", [8])[0] if grid.get("gpus_per_node") else 8
-            nodes = target_ws // gpus_per_node
-            system = SystemSpec(
-                gpu=GPU(
-                    name=hw.name,
-                    flops_bf16=hw.compute.bf16_tflops,
-                    flops_fp8=hw.compute.fp8_tops or hw.compute.bf16_tflops * 2,
-                    flops_fp4=hw.compute.fp4_tops,
-                    hbm_gb=hw.memory.capacity_gb,
-                    hbm_bw_gbps=hw.memory.hbm_bandwidth_gbps,
-                    cube_tflops=hw.compute.cube_bf16_tflops,
-                    vector_tflops=hw.compute.vector_bf16_tflops,
-                    overlap_ratio=dict(hw.compute.overlap_ratio),
-                ),
-                interconnect=hw.interconnect,
+            gpus_per_node = _inferred_gpus_per_node(hw)
+            nodes = _ceil_nodes_for_world_size(target_ws, gpus_per_node)
+            system = _system_from_hw(
+                hw,
                 nodes=nodes,
                 gpus_per_node=gpus_per_node,
+                world_size_override=target_ws,
                 host_mem_gb=grid.get("host_mem_gb", [256.0])[0] if grid.get("host_mem_gb") else 256.0,
             )
         except Exception:
-            model = None
             system = None
 
         other_combinations = 1
@@ -387,12 +572,22 @@ class TrainingConfigManager:
 
     def generate_static_configs_stream(self) -> Generator[Dict[str, Any], None, None]:
         grid = {k: (v if isinstance(v, list) else [v]) for k, v in self.param_grid.items()}
+        _reject_gpus_per_node_config(grid)
         world_sizes = grid.get("world_size", [1])
         if len(world_sizes) > 1:
             raise ValueError("Only single world_size is supported when using 'auto' parallel strategy")
         target_ws = world_sizes[0]
 
-        self._expand_auto_values_optimized(grid, target_ws)
+        model_name = grid.get("model", ["unknown"])[0] if grid.get("model") else "unknown"
+        seq_len = grid.get("seq_len", [4096])[0] if grid.get("seq_len") else 4096
+        model_for_auto = None
+        try:
+            model_for_auto = _load_model_spec(model_name)
+            model_for_auto.seq_len = seq_len
+        except Exception:
+            pass
+
+        self._expand_auto_values_optimized(grid, target_ws, model_for_auto)
 
         parallel_keys = ["tp", "cp", "pp", "ep", "dp"]
         
@@ -403,39 +598,30 @@ class TrainingConfigManager:
         if has_total_token and "seq_len" in other_keys:
             other_keys.remove("seq_len")
 
-        model_name = grid.get("model", ["unknown"])[0] if grid.get("model") else "unknown"
         hw_name = grid.get("hw", ["nvidia_h100_sxm"])[0] if grid.get("hw") else "nvidia_h100_sxm"
-        seq_len = grid.get("seq_len", [4096])[0] if grid.get("seq_len") else 4096
 
         model = None
         system = None
         try:
             model = _load_model_spec(model_name)
             model.seq_len = seq_len
-            hw = load_hw(hw_name)
-            gpus_per_node = grid.get("gpus_per_node", [8])[0] if grid.get("gpus_per_node") else 8
-            nodes = target_ws // gpus_per_node
-            system = SystemSpec(
-                gpu=GPU(
-                    name=hw.name,
-                    flops_bf16=hw.compute.bf16_tflops,
-                    flops_fp8=hw.compute.fp8_tops or hw.compute.bf16_tflops * 2,
-                    flops_fp4=hw.compute.fp4_tops,
-                    hbm_gb=hw.memory.capacity_gb,
-                    hbm_bw_gbps=hw.memory.hbm_bandwidth_gbps,
-                    cube_tflops=hw.compute.cube_bf16_tflops,
-                    vector_tflops=hw.compute.vector_bf16_tflops,
-                    overlap_ratio=dict(hw.compute.overlap_ratio),
-                ),
-                interconnect=hw.interconnect,
-                nodes=nodes,
-                gpus_per_node=gpus_per_node,
-                host_mem_gb=grid.get("host_mem_gb", [256.0])[0] if grid.get("host_mem_gb") else 256.0,
-            )
         except FileNotFoundError:
             pass
         except Exception:
             pass
+        try:
+            hw = load_hw(hw_name)
+            gpus_per_node = _inferred_gpus_per_node(hw)
+            nodes = _ceil_nodes_for_world_size(target_ws, gpus_per_node)
+            system = _system_from_hw(
+                hw,
+                nodes=nodes,
+                gpus_per_node=gpus_per_node,
+                world_size_override=target_ws,
+                host_mem_gb=grid.get("host_mem_gb", [256.0])[0] if grid.get("host_mem_gb") else 256.0,
+            )
+        except Exception:
+            system = None
 
         other_grids = [grid[k] for k in other_keys]
         for other_vals in itertools.product(*other_grids):
@@ -492,13 +678,11 @@ def run_training_task_wrapper(config: Dict) -> Optional[Dict]:
         if seq_len is not None:
             model.seq_len = int(seq_len)
 
-        # System cache must key on world_size / gpus_per_node, not just hw_name,
-        # because nodes is derived from those — otherwise multi-world_size grids
-        # silently reuse the first config's SystemSpec.
+        # System cache must key on world_size as well as hardware; nodes is
+        # derived from world_size and the hardware's innermost tier size.
         sys_key = (
             hw_name,
             int(config.get("world_size", 0)),
-            int(config.get("gpus_per_node", 8)),
         )
         system = _WORKER_HW_CACHE.get(sys_key)
         if system is None:
@@ -541,6 +725,8 @@ def format_results(reports: List[TrainingReport], configs: List[Dict]) -> pd.Dat
         else:
             memory_gb = None
 
+        d.update(_comm_domain_columns_from_config(cfg))
+        d["compute_time_ms"] = round(report.compute_time_ms, 2)
         d["fwd_compute_ms"] = round(report.fwd_compute_ms, 2)
         d["bwd_compute_ms"] = round(report.bwd_compute_ms, 2)
         d["exposed_comm_ms"] = round(report.exposed_comm_ms, 2)
@@ -557,6 +743,8 @@ def format_results(reports: List[TrainingReport], configs: List[Dict]) -> pd.Dat
         d["optimizer_compute_ms"] = round(report.optimizer_time_ms, 2)
         d["optimizer_comm_ms"] = round(report.optimizer_comm_ms + report.optimizer_comm_hidden_ms, 2)
         d["optimizer_exposed_ms"] = round(report.optimizer_comm_ms, 2)
+        d["recompute_time_ms"] = round(report.recompute_time_ms, 3)
+        d["recompute_time_raw_ms"] =  round(report.recompute_time_raw_ms, 3)
         d["step_time_ms"] = round(report.step_time_ms, 3)
         d["pipeline_time_ms"] = round(report.pipeline_time_ms, 3)
         d["mfu"] = round(report.mfu, 4)
@@ -581,12 +769,12 @@ def format_results(reports: List[TrainingReport], configs: List[Dict]) -> pd.Dat
     if not df.empty:
         df = df.sort_values("mfu", ascending=False)
 
-    metric_cols = ["fwd_compute_ms", "bwd_compute_ms", "exposed_comm_ms",
+    metric_cols = ["compute_time_ms", "fwd_compute_ms", "bwd_compute_ms", "exposed_comm_ms",
                    "tp_total_ms", "tp_exposed_ms", "cp_total_ms", "cp_exposed_ms",
                    "ep_total_ms", "ep_exposed_ms", "pp_total_ms", "pp_exposed_ms",
                    "dp_total_ms", "dp_exposed_ms",
-                   "optimizer_compute_ms", "optimizer_comm_ms", "optimizer_exposed_ms",
-                   "step_time_ms", "pipeline_time_ms",
+                   "optimizer_compute_ms", "optimizer_comm_ms", "optimizer_exposed_ms", "recompute_time_ms",
+                   "recompute_time_raw_ms", "step_time_ms", "pipeline_time_ms",
                    "mfu", "mfu_native", "hfu", "bubble_fraction", "bubble_time_ms", "tokens_per_sec",
                    "weights_gb", "grads_gb", "opt_state_gb", "activations_gb",
                    "comm_buffers_gb", "memory_gb"]
@@ -648,23 +836,14 @@ def export_best_configs_excel(
         model.seq_len = seq_len
 
         hw = load_hw(hw_name)
-        gpus_per_node = best_config.get("gpus_per_node", 8)
-        nodes = world_size // gpus_per_node
-        system = SystemSpec(
-            gpu=GPU(
-                name=hw.name,
-                flops_bf16=hw.compute.bf16_tflops,
-                flops_fp8=hw.compute.fp8_tops or hw.compute.bf16_tflops * 2,
-                flops_fp4=hw.compute.fp4_tops,
-                hbm_gb=hw.memory.capacity_gb,
-                hbm_bw_gbps=hw.memory.hbm_bandwidth_gbps,
-                cube_tflops=hw.compute.cube_bf16_tflops,
-                vector_tflops=hw.compute.vector_bf16_tflops,
-                overlap_ratio=dict(hw.compute.overlap_ratio),
-            ),
-            interconnect=hw.interconnect,
+        _reject_gpus_per_node_config(best_config)
+        gpus_per_node = _inferred_gpus_per_node(hw)
+        nodes = _ceil_nodes_for_world_size(world_size, gpus_per_node)
+        system = _system_from_hw(
+            hw,
             nodes=nodes,
             gpus_per_node=gpus_per_node,
+            world_size_override=world_size,
             host_mem_gb=best_config.get("host_mem_gb", 256.0),
         )
 
@@ -824,6 +1003,7 @@ if __name__ == "__main__":
         "micro_batch": [1, 16, 32],
         "global_batch": [512, 1024, 2048, 4096, 8192, 65536],
         "seq_len": [8192, 32768, 131072],
+        "total_token": [536870912],
         "zero_stage": [3],
         "pp_schedule": ["dualpipev"],
         "cp_kind": ["ulysses"],

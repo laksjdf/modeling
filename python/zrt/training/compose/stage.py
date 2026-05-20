@@ -10,8 +10,11 @@ import math
 from dataclasses import dataclass
 
 from zrt.training.ir.training_graph import Collective, Graph, Op
-from zrt.training.io.perf_tables import achieved_bandwidth_efficiency, achieved_flops_efficiency
+from zrt.training.io.perf_tables import (
+    effective_flops, effective_hbm_bw_bps, peak_tflops_for,
+)
 from zrt.training.models.comm import collective_time, tier_for_group, total_comm_time
+from zrt.training.topology import CommDomain
 from zrt.training.models.flops import OpCost, op_cost
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import LayerKind, ModelSpec
@@ -63,18 +66,15 @@ def op_to_time(
     gpu_name: str = "", dtype: Dtype = Dtype.BF16,
 ) -> float:
     """Roofline: op time = max(compute_time, memory_time)."""
-    from zrt.training.io.perf_tables import peak_tflops_for
     gpu = system.gpu
     compute_t = 0.0
     if flops > 0:
-        peak = peak_tflops_for(gpu, dtype)
-        eff = achieved_flops_efficiency(gpu_name or gpu.name, dtype, flops)
-        compute_t = flops / (peak * eff) if peak > 0 else 0.0
+        eff_flops = effective_flops(gpu, dtype, flops)
+        compute_t = flops / eff_flops if eff_flops > 0 else 0.0
     memory_t = 0.0
     if bytes_ > 0:
-        bw = gpu.hbm_bw_gbps * 1e9
-        eff = achieved_bandwidth_efficiency(gpu_name or gpu.name, bytes_)
-        memory_t = bytes_ / (bw * eff) if bw > 0 else 0.0
+        eff_bw = effective_hbm_bw_bps(gpu, bytes_)
+        memory_t = bytes_ / eff_bw if eff_bw > 0 else 0.0
     return max(compute_t, memory_t)
 
 
@@ -97,7 +97,6 @@ def op_to_time_hetero(
     If either heterogeneous peak is missing, preserve the legacy unified-peak
     roofline instead of treating one side of the work as free.
     """
-    from zrt.training.io.perf_tables import peak_tflops_for
     gpu = system.gpu
     total_flops = cube_flops + vector_flops
     if not has_heterogeneous_compute(system):
@@ -110,13 +109,18 @@ def op_to_time_hetero(
 
     compute_t = 0.0
     if total_flops > 0:
-        eff = achieved_flops_efficiency(gpu_name or gpu.name, dtype, total_flops)
+        # Override-or-heuristic utilization fraction via the unified entry
+        # (effective_flops = peak × eff ⇒ eff = effective_flops / peak).
+        eff = (
+            effective_flops(gpu, dtype, total_flops) / dtype_peak
+            if dtype_peak > 0 else 0.0
+        )
         cube_t = 0.0
         vector_t = 0.0
-        if cube_flops > 0:
+        if cube_flops > 0 and eff > 0:
             peak_cube = gpu.cube_tflops * 1e12 * scale
             cube_t = cube_flops / (peak_cube * eff) if peak_cube > 0 else 0.0
-        if vector_flops > 0:
+        if vector_flops > 0 and eff > 0:
             peak_vector = gpu.vector_tflops * 1e12 * scale
             vector_t = vector_flops / (peak_vector * eff) if peak_vector > 0 else 0.0
         if cube_t > 0 or vector_t > 0:
@@ -124,9 +128,8 @@ def op_to_time_hetero(
 
     memory_t = 0.0
     if bytes_ > 0:
-        bw = gpu.hbm_bw_gbps * 1e9
-        eff_bw = achieved_bandwidth_efficiency(gpu_name or gpu.name, bytes_)
-        memory_t = bytes_ / (bw * eff_bw) if bw > 0 else 0.0
+        eff_bw_bps = effective_hbm_bw_bps(gpu, bytes_)
+        memory_t = bytes_ / eff_bw_bps if eff_bw_bps > 0 else 0.0
     return max(compute_t, memory_t)
 
 
@@ -169,8 +172,22 @@ def stage_time(
     model: ModelSpec,
     system: SystemSpec,
     strategy: Strategy,
+    domain: CommDomain | None = None,
 ) -> StageTime:
-    """Compute forward + backward time for one PP stage and one microbatch."""
+    """Compute forward + backward time for one PP stage and one microbatch.
+
+    Parameters
+    ----------
+    domain
+        Optional shared :class:`CommDomain`. When provided, ALL
+        per-collective costs are priced through it — picking up the
+        N-tier explicit-ranks path automatically for 3+ tier systems
+        (no per-call rebuilds of ParallelGroups). When ``None``, a
+        local domain is constructed inline; callers in the search hot
+        path should pass a pre-built one to avoid the rebuild.
+    """
+    if domain is None:
+        domain = CommDomain(system=system, strategy=strategy)
     gpu_name = system.gpu.name
     gpu = system.gpu
 
@@ -189,14 +206,22 @@ def stage_time(
         t_bwd_dx += dx_t
         t_bwd_dw += dw_t
 
-    # Recompute: re-do forward for selected ops before backward. It stays
-    # inside t_bwd_dx (it IS on the backward critical path, so the pipeline
-    # timeline and step_time are unchanged), but we also track it separately
-    # so the report can surface it as its own term instead of burying it in
-    # backward compute. t_recompute is carried through the same EP-imbalance
-    # scaling as bwd below, keeping the two consistent.
+    # Recompute: re-do forward for selected ops before backward. Returned
+    # as a SEPARATE field — NOT folded into ``t_bwd_dx`` — because schedule
+    # semantics decide whether recompute sits on the critical path or
+    # overlaps with the W (bwd_dw) stream:
+    #
+    #   - 1F1B / VPP / ZB        — serial: pipeline_step_time adds it back
+    #                              into the augmented bwd_dx for these
+    #                              composers (bit-exact with the legacy
+    #                              ``t_bwd_dx += recompute_t`` location).
+    #   - DualPipe / DualPipeV   — dual-stream: the residual after the
+    #                              bwd_dw window absorbs it is exposed.
+    #
+    # t_recompute is still scaled through the same EP-imbalance step as
+    # the rest of bwd so the per-stage report remains consistent with the
+    # bwd that ultimately carries it.
     recompute_t = _recompute_time(stage_ops, model, system, strategy, gpu_name)
-    t_bwd_dx += recompute_t
     t_recompute = recompute_t
 
     t_comm_fwd = 0.0
@@ -210,9 +235,10 @@ def stage_time(
     t_other_comm_fwd = 0.0  # DP and any other groups
     t_other_comm_bwd = 0.0
     for c in stage_collectives:
-        group_size = _group_size(c.group, strategy)
-        tier = tier_for_group(c.group, group_size, system)
-        ct = collective_time(c, group_size, tier)
+        # All per-collective pricing goes through the unified resolver —
+        # picks the right tier (N-tier for 3+ levels, legacy for 2-tier)
+        # without each call site re-deriving the dispatch.
+        ct = domain.time(c)
 
         if c.group == "CP":
             if c.phase == "fwd":
@@ -430,6 +456,13 @@ def _recompute_time(
     for op in ops:
         if op.layer_id < 0:
             continue
+        # v2 cast ops: their cost is tied to the consumer's HBM read and
+        # is already counted in the main stage_time loop. Recomputing them
+        # is conceptually "redo the consumer's input cast" — handled as a
+        # 2nd-order effect; the main stage_time path covers it via the
+        # restored consumer fwd time. See §12.7 of mixed_quant_v2 doc.
+        if op.kind == "cast":
+            continue
         lk = model.layers[op.layer_id].value if op.layer_id < len(model.layers) else ""
         cats = policy.get(lk, set())
         if not cats:
@@ -462,6 +495,11 @@ def _ep_parallel_fraction(
     t_total = 0.0
     t_ep = 0.0
     for op in ops:
+        if op.kind == "cast":
+            # cast ops are neither EP-parallel nor representative of
+            # compute time — exclude from both numerator and denominator
+            # of the imbalance fraction.
+            continue
         cost = op_cost(op, model, system)
         if cost.fwd_cube_flops > 0 or cost.fwd_vector_flops > 0 or cost.fwd_bytes > 0:
             op_dtype = _resolve_compute_dtype(op, model)
@@ -505,15 +543,20 @@ def _wave_overlap_saved(comm_time: float, gemm_time: float, K: int = 4) -> float
 
 def _ep_comm_time(
     collectives: list[Collective], strategy: Strategy, system: SystemSpec,
+    domain: CommDomain | None = None,
 ) -> float:
-    """Total EP A2A communication time (seconds)."""
-    from zrt.training.models.comm import collective_time, tier_for_group
+    """Total EP A2A communication time (seconds).
+
+    Uses the shared :class:`CommDomain` when provided so the N-tier
+    explicit-ranks path applies (A2A picks the outermost spanned tier
+    for 3+ tier systems). Local fall-back domain otherwise.
+    """
+    if domain is None:
+        domain = CommDomain(system=system, strategy=strategy)
     total = 0.0
     for c in collectives:
         if c.group == "EP":
-            group_size = _group_size(c.group, strategy)
-            tier = tier_for_group(c.group, group_size, system)
-            total += collective_time(c, group_size, tier)
+            total += domain.time(c)
     return total
 
 

@@ -3,6 +3,8 @@ vendor: "huawei"
 device_type: "npu"
 
 compute:
+  # compute_efficiency: 0.5   # uncomment to override the size-bucket
+  #                           # achieved-FLOPs heuristic with a flat value
   # Peak throughput (theoretical, no sparsity)
   fp16_tflops: 320
   bf16_tflops: 320
@@ -22,6 +24,8 @@ compute:
     attn_core: 0.6   # ~60% pipeline overlap for fused attention
 
 memory:
+  # mem_bw_efficiency: 0.7   # uncomment to override the size-bucket
+  #                          # achieved-bandwidth heuristic with a flat value
   capacity_gb: 64
   hbm_bandwidth_gbps: 1600
   l2_cache_mb: 48
@@ -38,10 +42,13 @@ interconnect:
     num_links: 7
     latency_us: 3
     topology: "full_mesh"
+    kb_efficiency: 0.7        # bandwidth utilization (effective/peak)
     num_devices: 8
   inter_node:
     type: "RoCE"
     bandwidth_gbps: 200      # 200 GbE ≈ 25 GB/s per port; 8-port = 200 GB/s aggregate
     latency_us: 5
     topology: "fat_tree"
+    kb_efficiency: 0.7       # bandwidth utilization (effective/peak)
+    # oversubscription: 4.0  # uncomment for an over-subscribed spine (non-clos)
     num_devices: 0           # cluster-scale, no fixed upper bound
