@@ -649,7 +649,11 @@ class CommInserterPass(GraphPass):
 
 
 def _moe_scope_root(scope: str) -> str:
-    """Return the scope prefix up to (not including) the expert index."""
+    """Return the phase-agnostic scope prefix before the expert index.
+
+    Callers that group MoE blocks across training graphs must pair this root
+    with phase, e.g. ``(scope_root, phase)``, so fwd/bwd blocks are not merged.
+    """
     for kw in ("experts.", "expert_"):
         idx = scope.lower().find(kw)
         if idx >= 0:

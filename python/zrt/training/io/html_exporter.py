@@ -1172,17 +1172,19 @@ def _json_parse_literal_for_script(data) -> str:
     """
     payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
-    # Prevent data from closing the script element.
-    payload = payload.replace("</", "<\\/")
-
-    # Defensive escaping for JavaScript string literal compatibility.
-    payload = payload.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
-
-    # Return a single-quoted JS string literal. Keeping the JSON object's
-    # double quotes unescaped makes key names visible in the generated HTML,
-    # while JSON.parse still receives inert data rather than executable JS.
-    payload = payload.replace("\\", "\\\\").replace("'", "\\'")
-    return f"'{payload}'"
+    # Escape characters that can alter script parsing, then let json.dumps
+    # generate the JavaScript string literal rather than hand-escaping quotes,
+    # backslashes, and control characters.
+    payload = (
+        payload
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+        .replace("'", "\\u0027")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+    return json.dumps(payload, ensure_ascii=False)
 
 
 _HTML_TEMPLATE = r"""<!doctype html>

@@ -152,7 +152,7 @@ class ExpertGroupedMMPass(GraphPass):
             if phase not in ("fwd", "forward", "train_forward"):
                 continue
 
-            gates, ups, downs, activations = [], [], [], []
+            gates, ups, downs = [], [], []
             for n in nodes:
                 if not _is_expert_matmul(n):
                     continue
@@ -163,9 +163,6 @@ class ExpertGroupedMMPass(GraphPass):
                     ups.append(n)
                 elif w in ("w2", "down_proj"):
                     downs.append(n)
-                elif "silu" in n.op_type.lower() or "swiglu" in n.op_type.lower():
-                    activations.append(n)
-
             if not gates or not ups or not downs:
                 continue
 
@@ -174,6 +171,14 @@ class ExpertGroupedMMPass(GraphPass):
             ffn = downs[0].inputs[0].shape[-1] if downs[0].inputs else min(gate_dim, up_dim)
             H_in = gates[0].inputs[0].shape[-1] if gates[0].inputs else hidden
             H_out = downs[0].outputs[0].shape[-1] if (downs and downs[0].outputs) else hidden
+            if (
+                any(n.outputs and n.outputs[0].shape[-1] != gate_dim for n in gates)
+                or any(n.outputs and n.outputs[0].shape[-1] != up_dim for n in ups)
+                or any(n.inputs and n.inputs[0].shape[-1] != ffn for n in downs)
+                or any(n.inputs and n.inputs[0].shape[-1] != H_in for n in gates + ups)
+                or any(n.outputs and n.outputs[0].shape[-1] != H_out for n in downs)
+            ):
+                continue
             old_ids = {n.id for n in nodes}
 
             # Collect ALL external edges at once before any mutation
@@ -252,16 +257,16 @@ class ExpertGroupedMMPass(GraphPass):
             # Wire: external-in → gate_up
             seen_src = set()
             for e in in_edges:
-                key = (e.src, e.dst_idx)
+                key = (e.src, e.src_idx)
                 if key not in seen_src:
                     seen_src.add(key)
-                    g.edges.append(Edge(e.src, e.src_idx, gate_up_id, e.dst_idx, e.tensor))
+                    g.edges.append(Edge(e.src, e.src_idx, gate_up_id, 0, gate_up.inputs[0]))
             # gate_up → silu → down
             g.edges.append(Edge(gate_up_id, 0, act_id, 0, gate_up.outputs[0]))
             g.edges.append(Edge(act_id, 0, down_id, 0, act_node.outputs[0]))
             # down → external-out
             for e in out_edges:
-                g.edges.append(Edge(down_id, e.src_idx, e.dst, e.dst_idx, e.tensor))
+                g.edges.append(Edge(down_id, 0, e.dst, e.dst_idx, down.outputs[0]))
 
             g._rebuild_adjacency()
 
@@ -283,16 +288,64 @@ class ExpertGroupedMMPass(GraphPass):
         if not gates or not ups or not downs:
             return
 
-        H = downs[0].inputs[0].shape[-1] if downs[0].inputs else hidden
+        # Backward down consumes grad wrt the forward output (H_out) and
+        # produces grad wrt the expert activation (ffn).
+        H_out = downs[0].inputs[0].shape[-1] if downs[0].inputs else hidden
         ffn = downs[0].outputs[0].shape[-1] if downs[0].outputs else (
             gates[0].inputs[0].shape[-1] if gates[0].inputs else 3072)
-        gate_dim = gates[0].outputs[0].shape[-1] if gates[0].outputs else ffn
-        up_dim = ups[0].outputs[0].shape[-1] if ups[0].outputs else gate_dim
-        gate_up_dim = gate_dim + up_dim
+        gate_grad_dim = gates[0].outputs[0].shape[-1] if gates[0].outputs else ffn
+        up_grad_dim = ups[0].outputs[0].shape[-1] if ups[0].outputs else gate_grad_dim
+        gate_up_dim = gate_grad_dim + up_grad_dim
+        if (
+            any(n.inputs and n.inputs[0].shape[-1] != H_out for n in downs)
+            or any(n.outputs and n.outputs[0].shape[-1] != ffn for n in downs)
+            or any(n.inputs and n.inputs[0].shape[-1] != ffn for n in gates + ups)
+            or any(n.outputs and n.outputs[0].shape[-1] != gate_grad_dim for n in gates)
+            or any(n.outputs and n.outputs[0].shape[-1] != up_grad_dim for n in ups)
+        ):
+            return
         old_ids = {n.id for n in nodes}
 
-        in_edges = [e for e in g.edges if e.dst in old_ids and e.src not in old_ids]
-        out_edges = [e for e in g.edges if e.src in old_ids and e.dst not in old_ids]
+        succ: dict[str, list[str]] = {}
+        for e in g.edges:
+            succ.setdefault(e.src, []).append(e.dst)
+
+        def _reachable_from_old(node_id: str) -> bool:
+            stack = list(succ.get(node_id, []))
+            seen = {node_id}
+            while stack:
+                cur = stack.pop()
+                if cur in old_ids:
+                    return True
+                if cur in seen:
+                    continue
+                seen.add(cur)
+                stack.extend(succ.get(cur, []))
+            return False
+
+        def _reachable_from_any_old(node_id: str) -> bool:
+            stack = list(old_ids)
+            seen: set[str] = set()
+            while stack:
+                cur = stack.pop()
+                if cur == node_id:
+                    return True
+                if cur in seen:
+                    continue
+                seen.add(cur)
+                stack.extend(succ.get(cur, []))
+            return False
+
+        in_edges = [
+            e for e in g.edges
+            if e.dst in old_ids and e.src not in old_ids
+            and not _reachable_from_any_old(e.src)
+        ]
+        out_edges = [
+            e for e in g.edges
+            if e.src in old_ids and e.dst not in old_ids
+            and not _reachable_from_old(e.dst)
+        ]
         if not in_edges:
             return
 
@@ -300,8 +353,8 @@ class ExpertGroupedMMPass(GraphPass):
         down = _make_grouped_mm(
             down_id, f"{layer_key}.moe",
             [
-                TensorMeta.from_shape_dtype("grouped_down_bwd_in", (G, M, H), DType.BF16),
-                _weight_tensor("grouped_down_bwd_weight", (G, H, ffn), DType.BF16),
+                TensorMeta.from_shape_dtype("grouped_down_bwd_in", (G, M, H_out), DType.BF16),
+                _weight_tensor("grouped_down_bwd_weight", (G, H_out, ffn), DType.BF16),
             ],
             [TensorMeta.from_shape_dtype("grouped_down_bwd_out", (G, M, ffn), DType.BF16)],
             downs[0],
@@ -343,13 +396,13 @@ class ExpertGroupedMMPass(GraphPass):
 
         seen_src = set()
         for e in in_edges:
-            key = (e.src, e.dst_idx)
+            key = (e.src, e.src_idx)
             if key not in seen_src:
                 seen_src.add(key)
-                g.edges.append(Edge(e.src, e.src_idx, down_id, e.dst_idx, e.tensor))
+                g.edges.append(Edge(e.src, e.src_idx, down_id, 0, down.inputs[0]))
 
         g.edges.append(Edge(down_id, 0, gate_up_id, 0, down.outputs[0]))
         for e in out_edges:
-            g.edges.append(Edge(gate_up_id, e.src_idx, e.dst, e.dst_idx, e.tensor))
+            g.edges.append(Edge(gate_up_id, 0, e.dst, e.dst_idx, gate_up.outputs[0]))
 
         g._rebuild_adjacency()

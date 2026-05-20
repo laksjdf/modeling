@@ -237,6 +237,46 @@ def test_steady_steps_equals_num_microbatches():
 
 # ── Bug 3: FlopsPass gates _calculate_grad_flops on node phase ───────────
 
+def test_recompute_compute_time_excludes_comm_nodes_defensively():
+    compute = OpNode(
+        id="compute",
+        op_type="aten.silu.default",
+        category="compute",
+        annotations={
+            "phase": "fwd",
+            "recompute": True,
+            "latency_us": 100.0,
+            "base_latency_us": 80.0,
+        },
+    )
+    comm = OpNode(
+        id="comm",
+        op_type="comm.all_to_all",
+        category="communication",
+        annotations={
+            "phase": "fwd",
+            "recompute": True,
+            "latency_us": 1000.0,
+            "base_latency_us": 900.0,
+        },
+    )
+    g = _make_graph(
+        [compute, comm],
+        {"num_layers": 1, "num_layers_traced": 1, "training_flops": 1e12},
+    )
+    ctx = _make_ctx(pp=1, micro_batch=1, global_batch=1)
+
+    from unittest.mock import MagicMock, patch
+    mock_timeline = MagicMock()
+    mock_timeline.total_latency_us = 100.0
+
+    with patch("python.zrt.executor.scheduler.DAGScheduler") as MockSched:
+        MockSched.return_value.schedule.return_value = mock_timeline
+        result = TrainingPipelinePass().run(g, ctx)
+
+    assert result.metadata["recompute_compute_ms"] == pytest.approx(0.08)
+
+
 def test_train_flops_pass_zeros_dx_dw_for_backward_phase_nodes():
     """Bug 3: Bwd-phase nodes should have dx_flops=0 and dw_flops=0.
 

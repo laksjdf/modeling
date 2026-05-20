@@ -11,6 +11,7 @@ RED→GREEN regression for:
   5. step_time identity preserved (attribution does not change totals).
 """
 
+import json
 import shutil
 from pathlib import Path
 
@@ -252,8 +253,8 @@ def test_html_export_surfaces_recompute_and_bubble():
                              op_costs=op_costs, output_path=out)
         html = out.read_text(encoding="utf-8")
 
-        assert '"recompute_time_ms"' in html
-        assert '"recompute_time_raw_ms"' in html
+        assert "recompute_time_ms" in html
+        assert "recompute_time_raw_ms" in html
         assert "Recompute (crit. path)" in html
         assert "step time breakdown" in html
         assert "pipeline bubble" in html
@@ -261,6 +262,18 @@ def test_html_export_surfaces_recompute_and_bubble():
     finally:
         if out_dir.exists():
             shutil.rmtree(out_dir)
+
+
+def test_html_json_literal_escapes_script_breakout_and_control_chars():
+    from zrt.training.io.html_exporter import _json_parse_literal_for_script
+
+    data = {"name": "</SCRIPT>\n'x'", "template": "${not_executed}"}
+
+    literal = _json_parse_literal_for_script(data)
+    payload = json.loads(literal)
+
+    assert "</script" not in literal.lower()
+    assert json.loads(payload) == data
 
 
 def test_search_report_surfaces_bubble_and_recompute():

@@ -241,6 +241,7 @@ def test_expert_grouped_mm_backward_preserves_external_outputs_and_gate_up_width
         (2, 4),
         (2, 7),
     )
+    up.outputs.append(_t("up_bwd_aux_out", (2, 7)))
     gate_sink = _linear_node("gate_sink", "post.gate", (2, 5), (2, 5))
     up_sink = _linear_node("up_sink", "post.up", (2, 7), (2, 7))
     for n in (down, gate, up):
@@ -255,7 +256,7 @@ def test_expert_grouped_mm_backward_preserves_external_outputs_and_gate_up_width
             Edge("down_bwd", 0, "gate_bwd", 0, down.outputs[0]),
             Edge("down_bwd", 0, "up_bwd", 0, down.outputs[0]),
             Edge("gate_bwd", 0, "gate_sink", 0, gate.outputs[0]),
-            Edge("up_bwd", 0, "up_sink", 0, up.outputs[0]),
+            Edge("up_bwd", 1, "up_sink", 0, up.outputs[1]),
         ],
         metadata={"seq_len": 4, "hidden": 8},
     )
@@ -269,8 +270,66 @@ def test_expert_grouped_mm_backward_preserves_external_outputs_and_gate_up_width
     gate_up = out.nodes[gate_up_id]
     assert gate_up.inputs[1].shape == (2, 4, 12)
     assert gate_up.outputs[0].shape == (2, 2, 12)
+    grouped_down = out.nodes["transformer_layers_0_ffn_grouped_down_bwd"]
+    assert grouped_down.inputs[0].shape == (2, 2, 8)
+    assert grouped_down.inputs[1].shape == (2, 8, 4)
+    assert grouped_down.outputs[0].shape == (2, 2, 4)
     assert "gate_sink" in out.successors(gate_up_id)
     assert "up_sink" in out.successors(gate_up_id)
+    outbound = [e for e in out.edges if e.src == gate_up_id and e.dst in {"gate_sink", "up_sink"}]
+    assert len(outbound) == 2
+    for edge in outbound:
+        assert edge.src_idx == 0
+        assert edge.tensor.shape == gate_up.outputs[0].shape
+
+
+def test_expert_grouped_mm_backward_ignores_external_bridge_edges():
+    src = _linear_node("src", "input", (2, 8), (2, 8))
+    down = _linear_node(
+        "down_bwd",
+        "transformer.layers.0.ffn.experts.0.w2",
+        (2, 8),
+        (2, 4),
+    )
+    gate = _linear_node(
+        "gate_bwd",
+        "transformer.layers.0.ffn.experts.0.w1",
+        (2, 4),
+        (2, 4),
+    )
+    up = _linear_node(
+        "up_bwd",
+        "transformer.layers.0.ffn.experts.0.w3",
+        (2, 4),
+        (2, 4),
+    )
+    bridge = _linear_node("bridge", "activation.backward", (2, 4), (2, 8))
+    sink = _linear_node("sink", "post.gate", (2, 8), (2, 8))
+    for n in (down, gate, up):
+        n.annotations.update({"phase": "bwd", "ep_needs_a2a": True})
+
+    graph = OpGraph(
+        name="bwd_grouped_bridge",
+        phase="train",
+        nodes={n.id: n for n in (src, down, gate, up, bridge, sink)},
+        edges=[
+            Edge("src", 0, "down_bwd", 0, src.outputs[0]),
+            Edge("gate_bwd", 0, "bridge", 0, gate.outputs[0]),
+            Edge("bridge", 0, "down_bwd", 0, bridge.outputs[0]),
+            Edge("up_bwd", 0, "sink", 0, up.outputs[0]),
+        ],
+        metadata={"seq_len": 4, "hidden": 8},
+    )
+    ctx = _ctx(ep=2)
+    ctx.profile = SimpleNamespace(num_experts=4, moe_active=2)
+
+    out = ExpertGroupedMMPass().run(graph, ctx)
+
+    gate_up_id = "transformer_layers_0_ffn_grouped_gate_up_bwd"
+    out.topo_sort()
+    assert "sink" in out.successors(gate_up_id)
+    assert gate_up_id not in out.predecessors("bridge")
+    assert "bridge" not in out.predecessors("transformer_layers_0_ffn_grouped_down_bwd")
 
 
 def test_flops_pass_does_not_ep_scale_expert_grouped_mm_again():
@@ -296,6 +355,27 @@ def test_flops_pass_does_not_ep_scale_expert_grouped_mm_again():
     out = FlopsPass().run(graph, _ctx(ep=2))
 
     assert out.nodes["grouped"].annotations["flops"] == 2 * 2 * 3 * 4 * 5
+
+
+def test_flops_pass_does_not_active_scale_ep_unfused_expert_helper_without_local_count():
+    helper = OpNode(
+        id="helper",
+        op_type="aten.silu.default",
+        inputs=[_t("x", (2, 3))],
+        outputs=[_t("y", (2, 3))],
+        scope="model.layers.0.ffn.experts.0.activation",
+        category="compute",
+    )
+    graph = OpGraph(
+        name="flops_ep_helper",
+        phase="train",
+        nodes={"helper": helper},
+        metadata={"moe_active_experts": 6, "moe_total_experts": 8},
+    )
+
+    out = FlopsPass().run(graph, _ctx(ep=2))
+
+    assert out.nodes["helper"].annotations["flops"] == 4 * 2 * 3
 
 
 def test_excel_export_separates_base_and_effective_flops(tmp_path):

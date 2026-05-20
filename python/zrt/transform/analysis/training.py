@@ -725,7 +725,9 @@ class TrainingPipelinePass(GraphPass):
         recompute_compute_ms = sum(
             n.annotations.get("base_latency_us", n.annotations.get("latency_us", 0.0))
             for n in g.nodes.values()
-            if not _is_bwd_node(n) and is_external_recompute_node(n)
+            if not _is_bwd_node(n)
+            and n.category != "communication"
+            and is_external_recompute_node(n)
         ) / 1000.0
         if layer_scale != 1.0:
             fwd_compute_ms *= layer_scale

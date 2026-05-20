@@ -146,9 +146,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--recompute-policy",
-        default="none",
+        default=None,
         choices=["none", "full", "selective"],
-        help="Activation recompute policy (default: none). "
+        help="Activation recompute policy (default: none unless configured elsewhere). "
              "full = all forward ops recomputed; "
              "selective = attention ops only.",
     )
@@ -653,7 +653,10 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
         muon_ns_steps=args.muon_ns_steps,
         micro_batch=args.micro_batch,
         global_batch=args.global_batch,
-        recompute_policy=args.recompute_policy,
+        recompute_policy=(
+            args.recompute_policy
+            or ("full" if args.gradient_checkpointing else "none")
+        ),
         return_transformed=True,
         quant=args.quant,
         moe_total_experts=_moe_total,

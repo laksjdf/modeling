@@ -1536,7 +1536,10 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
             ("Forward compute (ms)", round(report.fwd_compute_ms, 3)),
             ("Backward compute (ms)", round(report.bwd_compute_ms, 3)),
             ("Recompute compute (ms)", round(recompute_compute_ms, 3)),
-            ("Compute time note", "Forward + backward + recompute compute"),
+            (
+                "Compute time note",
+                "Compute time already includes forward, backward base, and activation recompute replay compute.",
+            ),
             ("Exposed comm (ms)", round(report.exposed_comm_ms, 3)),
             ("", ""),
             ("=== HW Efficiency ===", ""),

@@ -80,6 +80,11 @@ class FlopsPass(GraphPass):
                 elif (ep_local := node.annotations.get("ep_experts_local", 0)) > 0 and num_experts_total > 0:
                     ep_frac = ep_local / num_experts_total
                     scale = moe_scale * ep_frac
+                elif getattr(ctx.parallel, "ep", 1) > 1:
+                    # With EP enabled, unannotated residual expert-scope helper
+                    # ops are already local to this rank after EP/grouped-MM
+                    # lowering. Active-expert scaling would charge them again.
+                    scale = 1.0
                 else:
                     scale = moe_scale
                 flops = int(flops * scale)
