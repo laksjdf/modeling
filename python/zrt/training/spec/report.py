@@ -160,10 +160,6 @@ class TrainingReport:
     # Maps fused op_type → {count, sample_names, total_flops_pct, dtype, module_class}.
     fused_ops_summary: dict = field(default_factory=dict)
 
-    # FSDP/ZeRO-3 communication summary (graph-native runs only).
-    # {ag_count, rs_count, ag_total_ms, rs_total_ms, total_ms}
-    fsdp_comm_summary: dict = field(default_factory=dict)
-
     def __post_init__(self) -> None:
         """Sync total_flops with training_flops for unified contract.
 
@@ -257,8 +253,6 @@ class TrainingReport:
             result["warnings"] = self.warnings
         if self.fused_ops_summary:
             result["fused_ops_summary"] = self.fused_ops_summary
-        if self.fsdp_comm_summary:
-            result["fsdp_comm_summary"] = self.fsdp_comm_summary
 
         # Config summary (handle both str and dict)
         if isinstance(self.config_summary, str):
@@ -368,19 +362,6 @@ class TrainingReport:
                 lines.append(f"Params:   {self.total_params/1e9:.2f} B")
             else:
                 lines.append(f"Params:   {self.total_params/1e6:.2f} M")
-
-        # ── FSDP/ZeRO-3 Communication ──
-        if self.fsdp_comm_summary:
-            fsdp = self.fsdp_comm_summary
-            ag_count = fsdp.get("ag_count", 0)
-            rs_count = fsdp.get("rs_count", 0)
-            ag_ms = fsdp.get("ag_total_ms", 0.0)
-            rs_ms = fsdp.get("rs_total_ms", 0.0)
-            total_ms = fsdp.get("total_ms", 0.0)
-            lines.append(
-                f"FSDP:     {ag_count} AG + {rs_count} RS  "
-                f"({ag_ms:.2f} + {rs_ms:.2f} = {total_ms:.2f} ms)"
-            )
 
         # ── Warnings (Stack A) ──
         if self.warnings:
