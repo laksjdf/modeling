@@ -281,8 +281,6 @@ def _tier_for_groups(
     if primary > 0:
         for i, tier in enumerate(interconnect.tiers[:primary]):
             n = tier.link.num_devices
-            if n <= 0:
-                continue
             if all(len({r // n for r in g}) < len(g) for g in groups):
                 inner = i
                 break
