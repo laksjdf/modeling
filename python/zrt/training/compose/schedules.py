@@ -402,6 +402,7 @@ class DualPipeComposer(PipelineComposer):
 
         t_fwd_max = max((st.fwd for st in stage_times), default=0.0)
         t_bwd_max = max((st.bwd for st in stage_times), default=0.0)
+        # 一个阶段分成F、B，先F后B 时间依然是加法
         t_stage_max = t_fwd_max + t_bwd_max
         t_fb = max(t_fwd_max, t_bwd_max)  # F&B = max(F,B)
         t_w = max((st.bwd_dw for st in stage_times), default=0.0)  # W = bwd_dw
@@ -426,6 +427,20 @@ class DualPipeComposer(PipelineComposer):
         steady_bwd_total = M * t_bwd_max
         hidden = _dp_hidden(dp_ar_time, cooldown, steady_bwd_total, strategy)
         dp_exposed = dp_ar_time - hidden
+
+        # =========================================================================
+        # 视角 A：真实物理演进视角 (Physical Timeline Perspective)
+        # =========================================================================
+        #    StepTime = [Steady计算+纯空泡时间] + [Warmup 计算+纯空泡时间] + [cooldown 计算+纯空泡时间] + [暴露通信时间]
+        #             =      steadyTime      +     warmupTime      +     cooldownTime      +   dp_exposed
+
+        # =========================================================================
+        # 视角 B：代码数学重构视角 (Mathematical Reconstruct Perspective)
+        # 相当对计算、空泡时间做了汇总
+        #    StepTime = [全流程纯计算时间] + [Warmup空泡时间] + [cooldown空泡时间] + [暴露通信时间]
+        #             =      M * t_stage_max      +     warmup      +     cooldown      +   dp_exposed
+        # =========================================================================
+
 
         step = warmup + steady + cooldown + dp_exposed
         bubble_frac = bubble / step if step > 0 else 0.0
