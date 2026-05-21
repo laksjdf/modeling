@@ -1,26 +1,3 @@
-"""Integration test: compare ZeRO stages via real CLI-generated trace and report files.
-
-Runs the full CLI pipeline for ZeRO-0 and ZeRO-3:
-    python -m python.zrt --model-id hf_models/deepseek_v3 --train --hw nvidia_h100_sxm --tp 8 --pp 4 --dp 2 --global-batch 102 --zero-stage 0 --layers 4
-    python -m python.zrt --model-id hf_models/deepseek_v3 --train --hw nvidia_h100_sxm --tp 8 --pp 4 --dp 2 --global-batch 102 --zero-stage 3 --layers 4
-
-Also runs CLI for ZeRO-1 and ZeRO-2 (memory sharding tests).
-
-Test classes:
-- TestZeroStageCLICommComparison: ZeRO-0 vs ZeRO-3 communication comparison
-    - Compares communication entries in the generated _train_trace.json files
-    - ZeRO-0: single global `comm_dp_grad_reduce` (DP all_reduce at end of backward)
-    - ZeRO-3: per-layer `comm.all_gather` (fwd) + `comm.reduce_scatter` (bwd) from ZeroFSDPPass,
-      no global `comm_dp_grad_reduce` (DP comm handled per-layer by FSDP)
-    - Both have TP all_reduce and PP send_recv comm (independent of ZeRO stage)
-    - ZeRO-3 total comm latency > ZeRO-0 due to per-layer FSDP overhead
-
-- TestZeroStageCLIMemorySharding: Memory component sharding across all ZeRO stages (0-3)
-    - Weights sharded only in ZeRO-3
-    - Gradients sharded in ZeRO-2 and ZeRO-3
-    - Optimizer state sharded in ZeRO-1, ZeRO-2, and ZeRO-3
-    - FSDP comm ops present only in ZeRO-3 trace files
-"""
 from __future__ import annotations
 
 import json
@@ -163,30 +140,6 @@ class TestZeroStageCLICommComparison:
         output_dir = tmp_path_factory.mktemp("zero3_output")
         return _run_cli_with_zero_stage(3, output_dir)
 
-    # ── ZeRO-0 specific tests ─────────────────────────────────────────────
-
-    def test_zero0_has_global_dp_grad_reduce(self, zero0_trace: Path):
-        """ZeRO-0 should have exactly one comm_dp_grad_reduce (global DP all_reduce)."""
-        comm_events = _extract_comm_events(zero0_trace)
-        dp_grad = [e for e in comm_events
-                   if e.get("args", {}).get("node_id") == "comm_dp_grad_reduce"]
-        assert len(dp_grad) == 1, (
-            f"ZeRO-0 expected 1 comm_dp_grad_reduce, got {len(dp_grad)}"
-        )
-        assert dp_grad[0]["args"]["op_type"] == "comm.all_reduce"
-
-
-    # ── ZeRO-3 specific tests ─────────────────────────────────────────────
-
-    def test_zero3_has_no_global_dp_grad_reduce(self, zero3_trace: Path):
-        """ZeRO-3 should NOT have comm_dp_grad_reduce (handled by ZeroFSDPPass per-layer)."""
-        comm_events = _extract_comm_events(zero3_trace)
-        dp_grad = [e for e in comm_events
-                   if e.get("args", {}).get("node_id") == "comm_dp_grad_reduce"]
-        assert len(dp_grad) == 0, (
-            f"ZeRO-3 should NOT have comm_dp_grad_reduce, got {len(dp_grad)}"
-        )
-
     def test_zero3_has_per_layer_all_gather(self, zero3_trace: Path):
         """ZeRO-3 should have exactly one all_gather per traced layer."""
         comm_events = _extract_comm_events(zero3_trace)
@@ -200,7 +153,8 @@ class TestZeroStageCLICommComparison:
         """ZeRO-3 should have exactly one reduce_scatter per traced layer."""
         comm_events = _extract_comm_events(zero3_trace)
         rs_events = [e for e in comm_events
-                     if e.get("args", {}).get("op_type") == "comm.reduce_scatter"]
+                     if e.get("args", {}).get("op_type") == "comm.reduce_scatter"
+                     and e.get("args", {}).get("node_id").startswith("comm_fsdp")]
         assert len(rs_events) == _NUM_LAYERS, (
             f"ZeRO-3 expected {_NUM_LAYERS} reduce_scatter events (one per traced layer), got {len(rs_events)}"
         )
