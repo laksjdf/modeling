@@ -603,6 +603,7 @@ class TrainingPipelinePass(GraphPass):
             StageTime(
                 fwd=stage_fwd.get(s, 0.0) / 1e6,
                 bwd=stage_bwd.get(s, 0.0) / 1e6,
+                bwd_dx=(stage_bwd.get(s, 0.0) - stage_bwd_dw.get(s, 0.0)) / 1e6,
                 bwd_dw=stage_bwd_dw.get(s, 0.0) / 1e6,
             )
             for s in range(pp)

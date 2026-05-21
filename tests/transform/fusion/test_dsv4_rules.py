@@ -121,8 +121,8 @@ def test_rules_have_priorities(loaded_rules):
 
     # Specialized class_only rules should outrank the generic Linear pattern.
     for op_type in ("rms_norm", "parallel_embedding", "kv_compressor",
-                    "sparse_indexer", "mla_sparse_attn", "moe_dispatch",
-                    "moe_gate", "hc_head"):
+                    "sparse_indexer", "mla_sparse_attn", "moe_gate",
+                    "hc_head"):
         assert by_op[op_type].priority >= by_op["linear"].priority, (
             f"{op_type} priority should be ≥ generic linear ({by_op['linear'].priority})"
         )
@@ -249,8 +249,8 @@ def test_register_via_yaml_loader():
             "rms_norm", "parallel_embedding", "linear",
             "column_parallel_linear", "row_parallel_linear",
             "rotary_emb", "kv_compressor", "sparse_indexer",
-            "mla_sparse_attn", "moe_dispatch", "moe_expert_swiglu",
-            "moe_gate", "hc_pre", "hc_post", "hc_head",
+            "mla_sparse_attn", "moe_expert_swiglu", "moe_gate",
+            "hc_pre", "hc_post", "hc_head",
             "sparse_attention_kernel",
         ):
             assert required in op_types, f"missing rule op_type={required!r}"

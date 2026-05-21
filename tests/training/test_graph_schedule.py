@@ -191,24 +191,31 @@ def test_dualpipev_composer_matches_or_beats_dualpipe():
 
 
 def test_zero_bubble_uses_dw_split_to_reduce_dualpipe_bubble():
-    dualpipe, _ = _run_stage_pass("dualpipe")
-    zero_bubble, metadata = _run_stage_pass("zb")
+    dualpipe, _ = _run_stage_pass("dualpipe", bwd_dw_share=0.2)
+    zero_bubble, metadata = _run_stage_pass("zb", bwd_dw_share=0.2)
 
     pp = 4
     M = 8
     t_stage_ms = 3.0
-    t_w_ms = 1.0
-    # Corrected formula: subtract 2*t_w instead of t_w
-    expected_step_ms = M * t_stage_ms + (pp - 1) * max(t_stage_ms - 2 * t_w_ms, 0.0)
+    t_fwd_ms = 1.0
+    t_w_ms = 0.4    # bwd_dw_share=0.2 → 0.2 * 2.0ms = 0.4ms
+    bwd_dx_ms = 1.6  # bwd - bwd_dw = 2.0 - 0.4 = 1.6ms
+    ZB_FLOOR_MS = 2e-3
+    # New ZB formula: warmup + cooldown with per-transition floor
+    expected_bubble = (
+        (pp - 1) * max(t_fwd_ms - t_w_ms, ZB_FLOOR_MS)
+        + (pp - 1) * max(bwd_dx_ms - t_w_ms, ZB_FLOOR_MS)
+    )
+    expected_step_ms = M * t_stage_ms + expected_bubble
 
     assert metadata["stage_timelines_bwd_dw"] == {
-        0: pytest.approx(1000.0),
-        1: pytest.approx(1000.0),
-        2: pytest.approx(1000.0),
-        3: pytest.approx(1000.0),
+        0: pytest.approx(400.0),
+        1: pytest.approx(400.0),
+        2: pytest.approx(400.0),
+        3: pytest.approx(400.0),
     }
     assert zero_bubble.step_time_ms == pytest.approx(expected_step_ms)
-    f1b, _ = _run_stage_pass("1f1b")
+    f1b, _ = _run_stage_pass("1f1b", bwd_dw_share=0.2)
     assert zero_bubble.bubble_fraction < f1b.bubble_fraction
     assert dualpipe.bubble_fraction < f1b.bubble_fraction
 

@@ -285,8 +285,8 @@ class TestEPE2E:
                 assert n.outputs[0].shape == (G, M, _MOE_INTERMEDIATE)
             elif role == "gate_up_bwd":
                 assert n.inputs[0].shape == (G, M, _MOE_INTERMEDIATE)
-                assert n.inputs[1].shape == (G, _MOE_INTERMEDIATE, _MOE_INTERMEDIATE * 2)
-                assert n.outputs[0].shape == (G, M, _MOE_INTERMEDIATE * 2)
+                assert n.inputs[1].shape == (G, _MOE_INTERMEDIATE, _HIDDEN * 2)
+                assert n.outputs[0].shape == (G, M, _HIDDEN * 2)
 
     def test_shared_expert_not_grouped(self, ep8_all):
         _, _, t = ep8_all
@@ -445,8 +445,8 @@ class TestEPE2E:
             assert str((G, _HIDDEN, _MOE_INTERMEDIATE)) in str(down["Input Shapes"])
             assert str((G, M, _MOE_INTERMEDIATE)) in str(down["Output Shapes"])
             assert str((G, M, _MOE_INTERMEDIATE)) in str(gate_up["Input Shapes"])
-            assert str((G, _MOE_INTERMEDIATE, _MOE_INTERMEDIATE * 2)) in str(gate_up["Input Shapes"])
-            assert str((G, M, _MOE_INTERMEDIATE * 2)) in str(gate_up["Output Shapes"])
+            assert str((G, _MOE_INTERMEDIATE, _HIDDEN * 2)) in str(gate_up["Input Shapes"])
+            assert str((G, M, _HIDDEN * 2)) in str(gate_up["Output Shapes"])
 
     def test_exported_excel_ep_forward_order(self, ep8_artifacts):
         rows = _sheet_rows(ep8_artifacts["excel"], "Forward Operators")

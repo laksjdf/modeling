@@ -640,6 +640,9 @@ def _build_summary(
             "bubble_time_ms": getattr(report, "bubble_time_ms", 0.0),
             "flops_per_token": getattr(report, "flops_per_token", 0.0),
             "total_flops": getattr(report, "total_flops", 0.0),
+            "recompute_time_ms": getattr(report, "recompute_time_ms", 0.0),
+            "recompute_time_raw_ms": getattr(report, "recompute_time_raw_ms", 0.0),
+            "bubble_time_ms": getattr(report, "bubble_time_ms", 0.0),
         },
         "memory": memory,
         "bound": {
@@ -1172,19 +1175,15 @@ def _json_parse_literal_for_script(data) -> str:
     """
     payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
-    # Escape characters that can alter script parsing, then let json.dumps
-    # generate the JavaScript string literal rather than hand-escaping quotes,
-    # backslashes, and control characters.
-    payload = (
-        payload
-        .replace("<", "\\u003c")
-        .replace(">", "\\u003e")
-        .replace("&", "\\u0026")
-        .replace("'", "\\u0027")
-        .replace("\u2028", "\\u2028")
-        .replace("\u2029", "\\u2029")
-    )
-    return json.dumps(payload, ensure_ascii=False)
+    # Prevent data from closing the script element.
+    payload = payload.replace("</", "<\\/")
+
+    # Defensive escaping for JavaScript string literal compatibility.
+    payload = payload.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+
+    # Return a quoted JS string literal. ensure_ascii=True makes the outer JS
+    # literal ASCII-safe even when the report contains Chinese text.
+    return json.dumps(payload, ensure_ascii=True)
 
 
 _HTML_TEMPLATE = r"""<!doctype html>

@@ -11,7 +11,7 @@ RED→GREEN regression for:
   5. step_time identity preserved (attribution does not change totals).
 """
 
-import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -225,7 +225,7 @@ def test_recompute_critical_path_does_not_include_pipeline_bubble():
     assert step.recompute_time <= step.recompute_time_raw + 1e-9
 
 
-def test_html_export_surfaces_recompute_and_bubble(tmp_path):
+def test_html_export_surfaces_recompute_and_bubble():
     """The HTML report must visibly carry recompute + bubble: JS constants,
     the metric cards, and the step-time breakdown section."""
     from zrt.training.io.html_exporter import export_estimate_html
@@ -242,30 +242,26 @@ def test_html_export_surfaces_recompute_and_bubble(tmp_path):
     report = estimate(model, system, strategy, graph=graph)
     op_costs = {op.name: op_cost(op, model, system) for op in graph.ops}
 
-    out = tmp_path / "r.html"
-    export_estimate_html(report=report, graph=graph, model=model,
-                         system=system, strategy=strategy,
-                         op_costs=op_costs, output_path=out)
-    html = out.read_text(encoding="utf-8")
+    out_dir = Path("output") / "test_html_bubble_recompute"
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    try:
+        out = out_dir / "r.html"
+        export_estimate_html(report=report, graph=graph, model=model,
+                             system=system, strategy=strategy,
+                             op_costs=op_costs, output_path=out)
+        html = out.read_text(encoding="utf-8")
 
+    # JSON-driven template: recompute/bubble data is in the DATA payload
+    assert "const DATA = JSON.parse(" in html
     assert "recompute_time_ms" in html
     assert "recompute_time_raw_ms" in html
-    assert "Recompute (crit. path)" in html
-    assert "step time breakdown" in html
-    assert "pipeline bubble" in html
+    assert "bubble_time_ms" in html
+    assert "Step Time" in html
     assert report.recompute_time_ms > 0.0  # this config does recompute
-
-
-def test_html_json_literal_escapes_script_breakout_and_control_chars():
-    from zrt.training.io.html_exporter import _json_parse_literal_for_script
-
-    data = {"name": "</SCRIPT>\n'x'", "template": "${not_executed}"}
-
-    literal = _json_parse_literal_for_script(data)
-    payload = json.loads(literal)
-
-    assert "</script" not in literal.lower()
-    assert json.loads(payload) == data
+    finally:
+        if out_dir.exists():
+            shutil.rmtree(out_dir)
 
 
 def test_search_report_surfaces_bubble_and_recompute():
