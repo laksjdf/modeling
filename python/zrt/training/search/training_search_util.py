@@ -215,7 +215,7 @@ def _load_model_spec(model_name: str, quant_preset: Optional[str] = None) -> Mod
 def _make_system_from_config(config: Dict, *, warn_partial: bool = True) -> SystemSpec:
     _reject_gpus_per_node_config(config)
     hw_name = config.get("hw", "nvidia_h100_sxm")
-    hw = load_hw(hw_name)
+    hw = _cached_hw(hw_name)
 
     gpus_per_node = _inferred_gpus_per_node(hw)
     world_size_override = None
@@ -578,7 +578,7 @@ class TrainingConfigManager:
 
         system = None
         try:
-            hw = load_hw(hw_name)
+            hw = _cached_hw(hw_name)
             gpus_per_node = _inferred_gpus_per_node(hw)
             nodes = _ceil_nodes_for_world_size(target_ws, gpus_per_node)
             system = _system_from_hw(
@@ -644,7 +644,7 @@ class TrainingConfigManager:
         except Exception:
             pass
         try:
-            hw = load_hw(hw_name)
+            hw = _cached_hw(hw_name)
             gpus_per_node = _inferred_gpus_per_node(hw)
             nodes = _ceil_nodes_for_world_size(target_ws, gpus_per_node)
             system = _system_from_hw(
