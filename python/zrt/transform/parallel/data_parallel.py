@@ -16,10 +16,10 @@ _BWD_PHASES = {"bwd", "backward", "train_backward"}
 
 
 class DataParallelPass(GraphPass):
-    """Insert per-group gradient reduction comm nodes for data parallelism.
+    """Insert a single gradient reduction comm node for data parallelism.
 
-    Instead of one global tail node, groups backward/gradient-producing nodes
-    by layer and inserts a comm node after each group boundary.
+    Groups all backward/gradient-producing nodes into a single group and
+    inserts one comm node at the end (aligned with the estimate path).
 
     ZeRO mapping:
       - ZeRO-0 → all_reduce
@@ -61,10 +61,10 @@ class DataParallelPass(GraphPass):
                 # Check if edge goes from param node to backward node
                 if edge.src in param_nodes and edge.dst.startswith("bwd_"):
                     bwd_node = g.nodes.get(edge.dst)
+                    fwd_param_node = g.nodes.get(edge.src)
                     if bwd_node:
-                        # Group by layer
-                        layer = bwd_node.layer if bwd_node.layer else "0"
-                        param_grad_nodes[layer].append(bwd_node)
+                        # Group all gradients into a single group (aligned with estimate path)
+                        param_grad_nodes["0"].append(bwd_node)
 
             if not param_grad_nodes:
                 return g  # No parameter gradient nodes found
@@ -75,60 +75,58 @@ class DataParallelPass(GraphPass):
             grad_groups: dict[str, list[OpNode]] = defaultdict(list)
             for node in g.topo_sort():
                 if self._is_backward_node(node):
-                    layer = node.layer if node.layer else "0"
-                    grad_groups[layer].append(node)
+                    grad_groups["0"].append(node)
 
             if not grad_groups:
                 return g
 
-        # 2. For each layer group, create a comm node after the last grad node
-        for group_idx, (layer_key, nodes) in enumerate(
-            sorted(grad_groups.items(), key=lambda kv: int(kv[0]) if kv[0].isdigit() else 0)
-        ):
-            last_node = nodes[-1]
+        # 2. Create a single comm node after the last grad node
+        grad_nodes = list(grad_groups.values())[0]
 
-            # Calculate gradient bytes from grad node outputs
-            grad_bytes = sum(
-                o.mem_bytes for n in nodes for o in n.outputs
-                if hasattr(o, 'mem_bytes')
-            )
+        # Calculate gradient bytes from all grad node outputs
+        grad_bytes = sum(
+            o.mem_bytes for n in grad_nodes for o in n.outputs
+            if hasattr(o, 'mem_bytes')
+        )
 
-            comm_node = OpNode(
-                id=f"comm_grad_reduce_layer_{layer_key}",
-                op_type=f"comm.{collective}",
-                inputs=[],
-                outputs=[],
-                attrs={
-                    "group_size": dp,
-                    "collective": collective,
-                    "role": "dp_grad_reduce",
-                    "bucket_bytes": grad_bytes,
-                    "dp_grad_group_idx": group_idx,
-                },
-                scope=f"data_parallel.grad_reduce.layer_{layer_key}",
-                category="communication",
-            )
+        last_node = grad_nodes[-1]
 
-            comm_node.annotations["inserted_by"] = "data_parallel_pass"
-            comm_node.annotations["dp_comm"] = True
-            comm_node.annotations["phase"] = "bwd"
+        comm_node = OpNode(
+            id="comm_grad_reduce",
+            op_type=f"comm.{collective}",
+            inputs=[],
+            outputs=[],
+            attrs={
+                "group_size": dp,
+                "collective": collective,
+                "role": "dp_grad_reduce",
+                "bucket_bytes": grad_bytes,
+                "dp_grad_group_idx": 0,
+            },
+            scope="data_parallel.grad_reduce",
+            category="communication",
+        )
 
-            dp_overlap = getattr(ctx.training, "dp_overlap_in_bubble", True) if ctx.training else True
-            if dp_overlap:
-                comm_node.annotations["overlap_in_bubble"] = True
+        comm_node.annotations["inserted_by"] = "data_parallel_pass"
+        comm_node.annotations["dp_comm"] = True
+        comm_node.annotations["phase"] = "bwd"
 
-            self._insert_after(g, last_node, comm_node)
+        dp_overlap = getattr(ctx.training, "dp_overlap_in_bubble", True) if ctx.training else True
+        if dp_overlap:
+            comm_node.annotations["overlap_in_bubble"] = True
 
-            # 在 DataParallelPass 中，comm_node 之后插入
-            scale_node = OpNode(
-                id=f"grad_scale_layer_{layer_key}",
-                op_type="aten.div.Scalar",
-                attrs={"divisor": dp, "role": "dp_grad_average"},
-                category="compute",
-            )
-            scale_node.annotations["inserted_by"] = "data_parallel_pass"
-            scale_node.annotations["phase"] = "bwd"
-            self._insert_after(g, comm_node, scale_node)
+        self._insert_after(g, last_node, comm_node)
+
+        # Insert grad-scale node after comm_node
+        scale_node = OpNode(
+            id="grad_scale",
+            op_type="aten.div.Scalar",
+            attrs={"divisor": dp, "role": "dp_grad_average"},
+            category="compute",
+        )
+        scale_node.annotations["inserted_by"] = "data_parallel_pass"
+        scale_node.annotations["phase"] = "bwd"
+        self._insert_after(g, comm_node, scale_node)
 
         return g
 

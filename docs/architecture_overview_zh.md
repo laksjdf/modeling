@@ -342,7 +342,7 @@ CLAUDE.md 描述了 `python/zrt/training/builtins/`，但仓库中只剩下空 `
   - 终点检测平衡比 >1.5x 时 warning。
 
 - **DataParallelPass**（`parallel/data_parallel.py`）  
-  仅对 `is_training and dp>1 and phase=="train_backward"` 生效；按 layer 聚合"梯度生产节点"（op_type 含 `grad/backward`），插 layer 粒度的 `comm.all_reduce`（zero=0）或 `comm.reduce_scatter`（zero≥2）。  
+  仅对 `is_training and dp>1 and phase=="train_backward"` 生效；聚合所有梯度节点为单组，插一个 `comm.all_reduce`（zero=0）或 `comm.reduce_scatter`（zero≥2），与 estimate 路径对齐。  
   根据 `dp_overlap_in_bubble` 标 `overlap_in_bubble=True`。
 
 ### 4.3 融合 Pass

@@ -446,7 +446,7 @@ stitch_fwd_bwd(fwd_graph: OpGraph, bwd_graph: OpGraph,
 | `TensorParallelPass` | `tensor_parallel.py` | 列/行并行切分，标注 `comm_after`，修改 `local_shape` |
 | `ExpertParallelPass` | `expert_parallel.py` | 专家 FFN 节点标注 `ep_needs_a2a`，调整分片系数 |
 | `ContextParallelPass` | `context_parallel.py` | Ulysses：注意力前后插 `comm.all_to_all`；Ring：插 `cp` 轮 `comm.send_recv`，标 `overlap_target="fa_tile:<id>"` |
-| `DataParallelPass` | `data_parallel.py` | 反向梯度节点后按 layer 插 `comm.all_reduce`（ZeRO-0）或 `comm.reduce_scatter`（ZeRO-2/3），可重叠通信标注 `overlap_in_bubble=True` |
+| `DataParallelPass` | `data_parallel.py` | 反向梯度节点后插入单个 `comm.all_reduce`（ZeRO-0）或 `comm.reduce_scatter`（ZeRO-2/3），与 estimate 路径对齐；可重叠通信标注 `overlap_in_bubble=True` |
 | `CommInserterPass` | `comm_inserter.py` | 读取 `comm_after`/`ep_needs_a2a`/`cp_split` 注解，将集合通信节点实际插入图 |
 | `PipelineParallelPass` | `pipeline_parallel.py` | 按 `compute_us`（→`latency_us`→`flops` 降级）贪心装箱分配 `stage_id`；VPP 额外分配 `virtual_stage_id`；跨 stage 边替换为 `comm.send_recv` P2P 节点（放在接收 stage） |
 

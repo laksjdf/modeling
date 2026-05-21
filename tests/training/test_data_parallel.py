@@ -73,7 +73,7 @@ def _make_hardware_spec():
 class TestDPZero0:
     """ZeRO-0: all_reduce comm nodes."""
 
-    def test_all_reduce_created_per_layer(self):
+    def test_all_reduce_created_single_group(self):
         graph = _make_backward_graph(num_layers=3)
         ctx = TransformContext(
             hw_spec=_make_hardware_spec(),
@@ -88,7 +88,7 @@ class TestDPZero0:
 
         dp_nodes = [n for n in result.nodes.values()
                     if n.annotations.get("dp_comm")]
-        assert len(dp_nodes) == 3  # one per layer
+        assert len(dp_nodes) == 1  # single group (aligned with estimate path)
 
         for node in dp_nodes:
             assert node.op_type == "comm.all_reduce"
@@ -261,9 +261,9 @@ class TestDPOverlap:
 
 
 class TestDPGroupIdx:
-    """Tests for per-group index assignment."""
+    """Tests for group index assignment (single group: always 0)."""
 
-    def test_group_idx_sequential(self):
+    def test_group_idx_is_zero(self):
         graph = _make_backward_graph(num_layers=3)
         ctx = TransformContext(
             hw_spec=_make_hardware_spec(),
@@ -278,17 +278,17 @@ class TestDPGroupIdx:
             key=lambda n: n.attrs["dp_grad_group_idx"],
         )
         indices = [n.attrs["dp_grad_group_idx"] for n in dp_nodes]
-        assert indices == [0, 1, 2]
+        assert indices == [0]
 
 
 class TestDPDivScale:
     """Tests for aten.div.Scalar gradient averaging nodes.
 
-    DataParallelPass inserts a div/scale node after every DP comm node
+    DataParallelPass inserts a single div/scale node after the DP comm node
     so that all_reduce / reduce_scatter SUM is averaged by dp.
     """
 
-    def test_div_scale_node_created_per_layer(self):
+    def test_div_scale_node_created(self):
         graph = _make_backward_graph(num_layers=3)
         ctx = TransformContext(
             hw_spec=_make_hardware_spec(),
@@ -303,7 +303,7 @@ class TestDPDivScale:
             if n.annotations.get("inserted_by") == "data_parallel_pass"
             and n.op_type == "aten.div.Scalar"
         ]
-        assert len(scale_nodes) == 3  # one per layer
+        assert len(scale_nodes) == 1  # single group
 
     def test_div_scale_divisor_equals_dp(self):
         graph = _make_backward_graph(num_layers=2)
