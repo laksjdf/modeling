@@ -1,0 +1,63 @@
+name: "Ascend 910C SuperPod"
+vendor: "huawei"
+device_type: "npu"
+
+# Source: Huawei Atlas 900 A3 SuperPod / CloudMatrix 384 public references.
+# Per-NPU compute mirrors ascend_910c.yaml — this file diverges only in
+# the interconnect, which models the **3-tier** hierarchy:
+#   tier 0: HCCS inside one super-node (384 NPUs on a single HCCS plane)
+#   tier 1: pod-level RoCE between super-nodes (typical 3072 NPUs / 8 super-nodes)
+#   tier 2: cluster-wide RoCE spine (unbounded, over-subscribed)
+
+compute:
+  fp16_tflops: 640
+  bf16_tflops: 640
+  fp32_tflops: 320
+  int8_tops: 1280
+  int4_tops: 2560
+  fp8_tops: 1280
+  fp4_tops: 0
+  cube_bf16_tflops: 560
+  vector_bf16_tflops: 80
+  sram_kb_per_sm: 192
+  overlap_ratio:
+    attn_core: 0.6
+
+memory:
+  capacity_gb: 96
+  hbm_bandwidth_gbps: 3200
+  l2_cache_mb: 96
+  tiers:
+    - { name: "L2",  bandwidth_gbps: 12800, capacity_mb: 96 }
+    - { name: "HBM", bandwidth_gbps: 3200,  capacity_mb: 0  }
+
+interconnect:
+  tiers:
+    # Tier 0: HCCS full-mesh inside one super-node (CloudMatrix 384 ≈ 384 NPUs).
+    # 7 HCCS links per card × 112 GB/s unidirectional × 2 → 1568 GB/s bidir total.
+    - name: "hccs_supernode"
+      type: "HCCS"
+      unidirectional_bw_gbps: 112
+      num_links: 7
+      latency_us: 2.0
+      topology: "full_mesh"
+      kb_efficiency: 0.75
+      num_devices: 384
+    # Tier 1: RoCE between super-nodes inside one pod. Typical pod groups
+    # ~8 super-nodes (3072 NPUs).
+    - name: "roce_pod"
+      type: "RoCE"
+      bandwidth_gbps: 400
+      latency_us: 4.0
+      topology: "fat_tree"
+      kb_efficiency: 0.7
+      num_devices: 3072
+    # Tier 2: cluster spine across pods — unbounded, over-subscribed.
+    - name: "roce_spine"
+      type: "RoCE"
+      bandwidth_gbps: 200
+      latency_us: 8.0
+      topology: "fat_tree"
+      kb_efficiency: 0.6
+      oversubscription: 4.0
+      num_devices: 0

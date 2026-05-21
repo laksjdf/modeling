@@ -1,0 +1,69 @@
+name: "NVIDIA GB300 NVL576"
+vendor: "nvidia"
+device_type: "gpu"
+
+# Source: NVIDIA Blackwell Ultra GB300 NVL576 reference, public figures.
+# Per-GPU compute mirrors nvidia_b300.yaml — this file diverges only in the
+# interconnect, which models the **4-tier** scale-up + scale-out topology:
+#   tier 0: NVLink5 inside one tray (4 GPU)
+#   tier 1: NVL72 rack-level NVSwitch5 (72 GPU)
+#   tier 2: rail-aligned IB across 8 racks → NVL576 rail (576 GPU)
+#   tier 3: cluster-wide IB spine (unbounded; over-subscribed)
+
+compute:
+  fp16_tflops: 5000
+  bf16_tflops: 5000
+  fp32_tflops: 250
+  int8_tops:   10000
+  int4_tops:   20000
+  fp8_tops:    10000
+  fp4_tops:    20000
+  sram_kb_per_sm: 256
+
+memory:
+  capacity_gb: 288
+  hbm_bandwidth_gbps: 8000
+  l2_cache_mb: 64
+  tiers:
+    - { name: "L2",  bandwidth_gbps: 16384, capacity_mb: 64 }
+    - { name: "HBM", bandwidth_gbps: 8000,  capacity_mb: 0  }
+
+interconnect:
+  tiers:
+    # Tier 0: NVLink5 inside a single GB300 tray (4 GPU).
+    - name: "nvlink_tray"
+      type: "NVLink5"
+      bandwidth_gbps: 1800
+      latency_us: 0.5
+      topology: "all_to_all"
+      kb_efficiency: 0.85
+      num_devices: 4
+    # Tier 1: NVL72 rack — 18 trays × 4 GPU, all connected through NVSwitch5.
+    # Per-GPU bandwidth into the rack switch is ~900 GB/s; latency higher
+    # than intra-tray because traffic crosses the switch ASIC.
+    - name: "nvswitch_rack"
+      type: "NVSwitch5"
+      bandwidth_gbps: 900
+      latency_us: 1.0
+      topology: "all_to_all"
+      kb_efficiency: 0.75
+      num_devices: 72
+    # Tier 2: rail-aligned XDR IB connecting 8 racks → 576 GPU rail.
+    # Non-blocking inside the rail (kb_efficiency reflects realistic
+    # achievable BW, no spine over-subscription).
+    - name: "ib_rail"
+      type: "InfiniBand_XDR_rail"
+      bandwidth_gbps: 800
+      latency_us: 2.0
+      topology: "fat_tree"
+      kb_efficiency: 0.7
+      num_devices: 576
+    # Tier 3: cluster spine — unbounded domain, over-subscribed fat-tree.
+    - name: "ib_spine"
+      type: "InfiniBand_XDR_spine"
+      bandwidth_gbps: 400
+      latency_us: 5.0
+      topology: "fat_tree"
+      kb_efficiency: 0.6
+      oversubscription: 4.0
+      num_devices: 0
