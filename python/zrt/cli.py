@@ -220,6 +220,23 @@ def main() -> None:
              f"Available: {', '.join(__import__('python.zrt.hardware.registry', fromlist=['list_available']).list_available())}",
     )
 
+    # ── Tilesim (external operator latency predictor) ─────────────────────────
+    parser.add_argument(
+        "--tilesim",
+        action="store_true",
+        default=False,
+        help="Enable Tilesim operator latency prediction (local in-process). "
+             "Requires api.operator_api.op_latency_predict to be importable. "
+             "When set, operator latency is predicted by Tilesim instead of Roofline.",
+    )
+    parser.add_argument(
+        "--tilesim-accelerator",
+        metavar="PATH_OR_NAME",
+        default=None,
+        help="Accelerator config path or name for Tilesim (e.g. 910B1/910B1.yaml). "
+             "If omitted, derived from --hw.",
+    )
+
     # ── Training modelling extras (used with --train --hw or --estimate-config) ──
     parser.add_argument(
         "--zero-stage", type=int, default=1,
@@ -558,6 +575,8 @@ def _run_inference_pipeline(args, model_id: str, hw, result) -> None:
         quant=quant,
         fusion=fusion_cfg,
         model_id=model_id,
+        tilesim=args.tilesim,
+        tilesim_accelerator=getattr(args, "tilesim_accelerator", "") or "",
     )
     pipe = build_default_pipeline()
 
@@ -663,6 +682,8 @@ def _run_training_modelling(args, model_id: str, hw, result) -> None:
         moe_active_experts=_moe_active,
         model_id=model_id,
         fusion_config=fusion_cfg,
+        tilesim=args.tilesim,
+        tilesim_accelerator=getattr(args, "tilesim_accelerator", "") or "",
     )
 
     try:

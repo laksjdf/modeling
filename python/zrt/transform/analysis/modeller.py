@@ -60,6 +60,8 @@ def estimate_training_from_graphs(
     num_heads: int | None = None,
     kv_heads: int | None = None,
     head_dim: int | None = None,
+    tilesim: bool = False,
+    tilesim_accelerator: str = "",
 ) -> "TrainingReport | tuple[TrainingReport, TransformContext, dict[str, OpGraph]]":
     """Estimate training performance from pre-built OpGraph instances.
 
@@ -125,6 +127,8 @@ def estimate_training_from_graphs(
         ),
         fusion=fusion_config or FusionConfig(),
         quant=quant_cfg,
+        tilesim=tilesim,
+        tilesim_accelerator=tilesim_accelerator,
     )
 
     # Attach MoE profile to ctx so ExpertParallelPass and other MoE-aware

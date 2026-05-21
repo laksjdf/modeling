@@ -230,6 +230,8 @@ class TransformContext:
     profile:      Any             = None   # ModelProfile (optional)
     stack:        Any             = None   # SoftwareStack (optional)
     model_id:     str             = ""     # HF model id, used by FusionPass to load platform rules
+    tilesim:      bool            = False  # Enable Tilesim latency prediction (--tilesim flag)
+    tilesim_accelerator: str      = ""     # Accelerator config path for Tilesim (--tilesim-accelerator)
 
     @property
     def is_training(self) -> bool:
