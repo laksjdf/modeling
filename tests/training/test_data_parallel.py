@@ -1,4 +1,4 @@
-"""Test data parallel pass: per-group comm insertion, ZeRO staging, overlap."""
+"""Test data parallel pass: global comm insertion, ZeRO staging, overlap."""
 
 import pytest
 from zrt.ir.graph import OpGraph
@@ -68,9 +68,9 @@ def _make_hardware_spec():
 
 
 class TestDPZero0:
-    """ZeRO-0: all_reduce comm nodes."""
+    """ZeRO-0: single global all_reduce at end of backward pass."""
 
-    def test_all_reduce_created_per_layer(self):
+    def test_single_global_all_reduce(self):
         graph = _make_backward_graph(num_layers=3)
         ctx = TransformContext(
             hw_spec=_make_hardware_spec(),
@@ -85,13 +85,14 @@ class TestDPZero0:
 
         dp_nodes = [n for n in result.nodes.values()
                     if n.annotations.get("dp_comm")]
-        assert len(dp_nodes) == 3  # one per layer
+        assert len(dp_nodes) == 1  # single global comm node
 
-        for node in dp_nodes:
-            assert node.op_type == "comm.all_reduce"
-            assert node.attrs["group_size"] == 4
-            assert node.attrs["collective"] == "all_reduce"
-            assert node.attrs["bucket_bytes"] > 0
+        node = dp_nodes[0]
+        assert node.op_type == "comm.all_reduce"
+        assert node.attrs["group_size"] == 4
+        assert node.attrs["collective"] == "all_reduce"
+        assert node.attrs["bucket_bytes"] > 0
+        assert node.id == "comm_dp_grad_reduce"
 
     def test_dp_comm_annotation_present(self):
         graph = _make_backward_graph(num_layers=2)
@@ -110,8 +111,29 @@ class TestDPZero0:
             assert node.annotations["inserted_by"] == "data_parallel_pass"
 
 
+class TestDPZero1:
+    """ZeRO-1: single global all_reduce at end of backward pass."""
+
+    def test_all_reduce_for_zero1(self):
+        graph = _make_backward_graph(num_layers=2)
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=1, dp=4),
+            training=TrainingConfig(micro_batch=1, global_batch=8, zero_stage=1),
+        )
+
+        result = DataParallelPass().run(graph, ctx)
+
+        dp_nodes = [n for n in result.nodes.values()
+                    if n.annotations.get("dp_comm")]
+        assert len(dp_nodes) == 1
+        for node in dp_nodes:
+            assert node.op_type == "comm.all_reduce"
+            assert node.attrs["collective"] == "all_reduce"
+
+
 class TestDPZero2:
-    """ZeRO-2/3: reduce_scatter comm nodes."""
+    """ZeRO-2: single global reduce_scatter at end of backward pass."""
 
     def test_reduce_scatter_for_zero2(self):
         graph = _make_backward_graph(num_layers=2)
@@ -125,11 +147,13 @@ class TestDPZero2:
 
         dp_nodes = [n for n in result.nodes.values()
                     if n.annotations.get("dp_comm")]
+        assert len(dp_nodes) == 1
         for node in dp_nodes:
             assert node.op_type == "comm.reduce_scatter"
             assert node.attrs["collective"] == "reduce_scatter"
 
-    def test_reduce_scatter_for_zero3(self):
+    def test_zero3_skipped_by_dp_pass(self):
+        """ZeRO-3 should be skipped by DataParallelPass (handled by ZeroFSDPPass)."""
         graph = _make_backward_graph(num_layers=2)
         ctx = TransformContext(
             hw_spec=_make_hardware_spec(),
@@ -141,8 +165,7 @@ class TestDPZero2:
 
         dp_nodes = [n for n in result.nodes.values()
                     if n.annotations.get("dp_comm")]
-        for node in dp_nodes:
-            assert node.op_type == "comm.reduce_scatter"
+        assert len(dp_nodes) == 0
 
     def test_reduce_scatter_has_lower_modeled_time_than_all_reduce(self):
         graph = _make_backward_graph(num_layers=1)
@@ -218,24 +241,3 @@ class TestDPOverlap:
         dp_nodes = [n for n in result.nodes.values()
                     if n.annotations.get("dp_comm")]
         assert len(dp_nodes) == 0
-
-
-class TestDPGroupIdx:
-    """Tests for per-group index assignment."""
-
-    def test_group_idx_sequential(self):
-        graph = _make_backward_graph(num_layers=3)
-        ctx = TransformContext(
-            hw_spec=_make_hardware_spec(),
-            parallel=ParallelConfig(tp=1, dp=4),
-            training=TrainingConfig(micro_batch=1, global_batch=8, zero_stage=0),
-        )
-
-        result = DataParallelPass().run(graph, ctx)
-
-        dp_nodes = sorted(
-            [n for n in result.nodes.values() if n.annotations.get("dp_comm")],
-            key=lambda n: n.attrs["dp_grad_group_idx"],
-        )
-        indices = [n.attrs["dp_grad_group_idx"] for n in dp_nodes]
-        assert indices == [0, 1, 2]
