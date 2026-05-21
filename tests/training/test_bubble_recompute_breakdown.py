@@ -252,13 +252,13 @@ def test_html_export_surfaces_recompute_and_bubble():
                              op_costs=op_costs, output_path=out)
         html = out.read_text(encoding="utf-8")
 
-    # JSON-driven template: recompute/bubble data is in the DATA payload
-    assert "const DATA = JSON.parse(" in html
-    assert "recompute_time_ms" in html
-    assert "recompute_time_raw_ms" in html
-    assert "bubble_time_ms" in html
-    assert "Step Time" in html
-    assert report.recompute_time_ms > 0.0  # this config does recompute
+        # JSON-driven template: recompute/bubble data is in the DATA payload
+        assert "const DATA = JSON.parse(" in html
+        assert "recompute_time_ms" in html
+        assert "recompute_time_raw_ms" in html
+        assert "bubble_time_ms" in html
+        assert "Step Time" in html
+        assert report.recompute_time_ms > 0.0  # this config does recompute
     finally:
         if out_dir.exists():
             shutil.rmtree(out_dir)
