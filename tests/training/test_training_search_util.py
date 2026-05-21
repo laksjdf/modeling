@@ -374,7 +374,9 @@ class TestTrainingConfigManager:
         configs = manager.generate_static_configs()
         ep_values = {cfg["ep"] for cfg in configs}
 
-        assert 256 in ep_values
+        assert 128 in ep_values
+        assert 256 not in ep_values
+        assert all(384 % ep == 0 for ep in ep_values)
         assert manager.count_total_configs() == len(configs)
 
     def test_ep_auto_falls_back_to_rank_divisors_without_model_context(self):
@@ -437,6 +439,58 @@ class TestTrainingConfigManager:
         configs = manager.generate_static_configs()
         assert manager.count_total_configs() == len(configs)
 
+    def test_search_filters_non_divisible_ep_dp_combos(self):
+        manager = TrainingConfigManager(
+            param_grid={
+                "model": ["deepseek_v3_2"],
+                "hw": ["nvidia_h100_sxm"],
+                "world_size": [768],
+                "seq_len": [4096],
+                "tp": [1],
+                "cp": [1],
+                "pp": [8],
+                "ep": [64],
+                "dp": [96],
+                "micro_batch": [1],
+                "global_batch": [768],
+                "zero_stage": [1],
+                "pp_schedule": ["1f1b"],
+                "recompute": ["none"],
+                "optimizer": ["muon"],
+            }
+        )
+
+        configs = manager.generate_static_configs()
+
+        assert configs == []
+        assert manager.count_total_configs() == 0
+
+    def test_search_keeps_valid_ep_dp_combos(self):
+        manager = TrainingConfigManager(
+            param_grid={
+                "model": ["deepseek_v3_2"],
+                "hw": ["nvidia_h100_sxm"],
+                "world_size": [512],
+                "seq_len": [4096],
+                "tp": [1],
+                "cp": [1],
+                "pp": [8],
+                "ep": [64],
+                "dp": [64],
+                "micro_batch": [1],
+                "global_batch": [512],
+                "zero_stage": [1],
+                "pp_schedule": ["1f1b"],
+                "recompute": ["none"],
+                "optimizer": ["muon"],
+            }
+        )
+
+        configs = manager.generate_static_configs()
+
+        assert [(c["ep"], c["dp"]) for c in configs] == [(64, 64)]
+        assert manager.count_total_configs() == len(configs)
+
     def test_count_total_configs_builds_system_when_model_is_unknown(self):
         manager = TrainingConfigManager(
             param_grid={
@@ -475,6 +529,41 @@ class TestTrainingConfigManager:
         assert result["status"] == "success"
         assert result["report"].config_summary["parallelism"].startswith(
             "TP*CP*PP*DP = 8192"
+        )
+
+    def test_muon_rotation_hidden_comm_is_preserved_in_search_summary(self):
+        cfg = {
+            "model": "deepseek_v3_2",
+            "hw": "nvidia_h100_sxm",
+            "world_size": 128,
+            "seq_len": 4096,
+            "tp": 4,
+            "cp": 1,
+            "pp": 4,
+            "ep": 8,
+            "dp": 8,
+            "micro_batch": 1,
+            "global_batch": 512,
+            "zero_stage": 1,
+            "pp_schedule": "1f1b",
+            "recompute": "none",
+            "optimizer": "muon",
+            "muon_rotation": True,
+        }
+
+        result = run_training_task_wrapper(cfg)
+
+        assert result["status"] == "success"
+        report = result["report"]
+        assert report.optimizer_comm_ms == pytest.approx(0.0)
+        assert report.optimizer_comm_hidden_ms > 0.0
+
+        report.memory = None
+        df = format_results([report], [cfg])
+        row = df.iloc[0]
+        assert row["optimizer_exposed_ms"] == pytest.approx(0.0)
+        assert row["optimizer_comm_ms"] == pytest.approx(
+            round(report.optimizer_comm_hidden_ms, 2)
         )
 
     def test_output_path_generation(self):
@@ -540,6 +629,18 @@ class TestFormatResults:
         assert df.iloc[0]["mfu"] == 0.5
         assert df.iloc[1]["mfu"] == 0.4
         assert df.iloc[2]["mfu"] == 0.3
+
+    def test_format_results_preserves_small_nonzero_optimizer_compute(self):
+        report = TrainingReport(
+            step_time_ms=100.0,
+            mfu=0.45,
+            optimizer_time_ms=0.000330720499,
+        )
+        config = {"model": "tiny", "hw": "nvidia_h100_sxm"}
+
+        df = format_results([report], [config])
+
+        assert df.iloc[0]["optimizer_compute_ms"] > 0.0
 
     def test_format_results_includes_comm_totals(self):
         """验证 format_results 包含各策略的通信总时间字段，且列按策略分组."""

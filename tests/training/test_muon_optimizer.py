@@ -6,6 +6,7 @@ from zrt.training.models.optimizer import (
     adam_step_flops,
     muon_step_flops,
     muon_optimizer_step_flops,
+    muon_step_flops_from_arch,
 )
 from zrt.training.models.memory import _optimizer_state_bytes
 from zrt.training.models.comm import optimizer_comm_time
@@ -368,7 +369,7 @@ class TestComputeOptimizerTimeSharding:
             optimizer=OptKind.MUON, zero_stage=0,
         )
         strategy_ep64 = Strategy(
-            tp=1, pp=1, ep=64, dp=1, micro_batch=1, global_batch=1,
+            tp=1, pp=1, ep=64, dp=64, micro_batch=1, global_batch=1,
             optimizer=OptKind.MUON, zero_stage=0,
         )
 
@@ -394,7 +395,7 @@ class TestComputeOptimizerTimeSharding:
             optimizer=OptKind.ADAM, zero_stage=0,
         )
         strategy_ep64 = Strategy(
-            tp=1, pp=1, ep=64, dp=1, micro_batch=1, global_batch=1,
+            tp=1, pp=1, ep=64, dp=64, micro_batch=1, global_batch=1,
             optimizer=OptKind.ADAM, zero_stage=0,
         )
 
@@ -462,6 +463,55 @@ class TestComputeOptimizerTimeSharding:
             f"ZeRO-1 ({time_zero1:.6f}s) and ZeRO-2 ({time_zero2:.6f}s) should match."
         )
 
+    def test_adam_optimizer_time_is_memory_bound_not_near_zero(self):
+        """Adam update is elementwise/HBM-bound and must not vanish."""
+        model = _make_mock_model()
+        system = _make_mock_system()
+        strategy = Strategy(
+            tp=1, pp=1, dp=8, micro_batch=1, global_batch=8,
+            optimizer=OptKind.ADAM, zero_stage=1,
+        )
+
+        from zrt.training.compose.schedules import _compute_optimizer_time
+        time_s = _compute_optimizer_time(model, system, strategy)
+
+        assert time_s * 1000 > 0.01
+
+    def test_adam_optimizer_time_scales_down_with_zero_dp_sharding(self):
+        """ZeRO optimizer-state sharding should reduce Adam update work."""
+        model = _make_mock_model()
+        system = _make_mock_system()
+        zero0 = Strategy(
+            tp=1, pp=1, dp=8, micro_batch=1, global_batch=8,
+            optimizer=OptKind.ADAM, zero_stage=0,
+        )
+        zero1 = Strategy(
+            tp=1, pp=1, dp=8, micro_batch=1, global_batch=8,
+            optimizer=OptKind.ADAM, zero_stage=1,
+        )
+
+        from zrt.training.compose.schedules import _compute_optimizer_time
+        time_zero0 = _compute_optimizer_time(model, system, zero0)
+        time_zero1 = _compute_optimizer_time(model, system, zero1)
+
+        assert time_zero1 < time_zero0 / 4
+
+    def test_muon_adam_residual_uses_memory_bound_path(self, monkeypatch):
+        """Muon's Adam residual must not be priced as BF16 TensorCore FLOPs."""
+        model = _make_mock_model()
+        system = _make_mock_system()
+        strategy = Strategy(
+            tp=1, pp=1, dp=8, micro_batch=1, global_batch=8,
+            optimizer=OptKind.MUON, zero_stage=1,
+            muon_config=MuonConfig(muon_param_fraction=0.0),
+        )
+
+        from zrt.training.compose import schedules
+        monkeypatch.setattr(schedules, "effective_flops", lambda *_args: 1e30)
+        time_s = schedules._compute_optimizer_time(model, system, strategy)
+
+        assert time_s * 1000 > 0.01
+
     def test_ep_sharding_factor_is_correct(self):
         """The EP-sharded optimizer time should be approximately 1/EP of the EP=1 time.
 
@@ -476,7 +526,7 @@ class TestComputeOptimizerTimeSharding:
             optimizer=OptKind.MUON, zero_stage=0,
         )
         strategy_ep8 = Strategy(
-            tp=1, pp=1, ep=8, dp=1, micro_batch=1, global_batch=1,
+            tp=1, pp=1, ep=8, dp=8, micro_batch=1, global_batch=1,
             optimizer=OptKind.MUON, zero_stage=0,
         )
 
@@ -491,6 +541,53 @@ class TestComputeOptimizerTimeSharding:
             f"EP=8 time ratio {ratio:.3f} should be in [0.10, 0.35] "
             f"(EP=1: {time_ep1:.4f}s, EP=8: {time_ep8:.4f}s)."
         )
+
+
+class TestExpertDPValidation:
+    """Strict EP/DP constraints required by distributed optimizer groups."""
+
+    def test_ep_requires_dp_divisible_by_ep(self):
+        model = _make_moe_model(num_experts=384)
+        system = SystemSpec(
+            gpu=GPU(name="test", flops_bf16=100, flops_fp8=200, hbm_gb=80, hbm_bw_gbps=3000),
+            host_mem_gb=128,
+            interconnect=InterconnectSpec(
+                intra_node=LinkSpec(type="NVLink", bandwidth_gbps=900, latency_us=1.0,
+                                    topology="all_to_all", num_devices=8),
+                inter_node=LinkSpec(type="IB", bandwidth_gbps=400, latency_us=5.0,
+                                    topology="fat_tree"),
+            ),
+            nodes=64,
+            gpus_per_node=8,
+        )
+        strategy = Strategy(tp=1, cp=1, pp=1, ep=384, dp=512)
+
+        with pytest.raises(ValueError, match="dp must be divisible by ep"):
+            strategy.validate(model, system)
+
+    def test_valid_ep_dp_pairs_still_validate(self):
+        model = _make_moe_model(num_experts=64)
+        system = _make_mock_system()
+
+        Strategy(tp=8, cp=1, pp=1, ep=2, dp=8).validate(model, system)
+        Strategy(tp=8, cp=1, pp=1, ep=8, dp=8).validate(model, system)
+
+    def test_muon_arch_flops_rejects_non_regular_ep_dp(self):
+        model = _make_moe_model(num_experts=64)
+        strategy = Strategy(tp=1, cp=1, pp=1, ep=8, dp=1, optimizer=OptKind.MUON)
+
+        with pytest.raises(ValueError, match="dp must be >= ep"):
+            muon_step_flops_from_arch(model, strategy, K=5)
+
+    def test_optimizer_compute_rejects_non_regular_ep_dp_for_adam(self):
+        model = _make_moe_model(num_experts=64)
+        system = _make_mock_system()
+        strategy = Strategy(tp=1, cp=1, pp=1, ep=8, dp=1, optimizer=OptKind.ADAM)
+
+        from zrt.training.compose.schedules import _compute_optimizer_time
+
+        with pytest.raises(ValueError, match="dp must be >= ep"):
+            _compute_optimizer_time(model, system, strategy)
 
 
 def _make_moe_model(num_experts: int = 64) -> ModelSpec:

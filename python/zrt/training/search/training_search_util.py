@@ -491,6 +491,8 @@ class TrainingConfigManager:
                             continue
 
                         for ep in ep_vals:
+                            if ep > 1 and (dp < ep or dp % ep != 0):
+                                continue
                             if model is not None and ep > 1:
                                 if model.num_experts <= 0:
                                     continue
@@ -740,7 +742,7 @@ def format_results(reports: List[TrainingReport], configs: List[Dict]) -> pd.Dat
         d["pp_exposed_ms"] = round(report.pp_exposed_ms, 2)
         d["dp_total_ms"] = round(report.dp_total_ms, 2)
         d["dp_exposed_ms"] = round(report.dp_exposed_ms, 2)
-        d["optimizer_compute_ms"] = round(report.optimizer_time_ms, 2)
+        d["optimizer_compute_ms"] = round(report.optimizer_time_ms, 4)
         d["optimizer_comm_ms"] = round(report.optimizer_comm_ms + report.optimizer_comm_hidden_ms, 2)
         d["optimizer_exposed_ms"] = round(report.optimizer_comm_ms, 2)
         d["recompute_time_ms"] = round(report.recompute_time_ms, 3)
@@ -998,7 +1000,8 @@ if __name__ == "__main__":
         "tp": [1, 2, 4, 8, 16],
         "cp": [1, 2, 4, 8, 16],
         "pp": [1, 2, 4, 8, 16],
-        "ep": [384],
+        # EP must divide DP under the current expert-DP sharding model.
+        "ep": [128],
         "dp": "auto",
         "micro_batch": [1, 16, 32],
         "global_batch": [512, 1024, 2048, 4096, 8192, 65536],

@@ -361,9 +361,10 @@ def optimizer_comm_time(
     Sharding groups (matches Megatron-Core distributed optimizer):
       - Non-routed params (dense + shared experts + embed/lm_head):
         sharded across the full DP group of size ``strategy.dp``.
-      - Routed-expert params: sharded across the **expert-DP** group of size
-        ``max(1, dp // ep)``. When ``dp == ep`` the expert-DP group has a
-        single rank and routed AG/RS is free.
+      - Routed-expert params: sharded across the **expert-DP** group. With EP
+        enabled this is ``dp // ep`` after requiring a regular expert-DP
+        layout; when ``dp == ep`` the expert-DP group has a single rank and
+        routed AG/RS is free.
 
     Returns: dict with "muon_ag" and "muon_rs" time in seconds.
     """
@@ -398,8 +399,9 @@ def optimizer_comm_time(
         from zrt.training.topology.comm_domain import CommDomain
         domain = CommDomain(system=system, strategy=strategy)
 
-    def _ag_rs(bytes_, group_size: int, group_kind: str) -> tuple[float, float]:
+    def _ag_rs(bytes_, group_kind: str) -> tuple[float, float]:
         """Cost the AG (+optional RS) over `group_kind` via the resolver."""
+        group_size = domain.group_size(group_kind)
         if group_size <= 1 or bytes_ <= 0:
             return 0.0, 0.0
         ag_c = Collective(
@@ -419,9 +421,8 @@ def optimizer_comm_time(
     # distributed optimizer convention) — size dp/ep, ranks orthogonal
     # to EP within a DP block. CommDomain knows both groups so the
     # tier resolution and α-β decomposition are correct for each.
-    ag_dense, rs_dense = _ag_rs(P_muon_non_routed * param_bytes, strategy.dp, "DP")
-    expert_dp = max(1, strategy.dp // strategy.ep) if strategy.ep > 1 else strategy.dp
-    ag_routed, rs_routed = _ag_rs(P_muon_routed * param_bytes, expert_dp, "EXPERT_DP")
+    ag_dense, rs_dense = _ag_rs(P_muon_non_routed * param_bytes, "DP")
+    ag_routed, rs_routed = _ag_rs(P_muon_routed * param_bytes, "EXPERT_DP")
 
     return {
         "muon_ag": ag_dense + ag_routed,

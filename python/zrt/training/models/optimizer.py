@@ -151,8 +151,8 @@ def muon_step_flops_from_arch(
 
     Sharding model (matches the rest of the simulator):
       * Routed experts are placed across the EP dimension; the remaining
-        DP/EP replica factor (``dp // ep``, clamped to ≥1) further splits
-        per-expert NS work under ZeRO-1/3.
+        DP/EP replica factor (``dp // ep``) further splits per-expert NS
+        work after requiring a regular expert-DP layout.
       * Attention + shared experts + dense FFN replicate across EP and are
         ZeRO-sharded across the **full** DP group.
       * All weight matrices are TP-column-sharded (NS still operates on the
@@ -164,6 +164,16 @@ def muon_step_flops_from_arch(
     ep = max(1, strategy.ep)
     pp = max(1, strategy.pp)
     dp = max(1, strategy.dp)
+    if ep > 1:
+        if dp < ep:
+            raise ValueError(
+                f"dp must be >= ep for expert-DP sharding (dp={dp}, ep={ep})"
+            )
+        if dp % ep != 0:
+            raise ValueError(
+                f"dp must be divisible by ep for expert-DP sharding "
+                f"(dp={dp}, ep={ep})"
+            )
 
     n_moe = sum(1 for l in model.layers if l.value == "moe")
     n_dense = sum(1 for l in model.layers if l.value == "dense")
@@ -191,7 +201,7 @@ def muon_step_flops_from_arch(
     # ── Per-rank split ────────────────────────────────────────────────
     # Routed expert work lands on ``ep`` distinct ranks; within an EP rank,
     # remaining DP replicas (``dp // ep``) further parallelize NS.
-    ep_dp_replica = max(1, dp // ep) if ep > 1 else dp
+    ep_dp_replica = dp // ep if ep > 1 else dp
     routed_per_rank_per_layer = routed_layer_full // (ep * ep_dp_replica)
 
     # Non-routed weights replicate across EP and split across full DP.
