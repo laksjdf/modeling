@@ -1247,7 +1247,9 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
             self._write_backward_ops_sheet(wb, bwd_graph, ctx)
             self._write_recompute_sheet(wb, bwd_graph)
         if training_summary is not None:
-            self._write_training_summary_sheet(wb, training_summary, bwd_graph or fwd_graph)
+            self._write_training_summary_sheet(
+                wb, training_summary, bwd_graph or fwd_graph, ctx
+            )
 
         wb.save(output_path)
         logger.info(f"Exported training graphs to {output_path}")
@@ -1425,10 +1427,16 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
 
         ws.freeze_panes = "A2"
 
-    def _write_training_summary_sheet(self, wb: openpyxl.Workbook, ts, graph: OpGraph | None = None) -> None:
+    def _write_training_summary_sheet(
+        self,
+        wb: openpyxl.Workbook,
+        ts,
+        graph: OpGraph | None = None,
+        ctx: TransformContext | None = None,
+    ) -> None:
         """Write TrainingSummary metrics as a key-value sheet."""
         if hasattr(ts, "step_time_ms"):
-            self._write_training_report_sheet(wb, ts, graph)
+            self._write_training_report_sheet(wb, ts, graph, ctx)
             return
 
         ws = wb.create_sheet("Training Summary")
@@ -1514,23 +1522,35 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
         ws.column_dimensions["B"].width = 28
 
     def _write_training_report_sheet(
-        self, wb: openpyxl.Workbook, report, graph: OpGraph | None = None
+        self,
+        wb: openpyxl.Workbook,
+        report,
+        graph: OpGraph | None = None,
+        ctx: TransformContext | None = None,
     ) -> None:
         """Write graph-native TrainingReport metrics as a key-value sheet."""
         ws = wb.create_sheet("Training Summary")
         ws.append(["Training Step Summary"])
         ws["A1"].font = Font(bold=True, size=13)
         recompute_compute_ms = (
-            graph.metadata.get("recompute_compute_ms", 0.0)
-            if graph is not None else 0.0
+            getattr(report, "recompute_compute_ms", 0.0)
+            or (graph.metadata.get("recompute_compute_ms", 0.0) if graph is not None else 0.0)
         )
+        metadata = graph.metadata if graph is not None else {}
+        model_name = getattr(ctx, "model_id", "") if ctx is not None else ""
+        hardware_name = (
+            getattr(getattr(ctx, "hw_spec", None), "name", "")
+            if ctx is not None else ""
+        )
+        batch_size = metadata.get("batch_size", "")
+        seq_len = metadata.get("seq_len", getattr(getattr(ctx, "training", None), "seq_len", ""))
 
         rows = [
-            ("Model", ""),
-            ("Hardware", ""),
+            ("Model", model_name),
+            ("Hardware", hardware_name),
             ("Parallelism", report.config_summary),
-            ("Batch size", ""),
-            ("Sequence length", ""),
+            ("Batch size", batch_size),
+            ("Sequence length", seq_len),
             ("", ""),
             ("=== Step Timing ===", ""),
             ("Step latency (ms)", round(report.step_time_ms, 3)),

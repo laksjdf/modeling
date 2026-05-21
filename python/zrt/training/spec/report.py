@@ -122,6 +122,7 @@ class TrainingReport:
     compute_time_ms: float = 0.0        # Useful compute on critical path, excluding bubble
     fwd_compute_ms: float = 0.0         # Forward compute only (excludes all comm)
     bwd_compute_ms: float = 0.0         # Backward compute (excludes comm AND recompute)
+    recompute_compute_ms: float = 0.0   # Graph-native external checkpoint replay compute
     recompute_time_ms: float = 0.0      # Activation-recompute fwd redo on critical path.
                                         # 0 with no recompute policy; >0 full/selective.
                                         # 0 also when recompute is on a non-bottleneck
@@ -216,6 +217,7 @@ class TrainingReport:
             "compute_time_ms": self.compute_time_ms,
             "fwd_compute_ms": self.fwd_compute_ms,
             "bwd_compute_ms": self.bwd_compute_ms,
+            "recompute_compute_ms": self.recompute_compute_ms,
             "recompute_time_ms": self.recompute_time_ms,
             "recompute_time_raw_ms": self.recompute_time_raw_ms,
             "exposed_comm_ms": self.exposed_comm_ms,

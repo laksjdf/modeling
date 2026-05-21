@@ -108,6 +108,8 @@ def build_pipeline(*, fusion: str = "v2") -> TransformPipeline:
              condition=lambda c: c.parallel.tp > 1)
     pipe.add("split", ExpertParallelPass(),
              condition=lambda c: c.parallel.ep > 1)
+    # ExpertGroupedMMPass consumes ExpertParallelPass ep_needs_a2a annotations
+    # and must run before CommInserterPass so EP A2A wraps fused MoE blocks.
     pipe.add("split", ExpertGroupedMMPass(),
              condition=lambda c: c.parallel.ep > 1)
     pipe.add("split", ContextParallelPass(),

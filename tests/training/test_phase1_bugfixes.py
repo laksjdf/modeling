@@ -242,8 +242,8 @@ def test_steady_steps_equals_num_microbatches():
 # ── Bug 3: FlopsPass gates _calculate_grad_flops on node phase ───────────
 
 def test_recompute_compute_time_excludes_comm_nodes_defensively():
-    compute = OpNode(
-        id="compute",
+    fwd_compute = OpNode(
+        id="fwd_compute",
         op_type="aten.silu.default",
         category="compute",
         annotations={
@@ -251,6 +251,17 @@ def test_recompute_compute_time_excludes_comm_nodes_defensively():
             "recompute": True,
             "latency_us": 100.0,
             "base_latency_us": 80.0,
+        },
+    )
+    bwd_compute = OpNode(
+        id="bwd_compute",
+        op_type="aten.silu.default",
+        category="compute",
+        annotations={
+            "phase": "bwd",
+            "recompute": True,
+            "latency_us": 90.0,
+            "base_latency_us": 70.0,
         },
     )
     comm = OpNode(
@@ -265,7 +276,7 @@ def test_recompute_compute_time_excludes_comm_nodes_defensively():
         },
     )
     g = _make_graph(
-        [compute, comm],
+        [fwd_compute, bwd_compute, comm],
         {"num_layers": 1, "num_layers_traced": 1, "training_flops": 1e12},
     )
     ctx = _make_ctx(pp=1, micro_batch=1, global_batch=1)
@@ -278,9 +289,10 @@ def test_recompute_compute_time_excludes_comm_nodes_defensively():
         MockSched.return_value.schedule.return_value = mock_timeline
         result = TrainingPipelinePass().run(g, ctx)
 
-    assert result.metadata["recompute_compute_ms"] == pytest.approx(0.08)
+    assert result.metadata["recompute_compute_ms"] == pytest.approx(0.15)
     metrics = result.metadata["pipeline_metrics"]
     assert metrics.fwd_compute_ms == 0.0
+    assert metrics.bwd_compute_ms == 0.0
     assert metrics.compute_time_ms == pytest.approx(metrics.recompute_compute_ms)
 
 

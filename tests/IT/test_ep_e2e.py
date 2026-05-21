@@ -57,6 +57,7 @@ def _run_estimate(ep, captured_model):
         hw_spec=hw, tp=_TP, ep=ep, hidden=_HIDDEN, num_layers=4,
         seq_len=_SEQ_LEN, batch_size=_BATCH,
         moe_total_experts=_NUM_EXPERTS, moe_active_experts=_MOE_ACTIVE,
+        model_id="hf_models/deepseek_v4",
         return_transformed=True,
     )
 
@@ -212,13 +213,21 @@ class TestEPE2E:
     def test_grouped_mm_exists(self, ep8_all):
         _, _, t = ep8_all
         grouped = [n for n in t["unified"].nodes.values() if n.op_type == "GroupedMatMul"]
-        assert len(grouped) >= 2, f"Expected >=2 GroupedMM, got {len(grouped)}"
+        assert len(grouped) == 16, f"Expected 16 GroupedMM, got {len(grouped)}"
 
     def test_grouped_mm_per_moe_layer(self, ep8_all):
         _, _, t = ep8_all
         grouped = [n for n in t["unified"].nodes.values() if n.op_type == "GroupedMatMul"]
-        assert len(grouped) >= 2 and len(grouped) % 2 == 0, \
-            f"Expected even count >=2 GroupedMM, got {len(grouped)}"
+        role_counts = {}
+        for node in grouped:
+            role = node.annotations.get("grouped_mm_role")
+            role_counts[role] = role_counts.get(role, 0) + 1
+        assert role_counts == {
+            "gate_up": 4,
+            "down": 4,
+            "down_bwd": 4,
+            "gate_up_bwd": 4,
+        }
 
     def test_grouped_mm_replaces_routed_experts(self, ep8_all):
         _, _, t = ep8_all
@@ -476,7 +485,8 @@ class TestEPE2E:
         ep_rows = [r for r in rows if r["Collective Op"] == "all_to_all"]
         roles = [r["Role"] for r in ep_rows]
         assert roles.count("dispatch") == roles.count("combine") > 0
-        expected = _BATCH * _SEQ_LEN * _HIDDEN * _MOE_ACTIVE * 2 // _EP
+        routed_tokens_per_ep_rank = (_BATCH * _SEQ_LEN * _MOE_ACTIVE + _EP - 1) // _EP
+        expected = routed_tokens_per_ep_rank * _HIDDEN * 2
         for row in ep_rows:
             assert row["Group Size"] == _EP
             assert int(row["Data Volume (bytes)"]) == expected
@@ -485,6 +495,10 @@ class TestEPE2E:
         summary = _summary_map(ep8_artifacts["excel"])
         assert "TP8" in str(summary["Parallelism"])
         assert "EP8" in str(summary["Parallelism"])
+        assert summary["Model"] == "hf_models/deepseek_v4"
+        assert summary["Hardware"] == "NVIDIA H100 SXM"
+        assert summary["Batch size"] == _BATCH
+        assert summary["Sequence length"] == _SEQ_LEN
         assert float(summary["Step latency (ms)"]) > 0
         assert str(summary["MFU"]).endswith("%")
 

@@ -137,7 +137,8 @@ def _run_estimate(policy, captured_model):
         backward_graph=captured_model.graphs["train_backward"],
         hw_spec=hw, tp=_TP, ep=_EP, hidden=_HIDDEN, num_layers=_LAYERS,
         seq_len=_SEQ, batch_size=_BATCH,
-        recompute_policy=policy, return_transformed=True,
+        recompute_policy=policy, model_id="hf_models/deepseek_v4",
+        return_transformed=True,
     )
 
 

@@ -729,20 +729,25 @@ class TrainingPipelinePass(GraphPass):
         bwd_compute_ms = sum(
             n.annotations.get("base_latency_us", n.annotations.get("latency_us", 0.0))
             for n in g.nodes.values()
-            if _is_bwd_node(n) and n.category != "communication"
+            if _is_bwd_node(n)
+            and n.category != "communication"
+            and not is_external_recompute_node(n)
         ) / 1000.0
         recompute_compute_ms = sum(
             n.annotations.get("base_latency_us", n.annotations.get("latency_us", 0.0))
             for n in g.nodes.values()
-            if not _is_bwd_node(n)
-            and n.category != "communication"
+            if n.category != "communication"
             and is_external_recompute_node(n)
         ) / 1000.0
         if layer_scale != 1.0:
             fwd_compute_ms *= layer_scale
             bwd_compute_ms *= layer_scale
             recompute_compute_ms *= layer_scale
-        # fwd_compute_ms and recompute_compute_ms are disjoint by construction.
+        # These buckets are mutually exclusive:
+        # - fwd_compute_ms excludes external checkpoint replay nodes
+        # - bwd_compute_ms uses backward base latency and also excludes any
+        #   defensive recompute annotations
+        # - recompute_compute_ms contains external checkpoint replay nodes
         compute_time_ms = fwd_compute_ms + bwd_compute_ms + recompute_compute_ms
 
         metrics = PipelineStepMetrics(

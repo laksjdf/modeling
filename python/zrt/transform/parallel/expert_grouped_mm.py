@@ -336,7 +336,7 @@ class ExpertGroupedMMPass(GraphPass):
             if e.src in old_ids and e.dst not in old_ids
             and not _reachable_from_old(e.dst)
         ]
-        if not in_edges:
+        if not in_edges or not out_edges:
             return
 
         down_id = f"{layer_key.replace('.','_')}_grouped_down_bwd"

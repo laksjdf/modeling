@@ -366,6 +366,9 @@
 # 12. MoE  (line 609)  — full dispatch: Gate + bincount + N×Expert + all_reduce
 #     + shared_experts.
 #     The class-level fusion conflicts with the per-expert GroupedMM fusion.
+#     TODO: If a future DSv4 report mode does not need per-expert/GroupedMM
+#     detail, re-enable this only in a fusion config that does not run
+#     ExpertGroupedMMPass.
 # ─────────────────────────────────────────────────────────────────────────────
 #- target_class: MoE
 #  op_type: moe_dispatch
