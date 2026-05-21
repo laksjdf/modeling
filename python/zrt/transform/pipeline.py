@@ -91,6 +91,7 @@ def build_pipeline(*, fusion: str = "v2") -> TransformPipeline:
         FlopsPass, RooflinePass, CommLatencyPass, StreamAssignPass,
         TrainingFlopsPass, TrainingMemoryPass, TrainingPipelinePass,
     )
+    from python.zrt.transform.analysis.tilesim_pass import TilesimLatencyPass
     from python.zrt.transform.training.zero_fsdp import ZeroFSDPPass
     from python.zrt.transform.training.recompute import RecomputePass
     from python.zrt.transform.training.optimizer import OptimizerPass
@@ -145,6 +146,8 @@ def build_pipeline(*, fusion: str = "v2") -> TransformPipeline:
     # ── Stage 4: Analyze ──────────────────────────────────────────────────────
     pipe.add("analyze", FlopsPass())
     pipe.add("analyze", RooflinePass())
+    pipe.add("analyze", TilesimLatencyPass(),
+             condition=lambda c: c.tilesim)
     pipe.add("analyze", CommLatencyPass())
     pipe.add("analyze", StreamAssignPass())
     pipe.add("analyze", TrainingFlopsPass(),    condition=is_train)
