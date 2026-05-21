@@ -91,16 +91,16 @@ class DataParallelPass(GraphPass):
 
         self._insert_after(g, last_bwd_node, comm_node)
 
-            # 在 DataParallelPass 中，comm_node 之后插入
-            scale_node = OpNode(
-                id=f"grad_scale_layer_{layer_key}",
-                op_type="aten.div.Scalar",
-                attrs={"divisor": dp, "role": "dp_grad_average"},
-                category="compute",
-            )
-            scale_node.annotations["inserted_by"] = "data_parallel_pass"
-            scale_node.annotations["phase"] = "bwd"
-            self._insert_after(g, comm_node, scale_node)
+        # 在 DataParallelPass 中，comm_node 之后插入
+        scale_node = OpNode(
+            id=f"grad_scale_layer",
+            op_type="aten.div.Scalar",
+            attrs={"divisor": dp, "role": "dp_grad_average"},
+            category="compute",
+        )
+        scale_node.annotations["inserted_by"] = "data_parallel_pass"
+        scale_node.annotations["phase"] = "bwd"
+        self._insert_after(g, comm_node, scale_node)
 
         return g
 
