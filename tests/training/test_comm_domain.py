@@ -214,6 +214,53 @@ def test_optimizer_comm_time_accepts_shared_domain():
     assert res_with["muon_ag"] > 0  # ZeRO-1 Muon → real cost
 
 
+def test_expert_dp_group_size_rejects_non_divisible_dp_ep():
+    sys = _three_tier_system(world_size=512)
+    s = Strategy(tp=1, cp=1, ep=384, dp=512, pp=1)
+    d = CommDomain(system=sys, strategy=s)
+
+    with pytest.raises(ValueError, match="dp must be divisible by ep"):
+        d.group_size("EXPERT_DP")
+
+
+def test_n_tier_time_uses_max_group_instance_not_rank0_only():
+    """Some EXPERT_DP instances cross a slower tier even when rank0 does not."""
+    tray = LinkSpec(type="NVLink5", bandwidth_gbps=1800, latency_us=0.5,
+                    topology="all_to_all", num_devices=4, kb_efficiency=0.85)
+    rack = LinkSpec(type="NVSwitch5", bandwidth_gbps=900, latency_us=1.0,
+                    topology="all_to_all", num_devices=72, kb_efficiency=0.75)
+    rail = LinkSpec(type="IB_XDR_rail", bandwidth_gbps=800, latency_us=2.0,
+                    topology="fat_tree", num_devices=576, kb_efficiency=0.7)
+    spine = LinkSpec(type="IB_XDR_spine", bandwidth_gbps=400, latency_us=5.0,
+                     topology="fat_tree", num_devices=0, kb_efficiency=0.6)
+    sys = SystemSpec(
+        gpu=GPU(name="b300", flops_bf16=5000, flops_fp8=10000,
+                hbm_gb=288, hbm_bw_gbps=8000),
+        host_mem_gb=512,
+        interconnect=InterconnectSpec(tiers=[
+            TopologyTier(name="tray", link=tray),
+            TopologyTier(name="rack", link=rack),
+            TopologyTier(name="rail", link=rail),
+            TopologyTier(name="spine", link=spine),
+        ]),
+        nodes=32,
+        gpus_per_node=4,
+        world_size_override=128,
+    )
+    s = Strategy(tp=4, cp=2, ep=2, dp=8, pp=2)
+    d = CommDomain(system=sys, strategy=s)
+    c = Collective("x", "AG", "EXPERT_DP", 100 * 1024 * 1024, "op")
+
+    rank0_time = collective_time_multi_tier(c, d.ranks("EXPERT_DP"), sys)
+    expected_max = max(
+        collective_time_multi_tier(c, ranks, sys)
+        for ranks in d.groups.expert_dp_groups
+    )
+
+    assert expected_max > rank0_time
+    assert d.time(c) == pytest.approx(expected_max, rel=1e-12)
+
+
 def test_pp_p2p_time_accepts_shared_domain():
     sys = _three_tier_system(world_size=512)
     s = Strategy(tp=4, cp=2, ep=1, dp=16, pp=4, micro_batch=1)

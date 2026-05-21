@@ -15,11 +15,9 @@ from zrt.training.topology import CommDomain
 from zrt.training.models.flops import recompute_overhead_flops
 from zrt.training.models.memory import MemBreakdown, memory_breakdown
 from zrt.training.models.optimizer import (
-    muon_optimizer_step_flops,
     muon_step_flops_from_arch,
-    adam_step_flops,
 )
-from zrt.training.io.perf_tables import effective_flops
+from zrt.training.io.perf_tables import effective_flops, effective_hbm_bw_bps
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import ModelSpec
 from zrt.training.spec.strategy import PPSched, Strategy, resolve_muon_ns_steps
@@ -1014,6 +1012,16 @@ def _assign_stages(model: ModelSpec, strategy: Strategy) -> list[list[int]]:
     return stages
 
 
+_ADAM_UPDATE_BYTES_PER_PARAM = 28
+
+
+def _adam_optimizer_step_time(params: int, system: SystemSpec) -> float:
+    """Memory-bound Adam update time for FP32 master/grad/m/v state."""
+    bytes_ = max(0, int(params)) * _ADAM_UPDATE_BYTES_PER_PARAM
+    bw = effective_hbm_bw_bps(system.gpu, bytes_)
+    return bytes_ / bw if bw > 0 else 0.0
+
+
 def _compute_optimizer_time(model: ModelSpec, system: SystemSpec, strategy: Strategy) -> float:
     """Compute optimizer step time in seconds.
 
@@ -1022,6 +1030,17 @@ def _compute_optimizer_time(model: ModelSpec, system: SystemSpec, strategy: Stra
     from zrt.training.spec.model import LayerKind
 
     P = model.total_params()
+    if strategy.ep > 1:
+        if strategy.dp < strategy.ep:
+            raise ValueError(
+                f"dp must be >= ep for expert-DP sharding "
+                f"(dp={strategy.dp}, ep={strategy.ep})"
+            )
+        if strategy.dp % strategy.ep != 0:
+            raise ValueError(
+                f"dp must be divisible by ep for expert-DP sharding "
+                f"(dp={strategy.dp}, ep={strategy.ep})"
+            )
     if strategy.tp > 1:
         P //= strategy.tp
     if strategy.pp > 1:
@@ -1065,14 +1084,12 @@ def _compute_optimizer_time(model: ModelSpec, system: SystemSpec, strategy: Stra
         # inventory. The legacy P/hidden² path clamps num_matrices to 1
         # under ZeRO-3 + EP and yields a constant ~8 ms across the grid.
         muon_flops = muon_step_flops_from_arch(model, strategy, K, f_muon)
-        adam_flops = adam_step_flops(int(P * (1 - f_muon)))
-        flops = muon_flops + adam_flops
-        eff_flops = effective_flops(gpu, Dtype.BF16, flops)
-        return flops / eff_flops if eff_flops > 0 else 0.0
+        eff_flops = effective_flops(gpu, Dtype.BF16, muon_flops)
+        muon_time = muon_flops / eff_flops if eff_flops > 0 else 0.0
+        adam_time = _adam_optimizer_step_time(int(P * (1 - f_muon)), system)
+        return muon_time + adam_time
     else:
-        flops = adam_step_flops(P)
-        eff_flops = effective_flops(gpu, Dtype.BF16, flops)
-        return flops / eff_flops if eff_flops > 0 else 0.0
+        return _adam_optimizer_step_time(P, system)
 
 
 def _compute_optimizer_comm_time(

@@ -107,13 +107,13 @@ class CommDomain:
     def group_size(self, kind: str) -> int:
         """Degree of one parallel dimension; size of one group instance.
 
-        ``EXPERT_DP`` returns ``max(1, dp // ep)`` per Megatron-Core's
-        distributed-optimizer convention (routed-expert AG/RS group).
+        ``EXPERT_DP`` uses Megatron-Core's distributed-optimizer convention
+        for routed-expert AG/RS: ``dp`` when EP is disabled, otherwise
+        ``dp // ep`` after requiring a regular expert-DP layout.
         """
         kind = kind.upper()
         if kind in ("EXPERT_DP", "EDP"):
-            ep = max(self.strategy.ep, 1)
-            return max(1, self.strategy.dp // ep) if ep > 1 else self.strategy.dp
+            return self._expert_dp_group_size()
         return {
             "TP": self.strategy.tp,
             "CP": self.strategy.cp,
@@ -121,6 +121,36 @@ class CommDomain:
             "DP": self.strategy.dp,
             "PP": 2,  # P2P between adjacent stages
         }.get(kind, 1)
+
+    def _expert_dp_group_size(self) -> int:
+        ep = max(self.strategy.ep, 1)
+        dp = max(self.strategy.dp, 1)
+        if ep <= 1:
+            return dp
+        if dp < ep:
+            raise ValueError(
+                f"dp must be >= ep for expert-DP sharding (dp={dp}, ep={ep})"
+            )
+        if dp % ep != 0:
+            raise ValueError(
+                f"dp must be divisible by ep for expert-DP sharding "
+                f"(dp={dp}, ep={ep})"
+            )
+        return dp // ep
+
+    def group_instances(self, kind: str) -> list[list[int]]:
+        """All non-degenerate rank instances for ``kind``.
+
+        N-tier pricing uses the slowest instance, not just rank 0's
+        canonical group, because some instances can cross a higher tier.
+        """
+        kind = kind.upper()
+        if kind not in _VALID_KINDS:
+            return []
+        if kind in ("EXPERT_DP", "EDP"):
+            self._expert_dp_group_size()
+        attr = self.groups._kind_to_attr(kind)
+        return [list(g) for g in getattr(self.groups, attr, []) if len(g) > 1]
 
     def ranks(self, kind: str) -> list[int]:
         """Explicit rank set for one instance of ``kind``.
@@ -218,10 +248,13 @@ class CommDomain:
             return 0.0
 
         if self._use_multi_tier:
-            ranks = self.ranks(c.group)
-            if ranks and len(ranks) > 1:
-                return collective_time_multi_tier(c, ranks, self.system)
-            if not ranks and self.group_size(c.group) <= 1:
+            groups = self.group_instances(c.group)
+            if groups:
+                return max(
+                    collective_time_multi_tier(c, ranks, self.system)
+                    for ranks in groups
+                )
+            if not groups and self.group_size(c.group) <= 1:
                 return 0.0
             # Otherwise (rare: degenerate ParallelGroups but non-trivial
             # strategy degree) fall through to legacy size-only.

@@ -240,6 +240,16 @@ class Strategy:
                 errors.append(
                     f"num_experts({model.num_experts}) not divisible by EP({self.ep})"
                 )
+            if self.dp < self.ep:
+                errors.append(
+                    f"dp must be >= ep for expert-DP sharding "
+                    f"(dp={self.dp}, ep={self.ep})"
+                )
+            elif self.dp % self.ep != 0:
+                errors.append(
+                    f"dp must be divisible by ep for expert-DP sharding "
+                    f"(dp={self.dp}, ep={self.ep})"
+                )
 
         if self.zero_stage >= 1 and self.dp <= 1:
             errors.append(f"ZeRO-{self.zero_stage} requires DP > 1")
