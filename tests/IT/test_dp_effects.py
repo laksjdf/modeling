@@ -16,7 +16,7 @@ JSON-report checks:
 XLSX operator checks (DataParallel validation):
 - dp=1 → no DP comm nodes in "Communication Ops" sheet
 - dp>1 → DP comm nodes exist with correct collective type, group_size, role
-- one DP comm node per layer (4 layers with --layers 4)
+- one DP comm node total (aligned with estimate path)
 - each DP comm node has a matching grad-scale node (aten.div.Scalar) via Node ID
 - "Parallelism Summary" sheet references data_parallel_pass
 
