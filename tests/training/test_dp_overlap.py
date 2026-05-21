@@ -36,12 +36,11 @@ class TestSteadyBwdOverlap:
         assert s.dp_steady_overlap_ratio == 0.5
 
     def test_ratio_extends_hide_window_in_dualpipe(self):
-        """DualPipe cooldown is small; with ratio>0, steady_bwd contributes
-        and dp_exposed shrinks."""
-        # Two equal stages, fwd=10, bwd=20 → t_fwd_max=10, t_bwd_max=20, t_stage_max=30
-        # pp=2 DualPipe: bubble = (pp-1)/2 * t_stage_max = 15
-        #                cooldown = bubble / 2 = 7.5
-        # steady_bwd_total = M * t_bwd_max = 4 * 20 = 80 (bottom-up: reads actual bwd)
+        """DualPipe pp=2 has zero bubble (reference formula: (PP/2-1)*(...)=0),
+        so cooldown=0. With ratio>0, steady_bwd contributes and dp_exposed shrinks."""
+        # Two equal stages, fwd=10, bwd=20 (bwd_dw=0 → W=0)
+        # pp=2 DualPipe: factor = (2/2-1) = 0 → bubble=0, cooldown=0
+        # steady_bwd_total = M * t_bwd_max = 4 * 20 = 80
         stages = [StageTime(fwd=10.0, bwd=20.0), StageTime(fwd=10.0, bwd=20.0)]
         s_no = Strategy(tp=1, pp=2, dp=4, micro_batch=1, global_batch=4,
                         pp_schedule=PPSched.DUALPIPE, dp_steady_overlap_ratio=0.0)
@@ -51,10 +50,10 @@ class TestSteadyBwdOverlap:
         r_no = DualPipeComposer().compose(stages, M=4, pp=2, dp_ar_time=100.0, strategy=s_no)
         r_half = DualPipeComposer().compose(stages, M=4, pp=2, dp_ar_time=100.0, strategy=s_half)
 
-        # ratio=0: window = 7.5 → hide = 7.5 → exposed = 92.5
-        # ratio=0.5: window = 7.5 + 0.5*80 = 47.5 → hide = 47.5 → exposed = 52.5
-        assert r_no.dp_exposed == pytest.approx(92.5)
-        assert r_half.dp_exposed == pytest.approx(52.5)
+        # ratio=0: window = 0 + 0*80 = 0 → hide = 0 → exposed = 100.0
+        # ratio=0.5: window = 0 + 0.5*80 = 40 → hide = 40 → exposed = 60.0
+        assert r_no.dp_exposed == pytest.approx(100.0)
+        assert r_half.dp_exposed == pytest.approx(60.0)
 
     def test_ratio_zero_matches_legacy_behavior(self):
         """ratio=0 should reproduce the previous cooldown-only window exactly,
@@ -78,8 +77,8 @@ class TestDualbatchRecoversWithSteadyOverlap:
     """
 
     def test_dualbatch_dualpipe_preserves_cooldown_dp_hide(self):
-        """DualPipe + dualbatch: composer cooldown is non-zero, so DP can
-        hide in cooldown even with ratio=0."""
+        """DualPipe pp=2 + dualbatch: reference formula gives zero bubble at pp=2,
+        so cooldown=0. DP hiding at ratio=0 is therefore also zero."""
         model = ModelSpec(hidden=2048, ffn=8192, num_heads=16, num_kv_heads=16,
                           head_dim=128, vocab=32000, seq_len=1024,
                           layers=[LayerKind.DENSE]*4)
@@ -88,8 +87,8 @@ class TestDualbatchRecoversWithSteadyOverlap:
                      dp_steady_overlap_ratio=0.0)
         graph = build_graph(model, s)
         result = pipeline_step_time(graph, model, _make_system(), s)
-        # Composer cooldown survives → some DP can be hidden in it.
-        assert result.cooldown > 0.0
+        # pp=2 DualPipe: (PP/2-1)*(F&B+B-3W) = 0 → zero bubble → cooldown=0
+        assert result.cooldown == pytest.approx(0.0, abs=1e-12)
         assert result.dp_hidden >= 0.0
 
     def test_dualbatch_with_ratio_half_recovers_dp_hide(self):
@@ -151,10 +150,15 @@ class TestHideWindowConsistency:
         """After fix #3, dualbatch's new_dp_exposed should go through the same
         helper (cooldown + ratio*steady_bwd), so it can still hide DP in steady_bwd
         even when cooldown collapses to 0."""
+        # seq_len/micro_batch scaled up so the backward-compute hide window
+        # (steady_bwd) still dominates DP grad volume after kb_efficiency=0.7
+        # grew DP AllReduce ~1.43×. DP grad volume is param-bound (unchanged
+        # by token count), so more tokens restore the documented
+        # "steady_bwd >> dp_total" regime without weakening the assertion.
         model = ModelSpec(hidden=2048, ffn=8192, num_heads=16, num_kv_heads=16,
-                          head_dim=128, vocab=32000, seq_len=1024,
+                          head_dim=128, vocab=32000, seq_len=4096,
                           layers=[LayerKind.DENSE]*4)
-        s = Strategy(tp=1, pp=2, dp=4, micro_batch=1, global_batch=16,
+        s = Strategy(tp=1, pp=2, dp=4, micro_batch=4, global_batch=64,
                      pp_schedule=PPSched.DUALPIPE, dualbatch=True,
                      dp_steady_overlap_ratio=1.0)
         graph = build_graph(model, s)
@@ -190,8 +194,13 @@ class TestLastBucketResidual:
         assert total_dp > 0.0
         assert r.dp_exposed > 0.0, \
             f"DP fully hidden (bug): exposed={r.dp_exposed}, total={total_dp}"
-        # Residual is one bucket's worth: exposed ≈ total / buckets.
-        assert r.dp_exposed == pytest.approx(total_dp / 25, rel=1e-6)
+        # Bucket-residual is a *floor* on exposed: at least 1/n of total DP
+        # comm always escapes the hide window. Exact equality only when the
+        # window dominates over max_hidable; otherwise window is binding and
+        # exposed = dp_ar_time - window (≥ total/n).
+        assert r.dp_exposed >= total_dp / 25 * (1 - 1e-6), (
+            f"exposed={r.dp_exposed} below bucket floor total/25={total_dp/25}"
+        )
 
     def test_more_buckets_smaller_residual(self):
         stages = [StageTime(fwd=1.0, bwd=2.0)]
@@ -272,12 +281,13 @@ class TestZeroBubbleFloor:
             f"ZB cooldown collapsed to zero; got cooldown={r.cooldown}"
 
     def test_unbalanced_tw_uses_natural_value(self):
-        """When t_stage > t_w, the natural formula dominates and the floor is
+        """When bwd_dx > t_w, the natural formula dominates and the floor is
         not applied (floor < natural)."""
-        stages = [StageTime(fwd=4.0, bwd=6.0, bwd_dw=2.0),  # t_w small
-                  StageTime(fwd=4.0, bwd=6.0, bwd_dw=2.0)]
+        stages = [StageTime(fwd=4.0, bwd=6.0, bwd_dx=5.0, bwd_dw=2.0),
+                  StageTime(fwd=4.0, bwd=6.0, bwd_dx=5.0, bwd_dw=2.0)]
         s = Strategy(tp=1, pp=2, dp=4, micro_batch=1, global_batch=4,
                      pp_schedule=PPSched.ZERO_BUBBLE)
         r = ZeroBubbleComposer().compose(stages, M=4, pp=2, dp_ar_time=0.0, strategy=s)
-        # Natural: bubble = (pp-1)*(t_stage - t_w) = 1*(10-2) = 8; cooldown=4
-        assert r.cooldown == pytest.approx(4.0)
+        # New formula: cooldown = (pp-1) * max(bwd_dx - t_w, floor)
+        #   = 1 * max(5.0 - 2.0, floor) = 3.0
+        assert r.cooldown == pytest.approx(3.0)

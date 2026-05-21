@@ -3,8 +3,20 @@
 from __future__ import annotations
 
 from zrt.training.ir.training_graph import Collective, Graph
-from zrt.training.spec.model import ModelSpec
+from zrt.training.spec.model import LayerKind, ModelSpec
 from zrt.training.spec.strategy import CPKind, Strategy
+
+
+def _is_moe_layer(model: ModelSpec, layer_id: int) -> bool:
+    """True when the layer at ``layer_id`` is a MoE block.
+
+    Used to pick activation dtype for FFN-side TP collectives — MoE FFN
+    runs in ``effective_moe_act_dtype`` while dense FFN stays at
+    ``act_dtype``.
+    """
+    if 0 <= layer_id < len(model.layers):
+        return model.layers[layer_id] == LayerKind.MOE
+    return False
 
 
 class ShardPlan:
@@ -99,19 +111,30 @@ def _insert_tp_collectives(
     h_attn = model.num_heads * model.head_dim
     h_kv = model.num_kv_heads * model.head_dim
     ffn = model.ffn
-    act_bytes = model.act_dtype.bytes
-    
+    # v2 region-level dtype: AG/RS around attention use attn region's
+    # activation dtype; FFN-side use the dense/MoE region. For MoE layers
+    # the FFN-side TP collectives wrap shared/routed experts → use moe_act.
+    act_bytes = model.act_dtype.bytes               # legacy / fallback / TP-shape metadata
+    attn_act_bytes = model.effective_attn_act_dtype().bytes
+    moe_act_bytes = model.effective_moe_act_dtype().bytes
+
     # When CP is enabled, sequence is already sharded by CP
     # TP AG/RS should operate on the CP-sharded sequence
     if shard.cp > 1:
         seq = seq // shard.cp
 
     for layer_id, (start, end) in graph.layer_index.items():
-        # Compute payload sizes (after CP sharding, before TP sharding)
-        ag_attn_bytes = seq * h * act_bytes  # AG before QKV
-        rs_attn_bytes = seq * h * act_bytes  # RS after O_proj
-        ag_ffn_bytes = seq * h * act_bytes   # AG before FFN up
-        rs_ffn_bytes = seq * h * act_bytes   # RS after FFN down
+        # AG before QKV gathers an x_ln1 tile (attention region dtype after
+        # the fused LN epilog in v2 builders). RS after O_proj scatters
+        # attn_proj which is in the same dtype.
+        ag_attn_bytes = seq * h * attn_act_bytes  # AG before QKV
+        rs_attn_bytes = seq * h * attn_act_bytes  # RS after O_proj
+        # FFN AG/RS: in a dense block this wraps the dense FFN (act_dtype);
+        # in MoE this wraps shared expert ups/downs (moe_act). Pick the
+        # right dtype using the layer's kind from layer_index.
+        ffn_bytes_per = moe_act_bytes if _is_moe_layer(model, layer_id) else act_bytes
+        ag_ffn_bytes = seq * h * ffn_bytes_per   # AG before FFN up
+        rs_ffn_bytes = seq * h * ffn_bytes_per   # RS after FFN down
 
         for i in range(start, end):
             op = graph.ops[i]
@@ -186,7 +209,9 @@ def _insert_cp_collectives(
     h = model.hidden
     if shard.tp > 1:
         h = h // shard.tp
-    act_bytes = model.act_dtype.bytes
+    # CP shards the sequence INSIDE the attention region, so activation
+    # bytes use the attention region dtype (FP8 in mixed-quant V4).
+    act_bytes = model.effective_attn_act_dtype().bytes
     cp = shard.cp
 
     # If cp_kind is NONE, skip collective insertion but still apply
@@ -396,7 +421,10 @@ def _insert_ep_collectives(
     if shard.cp > 1:
         seq = seq // shard.cp
     moe_ffn = model.moe_ffn if model.moe_ffn > 0 else model.ffn
-    act_bytes = model.act_dtype.bytes
+    # v2: EP A2A dispatches tokens INTO the MoE region — payload should
+    # use the MoE region's activation dtype (FP8 in mixed-quant V4 →
+    # halves the A2A volume vs BF16 baseline).
+    act_bytes = model.effective_moe_act_dtype().bytes
 
     # EP A2A payload: micro_batch * seq * hidden * topk * dtype / EP
     # Each token is routed to topk experts, but A2A distributes tokens across EP ranks

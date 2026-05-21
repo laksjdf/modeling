@@ -365,35 +365,39 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # 12. MoE  (line 609)  — full dispatch: Gate + bincount + N×Expert + all_reduce
 #     + shared_experts.
+#     The class-level fusion conflicts with the per-expert GroupedMM fusion.
+#     TODO: If a future DSv4 report mode does not need per-expert/GroupedMM
+#     detail, re-enable this only in a fusion config that does not run
+#     ExpertGroupedMMPass.
 # ─────────────────────────────────────────────────────────────────────────────
-- target_class: MoE
-  op_type: moe_dispatch
-  name: moe_dispatch
-  description: "Full MoE dispatch: Gate + bincount + N x Expert + all_reduce + shared_experts"
-  default_phases: [inference, training]
-  priority: 38
-  match:
-    kind: class_only
-  io_roles:
-    - {role: activation, source_kind: input,  source_op_index: 0,  source_arg_index: 0,  shape_role: "[B,S,H]"}
-    - {role: output,     source_kind: output, source_op_index: -1, source_arg_index: -1, shape_role: "[B,S,H]"}
-  shape_derivation:
-    batch_size: "activation.shape[0]"
-    seq_len:    "activation.shape[1]"
-    hidden_in:  "activation.shape[-1]"
-    hidden_out: "output.shape[-1]"
-    extra:
-      - [num_tokens, "batch_size * seq_len"]
-      # Activated experts ≈ 2 (n_activated_experts default), inter_dim proxy = hidden / 4.
-      - [activated_proxy, "2"]
-      - [inter_proxy, "max(1, hidden_in // 4)"]
-  # Approx: routing GEMM (2 * T * H * E ≈ 2 * T * H * 8) + activated experts each contribute
-  # 6 * T * H * inter (treated by the Expert rule when expanded; here we coarse-sum).
-  flops_formula: "6 * num_tokens * hidden_in * inter_proxy * activated_proxy + 16 * num_tokens * hidden_in"
-  memory_formula: "activation.bytes + output.bytes * 2"
-  annotations:
-    component: moe_dispatch
-    comm: all_reduce
+#- target_class: MoE
+#  op_type: moe_dispatch
+#  name: moe_dispatch
+#  description: "Full MoE dispatch: Gate + bincount + N x Expert + all_reduce + shared_experts"
+#  default_phases: [inference, training]
+#  priority: 38
+#  match:
+#    kind: class_only
+#  io_roles:
+#    - {role: activation, source_kind: input,  source_op_index: 0,  source_arg_index: 0,  shape_role: "[B,S,H]"}
+#    - {role: output,     source_kind: output, source_op_index: -1, source_arg_index: -1, shape_role: "[B,S,H]"}
+#  shape_derivation:
+#    batch_size: "activation.shape[0]"
+#    seq_len:    "activation.shape[1]"
+#    hidden_in:  "activation.shape[-1]"
+#    hidden_out: "output.shape[-1]"
+#    extra:
+#      - [num_tokens, "batch_size * seq_len"]
+#      # Activated experts ≈ 2 (n_activated_experts default), inter_dim proxy = hidden / 4.
+#      - [activated_proxy, "2"]
+#      - [inter_proxy, "max(1, hidden_in // 4)"]
+#  # Approx: routing GEMM (2 * T * H * E ≈ 2 * T * H * 8) + activated experts each contribute
+#  # 6 * T * H * inter (treated by the Expert rule when expanded; here we coarse-sum).
+#  flops_formula: "6 * num_tokens * hidden_in * inter_proxy * activated_proxy + 16 * num_tokens * hidden_in"
+#  memory_formula: "activation.bytes + output.bytes * 2"
+#  annotations:
+#    component: moe_dispatch
+#    comm: all_reduce
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 13. Block.hc_pre  (line 673) — Sinkhorn-routed pre-norm + linear-routing block.

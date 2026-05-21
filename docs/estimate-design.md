@@ -532,16 +532,86 @@ flowchart TD
     end
 ```
 
-**Pipeline 公式：**
+#### 7.2.1 流水线并行空泡分阶段计算表
 
-| Schedule | Warmup | Steady | Cooldown | 特点 |
-|----------|--------|--------|----------|------|
-| 1F1B | `(pp-1) × max(fwd)` | `M × max(fwd+bwd)` | `(pp-1) × max(bwd)` | 基础调度 |
-| VPP/i1f1B | warmup ÷ V | same | cooldown ÷ V | Virtual stages |
-| DualPipe | bubble ÷ 4 | `M × t_stage` | bubble ÷ 4 | F/B parallel |
-| ZeroBubble | `(pp-1) × max(t_stage - t_w)` | same | same | dW delay fills bubble |
+流水线并行的全生命周期可划分为三个阶段：
+1. **Warmup（预热阶段）**：数据从输入端向流水线末端流动，系统逐渐满载的过程。
+2. **Steady（稳定阶段）**：所有物理/逻辑阶段均在满负荷并行处理数据，此阶段全系统空泡为 0。
+3. **Cooldown（冷却/刷新阶段）**：前向传播全部结束，系统依次清空剩余的反向传播直至完全退出的过程。
 
-**StepResult 关键字段：**
+下表对比了在相同流水线并行深度下，各策略的空泡来源与显存、物理设备开销：
+
+| 流水线方法 | Warmup 空泡 | Steady 空泡 | Cooldown 空泡 | 总空泡计算公式 (Total Bubble Time) | 参数显存 (Per Device) | 激活值显存 (Per Device) | 物理设备数 (#Devices) |
+| :--- | :--- | :--- | :--- | :--- | :---: | :---: | :---: |
+| 1F1B | (PP-1) * F | 0 | (PP-1) * B | (PP-1)(F+B) | 1x | PP | PP |
+| VPP (每个设备 v 个阶段) | (PP-1)/v * F | 0 | (PP-1)/v * B | (PP-1)/v * (F+B) | 1x | PP | PP |
+| ZB1P (Zero Bubble) | (PP-1)(F-W) | 0 | (PP-1)(B-W) | (PP-1)(F+B-2W) | 1x | > PP | PP |
+| DualPipe (DeepSeek) | (PP/2-1)(F&B - 2W) | 0 | (PP/2-1)(B - W) | (PP/2-1)(F&B+B-3W) | 2x | PP+1 | PP |
+| DualPipeV | (PP/2-1)(F&B - 2W) | 0 | (PP/2-1)(B - W) | (PP/2-1)(F&B+B-3W) | 2x | PP+1 | PP/2 |
+
+#### 7.2.2 核心参数与符号物理意义
+
+**时间与计算类参数（单位：毫秒 ms）：**
+
+| 符号 | 含义 |
+|------|------|
+| **F (Forward)** | 单个微批次在前向传播中通过一个流水线阶段所需的计算与通信时间。 |
+| **B (Backward for Activation Gradient)** | 单个微批次在反向传播中，仅计算输入激活值梯度所需的耗时，包含通信时间。 |
+| **W (Backward for Weight Gradient)** | 单个微批次在反向传播中，仅计算模型权重梯度所需的耗时。它不需要在设备间传递，执行顺序灵活。 |
+| **F&B (Forward & Backward Overlap)** | 在前向和反向并行重叠执行的总耗时。通常满足：max(F, B) < F&B < F + B。 |
+
+**架构与配置类参数：**
+
+| 符号 | 含义 |
+|------|------|
+| **PP (Pipeline Parallelism Stages)** | 流水线并行的层级切分阶段总数。整个大模型会被切分成 PP 个逻辑切片。 |
+| **v (Interleaved Count / Virtual Stages)** | 在 VPP 策略中，每个物理设备所负责的虚拟阶段数量。 |
+
+#### 7.2.3 核心优化原理
+
+| 策略 | 优化原理 |
+|------|---------|
+| **VPP** | **化整为零**：不改变计算总耗时，但通过将阶段切细，让第一个微批次快速冲到流水线末端，从而将等待时间等比例缩小 v 倍。 |
+| **ZB1P** | **拼图填空**：将反向传播拆解为 B 和 W。在系统原本闲置的空泡时间里安排设备去计算 W，在公式上体现为扣减了 2W 的时间。 |
+| **DualPipe** | **双向对冲与跨阶段重合**：微批次从头尾两侧双向对冲输入，使流水线的实际关键路径深度直接减半；同时在稳定期实现 F&B 高度重叠，在边缘期压榨出最多 3 个 W 的时间来填补空泡。 |
+
+#### 7.2.4 P2P 残余空泡（ZB_BUBBLE_FLOOR）
+
+**问题背景：** 文档公式假设理想情况——W 可完全填充空泡。但实际存在不可消除的残余：
+
+```
+Pipeline Stage 0          Stage 1          Stage 2
+
+[F] ──P2P──▶ [F] ──P2P──▶ [F]
+         │          │
+      ~2µs      ~2µs    ← 这些 P2P latency 无法被 W 覆盖
+```
+
+**物理原因：**
+
+| 因素 | 说明 |
+|------|------|
+| **P2P 传输不可并行** | W（权重梯度计算）是本地计算，但激活值 P2P 必须在阶段间传递 |
+| **每个 transition 有 residual** | `(PP-1)` 次阶段转换，每次至少 ~2µs 不可消除 |
+| **避免非物理结果** | 文档公式在 W 很大时给出 bubble=0，但实际硬件不可能 |
+
+**代码实现：**
+
+```python
+ZB_BUBBLE_FLOOR_PER_TRANSITION = 2e-6  # 2 µs P2P latency per transition
+
+# ZeroBubble 应用 floor
+warmup_bubble_per_stage = max(t_fwd - t_w, ZB_BUBBLE_FLOOR_PER_TRANSITION)
+cooldown_bubble_per_stage = max(t_b_dx - t_w, ZB_BUBBLE_FLOOR_PER_TRANSITION)
+
+# DualPipe 应用 floor
+warmup_bubble_per_slot = max(F_and_B - 2 * W, ZB_BUBBLE_FLOOR_PER_TRANSITION)
+cooldown_bubble_per_slot = max(B - W, ZB_BUBBLE_FLOOR_PER_TRANSITION)
+```
+
+**结论：** 文档公式是理论框架，代码添加 floor 使模拟更贴近真实硬件行为（NVLink/InfiniBand 传输延迟下界）。
+
+#### 7.2.5 StepResult 关键字段
 
 ```python
 @dataclass
@@ -894,3 +964,4 @@ PYTHONPATH=python:. python -m python.zrt --estimate-config python/zrt/training/c
 3. **Phase-aware backward**：dx 和 dw 分离，支持 ZeroBubble 等精细调度
 4. **Heterogeneous compute**：H100 Cube/Vector 双峰值，fallback 到统一峰值
 5. **Invariant-preserving**：StepResult 的 timing 分解有严格代数不变量，可在 pipeline_step_time() 中验证
+

@@ -1,13 +1,16 @@
-"""Test data parallel pass: global comm insertion, ZeRO staging, overlap."""
+"""Test data parallel pass: per-group comm insertion, ZeRO staging, overlap."""
 
 import pytest
 from zrt.ir.graph import OpGraph
 from zrt.ir.node import OpNode
 from zrt.ir.types import TensorMeta, DType
 from zrt.ir.edge import Edge
-from zrt.transform.context import TransformContext, ParallelConfig, TrainingConfig
+from zrt.transform.context import (
+    TransformContext, ParallelConfig, TrainingConfig, OffloadConfig,
+)
 from zrt.transform.parallel.data_parallel import DataParallelPass
 from zrt.transform.analysis import TrainingPipelinePass
+from zrt.transform.training.offload import OffloadPass
 
 
 def _make_backward_graph(num_layers=2, hidden=4096, seq_len=2048):
@@ -68,9 +71,9 @@ def _make_hardware_spec():
 
 
 class TestDPZero0:
-    """ZeRO-0: single global all_reduce at end of backward pass."""
+    """ZeRO-0: all_reduce comm nodes."""
 
-    def test_single_global_all_reduce(self):
+    def test_all_reduce_created_per_layer(self):
         graph = _make_backward_graph(num_layers=3)
         ctx = TransformContext(
             hw_spec=_make_hardware_spec(),
@@ -85,14 +88,13 @@ class TestDPZero0:
 
         dp_nodes = [n for n in result.nodes.values()
                     if n.annotations.get("dp_comm")]
-        assert len(dp_nodes) == 1  # single global comm node
+        assert len(dp_nodes) == 3  # one per layer
 
-        node = dp_nodes[0]
-        assert node.op_type == "comm.all_reduce"
-        assert node.attrs["group_size"] == 4
-        assert node.attrs["collective"] == "all_reduce"
-        assert node.attrs["bucket_bytes"] > 0
-        assert node.id == "comm_dp_grad_reduce"
+        for node in dp_nodes:
+            assert node.op_type == "comm.all_reduce"
+            assert node.attrs["group_size"] == 4
+            assert node.attrs["collective"] == "all_reduce"
+            assert node.attrs["bucket_bytes"] > 0
 
     def test_dp_comm_annotation_present(self):
         graph = _make_backward_graph(num_layers=2)
@@ -111,29 +113,8 @@ class TestDPZero0:
             assert node.annotations["inserted_by"] == "data_parallel_pass"
 
 
-class TestDPZero1:
-    """ZeRO-1: single global all_reduce at end of backward pass."""
-
-    def test_all_reduce_for_zero1(self):
-        graph = _make_backward_graph(num_layers=2)
-        ctx = TransformContext(
-            hw_spec=_make_hardware_spec(),
-            parallel=ParallelConfig(tp=1, dp=4),
-            training=TrainingConfig(micro_batch=1, global_batch=8, zero_stage=1),
-        )
-
-        result = DataParallelPass().run(graph, ctx)
-
-        dp_nodes = [n for n in result.nodes.values()
-                    if n.annotations.get("dp_comm")]
-        assert len(dp_nodes) == 1
-        for node in dp_nodes:
-            assert node.op_type == "comm.all_reduce"
-            assert node.attrs["collective"] == "all_reduce"
-
-
 class TestDPZero2:
-    """ZeRO-2: single global reduce_scatter at end of backward pass."""
+    """ZeRO-2/3: reduce_scatter comm nodes."""
 
     def test_reduce_scatter_for_zero2(self):
         graph = _make_backward_graph(num_layers=2)
@@ -147,13 +128,11 @@ class TestDPZero2:
 
         dp_nodes = [n for n in result.nodes.values()
                     if n.annotations.get("dp_comm")]
-        assert len(dp_nodes) == 1
         for node in dp_nodes:
             assert node.op_type == "comm.reduce_scatter"
             assert node.attrs["collective"] == "reduce_scatter"
 
-    def test_zero3_skipped_by_dp_pass(self):
-        """ZeRO-3 should be skipped by DataParallelPass (handled by ZeroFSDPPass)."""
+    def test_reduce_scatter_for_zero3(self):
         graph = _make_backward_graph(num_layers=2)
         ctx = TransformContext(
             hw_spec=_make_hardware_spec(),
@@ -165,7 +144,8 @@ class TestDPZero2:
 
         dp_nodes = [n for n in result.nodes.values()
                     if n.annotations.get("dp_comm")]
-        assert len(dp_nodes) == 0
+        for node in dp_nodes:
+            assert node.op_type == "comm.reduce_scatter"
 
     def test_reduce_scatter_has_lower_modeled_time_than_all_reduce(self):
         graph = _make_backward_graph(num_layers=1)
@@ -241,3 +221,284 @@ class TestDPOverlap:
         dp_nodes = [n for n in result.nodes.values()
                     if n.annotations.get("dp_comm")]
         assert len(dp_nodes) == 0
+
+
+class TestDPGroupIdx:
+    """Tests for per-group index assignment."""
+
+    def test_group_idx_sequential(self):
+        graph = _make_backward_graph(num_layers=3)
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=1, dp=4),
+            training=TrainingConfig(micro_batch=1, global_batch=8, zero_stage=0),
+        )
+
+        result = DataParallelPass().run(graph, ctx)
+
+        dp_nodes = sorted(
+            [n for n in result.nodes.values() if n.annotations.get("dp_comm")],
+            key=lambda n: n.attrs["dp_grad_group_idx"],
+        )
+        indices = [n.attrs["dp_grad_group_idx"] for n in dp_nodes]
+        assert indices == [0, 1, 2]
+
+
+class TestDPDivScale:
+    """Tests for aten.div.Scalar gradient averaging nodes.
+
+    DataParallelPass inserts a div/scale node after every DP comm node
+    so that all_reduce / reduce_scatter SUM is averaged by dp.
+    """
+
+    def test_div_scale_node_created_per_layer(self):
+        graph = _make_backward_graph(num_layers=3)
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=1, dp=4),
+            training=TrainingConfig(micro_batch=1, global_batch=8, zero_stage=0),
+        )
+
+        result = DataParallelPass().run(graph, ctx)
+
+        scale_nodes = [
+            n for n in result.nodes.values()
+            if n.annotations.get("inserted_by") == "data_parallel_pass"
+            and n.op_type == "aten.div.Scalar"
+        ]
+        assert len(scale_nodes) == 3  # one per layer
+
+    def test_div_scale_divisor_equals_dp(self):
+        graph = _make_backward_graph(num_layers=2)
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=1, dp=8),
+            training=TrainingConfig(micro_batch=1, global_batch=8, zero_stage=0),
+        )
+
+        result = DataParallelPass().run(graph, ctx)
+
+        scale_nodes = [
+            n for n in result.nodes.values()
+            if n.op_type == "aten.div.Scalar"
+        ]
+        for node in scale_nodes:
+            assert node.attrs["divisor"] == 8
+            assert node.attrs["role"] == "dp_grad_average"
+
+    def test_div_scale_inserted_after_comm_node(self):
+        """Verify div/scale is a successor of the corresponding comm node."""
+        graph = _make_backward_graph(num_layers=1)
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=1, dp=4),
+            training=TrainingConfig(micro_batch=1, global_batch=8, zero_stage=0),
+        )
+
+        result = DataParallelPass().run(graph, ctx)
+
+        comm_node = next(
+            n for n in result.nodes.values()
+            if n.annotations.get("dp_comm")
+        )
+        scale_node = next(
+            n for n in result.nodes.values()
+            if n.op_type == "aten.div.Scalar"
+        )
+
+        comm_succs = result.successors(comm_node.id)
+        assert scale_node.id in comm_succs, (
+            f"div/scale {scale_node.id} not a successor of "
+            f"comm node {comm_node.id}"
+        )
+
+    def test_div_scale_has_correct_annotations(self):
+        graph = _make_backward_graph(num_layers=2)
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=1, dp=4),
+            training=TrainingConfig(micro_batch=1, global_batch=8, zero_stage=0),
+        )
+
+        result = DataParallelPass().run(graph, ctx)
+
+        scale_nodes = [
+            n for n in result.nodes.values()
+            if n.op_type == "aten.div.Scalar"
+        ]
+        for node in scale_nodes:
+            assert node.annotations["inserted_by"] == "data_parallel_pass"
+            assert node.annotations["phase"] == "bwd"
+            assert node.category == "compute"
+
+    def test_div_scale_not_inserted_when_dp_1(self):
+        graph = _make_backward_graph(num_layers=2)
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=1, dp=1),
+            training=TrainingConfig(micro_batch=1, global_batch=8, zero_stage=0),
+        )
+
+        result = DataParallelPass().run(graph, ctx)
+
+        scale_nodes = [
+            n for n in result.nodes.values()
+            if n.op_type == "aten.div.Scalar"
+        ]
+        assert len(scale_nodes) == 0
+
+    def test_div_scale_divisor_matches_reduce_scatter(self):
+        """div/scale divisor equals dp regardless of collective type."""
+        graph = _make_backward_graph(num_layers=1)
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=1, dp=4),
+            training=TrainingConfig(micro_batch=1, global_batch=8, zero_stage=2),
+        )
+
+        result = DataParallelPass().run(graph, ctx)
+
+        comm_node = next(
+            n for n in result.nodes.values()
+            if n.annotations.get("dp_comm")
+        )
+        assert comm_node.op_type == "comm.reduce_scatter"
+
+        scale_node = next(
+            n for n in result.nodes.values()
+            if n.op_type == "aten.div.Scalar"
+        )
+        assert scale_node.attrs["divisor"] == 4
+
+
+class TestDPOffloadChain:
+    """Tests for OffloadPass _find_dp_chain_end with div/scale nodes.
+
+    When DataParallelPass inserts a div/scale node after the DP comm node,
+    OffloadPass must walk past it so that D2H is inserted after the averaged
+    gradients, not before.
+    """
+
+    def test_find_dp_chain_end_skips_div_scale(self):
+        """_find_dp_chain_end from comm node should return scale_node."""
+        graph = _make_backward_graph(num_layers=1)
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=1, dp=4),
+            training=TrainingConfig(
+                micro_batch=1, global_batch=8, zero_stage=0,
+                offload=OffloadConfig(pct=1.0, grads=True),
+            ),
+        )
+
+        dp_graph = DataParallelPass().run(graph, ctx)
+
+        comm_node = next(
+            n for n in dp_graph.nodes.values()
+            if n.annotations.get("dp_comm")
+        )
+
+        offload_pass = OffloadPass()
+        chain_end = offload_pass._find_dp_chain_end(dp_graph, comm_node)
+
+        assert chain_end is not comm_node, (
+            "_find_dp_chain_end should skip past div/scale to the chain end"
+        )
+        assert chain_end.op_type == "aten.div.Scalar", (
+            f"expected div/scale at chain end, got {chain_end.op_type}"
+        )
+        assert chain_end.annotations["inserted_by"] == "data_parallel_pass"
+
+    def test_d2h_inserted_after_div_scale(self):
+        """After OffloadPass runs, D2H should be a successor of div/scale,
+        not of the comm node directly."""
+        graph = _make_backward_graph(num_layers=1)
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=1, dp=4),
+            training=TrainingConfig(
+                micro_batch=1, global_batch=8, zero_stage=0,
+                offload=OffloadConfig(pct=1.0, grads=True),
+            ),
+        )
+
+        dp_graph = DataParallelPass().run(graph, ctx)
+        result = OffloadPass().run(dp_graph, ctx)
+
+        comm_node = next(
+            n for n in result.nodes.values()
+            if n.annotations.get("dp_comm")
+        )
+        scale_node = next(
+            n for n in result.nodes.values()
+            if n.op_type == "aten.div.Scalar"
+        )
+        d2h_node = next(
+            n for n in result.nodes.values()
+            if n.annotations.get("inserted_by") == "offload_pass"
+        )
+
+        scale_succs = result.successors(scale_node.id)
+        assert d2h_node.id in scale_succs, (
+            f"D2H {d2h_node.id} should be a successor of "
+            f"div/scale {scale_node.id}, got succs={scale_succs}"
+        )
+
+        comm_succs = result.successors(comm_node.id)
+        assert scale_node.id in comm_succs, (
+            "comm node should still point to div/scale"
+        )
+
+    def test_no_offload_when_grads_disabled(self):
+        """D2H should not be inserted when offload.grads is False."""
+        graph = _make_backward_graph(num_layers=1)
+        ctx = TransformContext(
+            hw_spec=_make_hardware_spec(),
+            parallel=ParallelConfig(tp=1, dp=4),
+            training=TrainingConfig(
+                micro_batch=1, global_batch=8, zero_stage=0,
+                offload=OffloadConfig(pct=1.0, grads=False),
+            ),
+        )
+
+        dp_graph = DataParallelPass().run(graph, ctx)
+        result = OffloadPass().run(dp_graph, ctx)
+
+        d2h_nodes = [
+            n for n in result.nodes.values()
+            if n.annotations.get("inserted_by") == "offload_pass"
+        ]
+        assert len(d2h_nodes) == 0
+
+    def test_find_dp_chain_end_stops_at_non_dp_node(self):
+        """When div/scale is NOT present (legacy graph), chain end is the
+        comm node itself."""
+        graph = _make_backward_graph(num_layers=1)
+
+        dp = 4
+        comm_node = OpNode(
+            id="comm_grad_reduce",
+            op_type="comm.all_reduce",
+            inputs=[], outputs=[],
+            attrs={"group_size": dp, "collective": "all_reduce",
+                   "bucket_bytes": 1000, "role": "dp_grad_reduce"},
+            scope="data_parallel.grad_reduce",
+            category="communication",
+        )
+        comm_node.annotations["dp_comm"] = True
+        comm_node.annotations["inserted_by"] = "data_parallel_pass"
+        comm_node.annotations["phase"] = "bwd"
+
+        g = OpGraph(
+            name="test_no_scale",
+            phase="train_backward",
+            nodes={"comm_grad_reduce": comm_node},
+            metadata={"seq_len": 4096, "hidden": 4096},
+        )
+
+        offload_pass = OffloadPass()
+        chain_end = offload_pass._find_dp_chain_end(g, comm_node)
+
+        assert chain_end is comm_node, (
+            "without div/scale, chain end should be the comm node itself"
+        )

@@ -91,6 +91,7 @@ def estimate(
         warnings=warnings,
         config_summary=config_summary,
         bubble_fraction=s.bubble_fraction,
+        bubble_time_ms=(s.warmup + s.cooldown) * 1000,
         schedule_name=s.schedule_name,
         warmup_steps=s.warmup_steps,
         cooldown_steps=s.cooldown_steps,
@@ -114,6 +115,8 @@ def estimate(
         compute_time_ms=s.compute_time * 1000,
         fwd_compute_ms=s.fwd_compute * 1000,
         bwd_compute_ms=s.bwd_compute * 1000,
+        recompute_time_ms=s.recompute_time * 1000,
+        recompute_time_raw_ms=s.recompute_time_raw * 1000,
         exposed_comm_ms=s.exposed_comm * 1000,
         tp_exposed_ms=s.tp_exposed * 1000,
         cp_exposed_ms=s.cp_exposed * 1000,
@@ -134,6 +137,11 @@ def estimate(
         tokens_per_sec=tokens_per_sec,
         effective_params=model.effective_params_for_flops(),
         flops_per_token=flops_per_token,
+        # v2 HBM traffic diagnostics
+        weight_hbm_gb=s.weight_hbm_gb,
+        act_hbm_gb=s.act_hbm_gb,
+        grad_hbm_gb=s.grad_hbm_gb,
+        cast_hbm_gb=s.cast_hbm_gb,
     )
 
 

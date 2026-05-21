@@ -44,6 +44,7 @@ def estimate_training_from_graphs(
     model_type: str | None = None,
     micro_batch: int = 1,
     global_batch: int = 32,
+    recompute_policy: str = "none",
     pp_schedule: str = "1f1b",
     vpp_chunks: int = 1,
     return_transformed: bool = False,
@@ -52,6 +53,13 @@ def estimate_training_from_graphs(
     moe_active_experts: int = 1,
     model_id: str = "",
     fusion_config: "FusionConfig | None" = None,
+    ffn_hidden: int | None = None,
+    moe_ffn_hidden: int | None = None,
+    layer_type_counts: dict[str, int] | None = None,
+    n_shared_experts: int | None = None,
+    num_heads: int | None = None,
+    kv_heads: int | None = None,
+    head_dim: int | None = None,
 ) -> "TrainingReport | tuple[TrainingReport, TransformContext, dict[str, OpGraph]]":
     """Estimate training performance from pre-built OpGraph instances.
 
@@ -89,13 +97,12 @@ def estimate_training_from_graphs(
     if model_type is not None:
         metadata["model_type"] = model_type
 
+    # Force set metadata (overwrite existing keys)
     for key, val in metadata.items():
-        if key not in forward_graph.metadata:
-            forward_graph.metadata[key] = val
+        forward_graph.metadata[key] = val
     if backward_graph is not None:
         for key, val in metadata.items():
-            if key not in backward_graph.metadata:
-                backward_graph.metadata[key] = val
+            backward_graph.metadata[key] = val
 
     quant_cfg = QuantConfig(weight=quant, activation=quant) if quant else None
     ctx = TransformContext(
@@ -109,6 +116,7 @@ def estimate_training_from_graphs(
             muon_ns_steps=muon_ns_steps,
             micro_batch=micro_batch,
             global_batch=global_batch,
+            recompute_policy=recompute_policy,
             pp_schedule=pp_schedule,
             vpp_chunks=vpp_chunks,
             seq_len=seq_len,
@@ -196,9 +204,18 @@ def estimate_training_from_graphs(
     cooldown_steps = pipeline_metrics.cooldown_steps if pipeline_metrics else 0
     steady_steps = pipeline_metrics.steady_steps if pipeline_metrics else 0
     bubble_fraction = pipeline_metrics.bubble_fraction if pipeline_metrics else 0.0
+    bubble_time_ms = pipeline_metrics.bubble_time_ms if pipeline_metrics else 0.0
+    compute_time_ms = pipeline_metrics.compute_time_ms if pipeline_metrics else 0.0
+    fwd_compute_ms = pipeline_metrics.fwd_compute_ms if pipeline_metrics else 0.0
+    bwd_compute_ms = pipeline_metrics.bwd_compute_ms if pipeline_metrics else 0.0
+    recompute_compute_ms = pipeline_metrics.recompute_compute_ms if pipeline_metrics else 0.0
     exposed_comm_ms = pipeline_metrics.exposed_comm_ms if pipeline_metrics else 0.0
     hidden_comm_ms = pipeline_metrics.hidden_comm_ms if pipeline_metrics else 0.0
     total_comm_ms = pipeline_metrics.total_comm_ms if pipeline_metrics else 0.0
+    dp_exposed_ms = pipeline_metrics.dp_exposed_ms if pipeline_metrics else 0.0
+    dp_hidden_ms = pipeline_metrics.dp_hidden_ms if pipeline_metrics else 0.0
+    optimizer_time_ms = pipeline_metrics.optimizer_time_ms if pipeline_metrics else 0.0
+    optimizer_comm_ms = pipeline_metrics.optimizer_comm_ms if pipeline_metrics else 0.0
 
     parallel = ctx.parallel
     training = ctx.training
@@ -228,7 +245,6 @@ def estimate_training_from_graphs(
         per_stage_ms=per_stage_ms,
         mfu=mfu,
         hfu=hfu,
-        total_flops=training_flops,
         training_flops=training_flops,
         forward_flops=forward_flops,
         backward_flops=backward_flops,
@@ -236,12 +252,22 @@ def estimate_training_from_graphs(
         warmup_steps=warmup_steps,
         cooldown_steps=cooldown_steps,
         steady_steps=steady_steps,
+        dp_exposed_ms=dp_exposed_ms,
+        dp_hidden_ms=dp_hidden_ms,
+        dp_total_ms=dp_exposed_ms + dp_hidden_ms,
         bubble_fraction=bubble_fraction,
+        bubble_time_ms=bubble_time_ms,
         total_params=total_params,
         fused_ops_summary=fused_ops_summary,
+        compute_time_ms=compute_time_ms,
+        fwd_compute_ms=fwd_compute_ms,
+        bwd_compute_ms=bwd_compute_ms,
+        recompute_compute_ms=recompute_compute_ms,
         exposed_comm_ms=exposed_comm_ms,
         hidden_comm_ms=hidden_comm_ms,
         total_comm_volume_ms=total_comm_ms,
+        optimizer_time_ms=optimizer_time_ms,
+        optimizer_comm_ms=optimizer_comm_ms,
     )
 
     if return_transformed:

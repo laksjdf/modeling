@@ -5,13 +5,16 @@ import math
 from python.zrt.ir.graph import OpGraph
 from python.zrt.ir.node import OpNode
 from python.zrt.ir.edge import Edge
+from python.zrt.ir.types import TensorMeta, DType
 from python.zrt.ir.param_count import count_params
 from python.zrt.transform.base import GraphPass
 from python.zrt.transform.context import TransformContext
 from python.zrt.training.models.optimizer import (
     adam_step_flops,
     muon_optimizer_step_flops,
+    muon_flops_from_geometry,
 )
+from zrt.training.models.memory import routed_expert_params
 
 logger = logging.getLogger(__name__)
 
@@ -46,8 +49,9 @@ class OptimizerPass(GraphPass):
         # Check graph-level phase (for unified stitched graphs)
         graph_phase = g.metadata.get("phase", "")
 
-        # For stitched graphs, only add optimizer to backward
-        if graph_phase and graph_phase not in ("train_backward", "backward"):
+        # For stitched graphs (phase="train"), optimizer runs on the unified graph
+        # For separate backward graphs (phase="train_backward" or "backward"), optimizer runs on backward
+        if graph_phase and graph_phase not in ("train", "train_backward", "backward"):
             return g
 
         # For non-stitched graphs, check if any node is a backward node
@@ -102,6 +106,7 @@ class OptimizerPass(GraphPass):
         params_adam = params
         ns_steps_resolved = 0
         muon_ag_bytes = 0
+        f_muon = 0.85
 
         if opt == "muon":
             f_muon = muon_fraction if muon_fraction is not None else 0.85
@@ -112,10 +117,60 @@ class OptimizerPass(GraphPass):
                 ns_steps_resolved = ctx.training.effective_ns_steps(model_type)
             else:
                 ns_steps_resolved = 5
-            # Muon AG bytes: total bytes to gather = P_muon × 4B
-            # Ring factor applied in timing calculation, not pre-scaled here
+            # Muon AG bytes: pre-DP payload (collective formula scales by dp internally)
             if dp > 1:
-                muon_ag_bytes = int(params_muon * 4)
+                muon_params_pre_dp = params_muon * dp if zero_stage >= 3 else params_muon
+                muon_ag_bytes = int(muon_params_pre_dp * 4)
+
+        # Compute routed/non-routed split for calibrated Muon comm model.
+        # Comm payloads use pre-DP params: the collective alpha-beta formula
+        # already scales by group_size internally (matching Stack A's
+        # _params_on_rank_for_dp which explicitly does NOT divide by dp).
+        params_for_comm = params * dp if (zero_stage >= 3 and dp > 1) else params
+        P_routed = 0
+        muon_ag_bytes_non_routed = 0
+        muon_ag_bytes_routed = 0
+        expert_dp = dp
+        if opt == "muon" and dp > 1:
+            ep = ctx.parallel.ep if ctx.parallel else 1
+            if ep > 1:
+                meta = g.metadata
+                n_moe = (meta.get("layer_type_counts") or {}).get("moe", 0)
+                h_meta = meta.get("hidden", ctx.training.hidden if ctx.training else hidden)
+                moe_ffn_meta = meta.get("moe_ffn_hidden") or 0
+                num_exp = meta.get("moe_total_experts") or 0
+                n_layers_meta = n_moe + (meta.get("layer_type_counts") or {}).get("dense", 0) + (meta.get("layer_type_counts") or {}).get("mtp", 0)
+                P_routed = routed_expert_params(
+                    n_moe=n_moe, hidden=h_meta or 0, moe_ffn=moe_ffn_meta,
+                    num_experts=num_exp, tp=tp, ep=ep, pp=pp, n_layers=max(n_layers_meta, 1),
+                )
+                expert_dp = max(1, dp // ep)
+        P_non_routed = max(0, params_for_comm - P_routed)
+        if opt == "muon" and dp > 1:
+            muon_ag_bytes_non_routed = int(P_non_routed * f_muon * 4)
+            muon_ag_bytes_routed = int(P_routed * f_muon * 4)
+
+        # Compute step FLOPs: arch-driven path when geometry metadata available
+        step_flops_val = self._opt_step_flops(opt, params, ns_steps_resolved, muon_fraction, hidden)
+        if opt == "muon":
+            meta = g.metadata
+            layer_counts = meta.get("layer_type_counts") or {}
+            ffn_val = meta.get("ffn_hidden") or 0
+            moe_ffn_val = meta.get("moe_ffn_hidden") or 0
+            h_val = hidden or meta.get("hidden") or 0
+            if h_val > 0 and layer_counts and (ffn_val > 0 or moe_ffn_val > 0):
+                ep = ctx.parallel.ep if ctx.parallel else 1
+                step_flops_val = muon_flops_from_geometry(
+                    hidden=h_val, ffn=ffn_val, moe_ffn=moe_ffn_val,
+                    n_dense=layer_counts.get("dense", 0),
+                    n_moe=layer_counts.get("moe", 0),
+                    n_mtp=layer_counts.get("mtp", 0),
+                    num_experts=meta.get("moe_total_experts") or 0,
+                    n_shared_experts=meta.get("n_shared_experts") or 1,
+                    tp=tp, ep=ep, pp=pp, dp=dp,
+                    zero_stage=zero_stage,
+                    K=ns_steps_resolved, muon_fraction=f_muon,
+                )
 
         # Create optimizer step node
         step_node = OpNode(
@@ -129,10 +184,13 @@ class OptimizerPass(GraphPass):
                 "params_muon": params_muon,
                 "params_adam": params_adam,
                 "state_bytes": self._opt_state_bytes(opt, params, muon_fraction=muon_fraction),
-                "step_flops": self._opt_step_flops(opt, params, ns_steps_resolved, muon_fraction, hidden),
+                "step_flops": step_flops_val,
                 "ns_steps": ns_steps_resolved,
                 "ns_rotation": muon_rotation if opt == "muon" else False,
                 "muon_ag_bytes": muon_ag_bytes,
+                "muon_ag_bytes_non_routed": muon_ag_bytes_non_routed,
+                "muon_ag_bytes_routed": muon_ag_bytes_routed,
+                "expert_dp": expert_dp,
             },
             scope="optimizer.step",
             category="compute",
@@ -141,8 +199,55 @@ class OptimizerPass(GraphPass):
         step_node.annotations["stage_id"] = optimizer_stage_id
         step_node.annotations["optimizer_step"] = True
 
-        # Append the optimizer step node at the end of the graph
-        self._append_at_end(g, step_node)
+        # Build optimizer chain: [AG] -> optimizer_step -> [RS]
+        # AG: AllGather momentum before optimizer step (Muon + ZeRO-1 + DP>1)
+        # RS: ReduceScatter gradient after optimizer step (rotation=True)
+        optimizer_chain: list[OpNode] = []
+
+        if opt == "muon" and dp > 1 and muon_ag_bytes > 0:
+            ag_node = OpNode(
+                id="muon_ag",
+                op_type="comm.all_gather",
+                inputs=[],
+                outputs=[],
+                attrs={
+                    "bytes": muon_ag_bytes,
+                    "group_size": dp,
+                    "collective": "all_gather",
+                    "optimizer": "muon",
+                },
+                scope="optimizer.comm",
+                category="communication",
+            )
+            ag_node.annotations["phase"] = "bwd"
+            ag_node.annotations["stage_id"] = optimizer_stage_id
+            ag_node.annotations["muon_comm"] = "ag"
+            optimizer_chain.append(ag_node)
+
+        optimizer_chain.append(step_node)
+
+        if opt == "muon" and dp > 1 and muon_ag_bytes > 0 and muon_rotation:
+            rs_node = OpNode(
+                id="muon_rs",
+                op_type="comm.reduce_scatter",
+                inputs=[],
+                outputs=[],
+                attrs={
+                    "bytes": muon_ag_bytes,
+                    "group_size": dp,
+                    "collective": "reduce_scatter",
+                    "optimizer": "muon",
+                },
+                scope="optimizer.comm",
+                category="communication",
+            )
+            rs_node.annotations["phase"] = "bwd"
+            rs_node.annotations["stage_id"] = optimizer_stage_id
+            rs_node.annotations["muon_comm"] = "rs"
+            optimizer_chain.append(rs_node)
+
+        # Append the optimizer chain at the end of the graph
+        self._append_chain_at_end(g, optimizer_chain)
 
         return g
 
@@ -204,6 +309,22 @@ class OptimizerPass(GraphPass):
             graph: OpGraph to modify
             new_node: OpNode to append
         """
+        self._append_chain_at_end(graph, [new_node])
+
+    def _append_chain_at_end(self, graph: OpGraph, chain: list[OpNode]) -> None:
+        """Append a chain of nodes at the end of the graph.
+
+        Finds all sink nodes (no outgoing edges) and connects them
+        to the first node in the chain, then connects chain nodes
+        sequentially.
+
+        Args:
+            graph: OpGraph to modify
+            chain: List of OpNodes to append in order
+        """
+        if not chain:
+            return
+
         # Build adjacency to find sink nodes
         has_out_edge = set()
         for edge in graph.edges:
@@ -214,23 +335,42 @@ class OptimizerPass(GraphPass):
             if nid not in has_out_edge
         ]
 
-        # Add the new node first
-        graph.nodes[new_node.id] = new_node
-        if new_node.id not in graph._pred:
-            graph._pred[new_node.id] = []
-        if new_node.id not in graph._succ:
-            graph._succ[new_node.id] = []
+        # Add all chain nodes to the graph
+        for node in chain:
+            graph.nodes[node.id] = node
+            if node.id not in graph._pred:
+                graph._pred[node.id] = []
+            if node.id not in graph._succ:
+                graph._succ[node.id] = []
 
-        # Connect all sink nodes to the new node
+        # Connect all sink nodes to the first chain node
+        first_node = chain[0]
         for sink_node in sink_nodes:
             if sink_node.outputs:
                 graph.edges.append(Edge(
                     src=sink_node.id,
                     src_idx=0,
-                    dst=new_node.id,
+                    dst=first_node.id,
                     dst_idx=0,
                     tensor=sink_node.outputs[0],
                 ))
-                # Update adjacency structures
-                graph._succ[sink_node.id].append(new_node.id)
-                graph._pred[new_node.id].append(sink_node.id)
+                graph._succ[sink_node.id].append(first_node.id)
+                graph._pred[first_node.id].append(sink_node.id)
+
+        # Connect chain nodes sequentially
+        for i in range(len(chain) - 1):
+            src_node = chain[i]
+            dst_node = chain[i + 1]
+            graph.edges.append(Edge(
+                src=src_node.id,
+                src_idx=0,
+                dst=dst_node.id,
+                dst_idx=0,
+                tensor=TensorMeta.from_shape_dtype(
+                    f"opt_chain_{i}",
+                    shape=(1,),
+                    dtype=DType.BF16,
+                ),
+            ))
+            graph._succ[src_node.id].append(dst_node.id)
+            graph._pred[dst_node.id].append(src_node.id)

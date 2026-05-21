@@ -91,6 +91,17 @@ class DataParallelPass(GraphPass):
 
         self._insert_after(g, last_bwd_node, comm_node)
 
+            # 在 DataParallelPass 中，comm_node 之后插入
+            scale_node = OpNode(
+                id=f"grad_scale_layer_{layer_key}",
+                op_type="aten.div.Scalar",
+                attrs={"divisor": dp, "role": "dp_grad_average"},
+                category="compute",
+            )
+            scale_node.annotations["inserted_by"] = "data_parallel_pass"
+            scale_node.annotations["phase"] = "bwd"
+            self._insert_after(g, comm_node, scale_node)
+
         return g
 
     def _is_backward_node(self, node: OpNode) -> bool:
@@ -127,6 +138,14 @@ class DataParallelPass(GraphPass):
                     dst=comm_node.id, dst_idx=0,
                     tensor=src_node.outputs[0],
                 ))
+            else:
+                # src has no real outputs (e.g. comm metadata nodes).
+                # Use a control edge so graph.successors() still works.
+                graph.edges.append(Edge(
+                    src=src_id, src_idx=0,
+                    dst=comm_node.id, dst_idx=0,
+                    tensor=None,
+                ))
             graph._rebuild_adjacency()
             return
 
@@ -139,11 +158,21 @@ class DataParallelPass(GraphPass):
         graph._pred[comm_node.id] = []
 
         # src → comm
-        for i, out_tensor in enumerate(src_node.outputs):
+        if src_node.outputs:
+            for i, out_tensor in enumerate(src_node.outputs):
+                graph.edges.append(Edge(
+                    src=src_id, src_idx=i,
+                    dst=comm_node.id, dst_idx=i,
+                    tensor=out_tensor,
+                ))
+        else:
+            # No real outputs (e.g. comm metadata nodes) — create a
+            # sentinel edge so that graph.successors() still works.
+            sentinel = old_out[0].tensor
             graph.edges.append(Edge(
-                src=src_id, src_idx=i,
-                dst=comm_node.id, dst_idx=i,
-                tensor=out_tensor,
+                src=src_id, src_idx=0,
+                dst=comm_node.id, dst_idx=0,
+                tensor=sentinel,
             ))
 
         # comm → old successors

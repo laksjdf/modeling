@@ -136,13 +136,24 @@ def _ns_pair_flops(m: int, n: int, K: int) -> int:
     return ns_flops(m, n, k1) + ns_flops_stage2(m, n, k2)
 
 
-def muon_step_flops_from_arch(
-    model,
-    strategy,
+def muon_flops_from_geometry(
+    hidden: int,
+    ffn: int,
+    moe_ffn: int,
+    n_dense: int,
+    n_moe: int,
+    n_mtp: int,
+    num_experts: int,
+    n_shared_experts: int,
+    tp: int,
+    ep: int,
+    pp: int,
+    dp: int,
+    zero_stage: int,
     K: int,
     muon_fraction: float = 0.85,
 ) -> int:
-    """Architecture-driven per-rank Muon NS FLOPs.
+    """Primitive-typed architecture-driven per-rank Muon NS FLOPs.
 
     Walks the explicit weight-matrix inventory instead of inferring count
     from per-rank P. The legacy ``num_matrices = P // hidden²`` path clamps
@@ -151,51 +162,49 @@ def muon_step_flops_from_arch(
 
     Sharding model (matches the rest of the simulator):
       * Routed experts are placed across the EP dimension; the remaining
-        DP/EP replica factor (``dp // ep``, clamped to ≥1) further splits
-        per-expert NS work under ZeRO-1/3.
+        DP/EP replica factor (``dp // ep``) further splits per-expert NS
+        work after requiring a regular expert-DP layout.
       * Attention + shared experts + dense FFN replicate across EP and are
         ZeRO-sharded across the **full** DP group.
       * All weight matrices are TP-column-sharded (NS still operates on the
         TP-Gathered row dim = ``hidden``, col dim = sharded).
       * PP shards layers across the ``pp`` stages.
     """
-    h = model.hidden
-    tp = max(1, strategy.tp)
-    ep = max(1, strategy.ep)
-    pp = max(1, strategy.pp)
-    dp = max(1, strategy.dp)
+    tp = max(1, tp); ep = max(1, ep); pp = max(1, pp); dp = max(1, dp)
+    if ep > 1:
+        if dp < ep:
+            raise ValueError(
+                f"dp must be >= ep for expert-DP sharding (dp={dp}, ep={ep})"
+            )
+        if dp % ep != 0:
+            raise ValueError(
+                f"dp must be divisible by ep for expert-DP sharding "
+                f"(dp={dp}, ep={ep})"
+            )
 
-    n_moe = sum(1 for l in model.layers if l.value == "moe")
-    n_dense = sum(1 for l in model.layers if l.value == "dense")
-    n_mtp = sum(1 for l in model.layers if l.value == "mtp")
 
-    moe_ffn_col = max(1, model.moe_ffn // tp) if model.moe_ffn else 0
-    ffn_col = max(1, model.ffn // tp) if model.ffn else 0
-    attn_col = max(1, h // tp)
+    moe_ffn_col = max(1, moe_ffn // tp) if moe_ffn else 0
+    ffn_col = max(1, ffn // tp) if ffn else 0
+    attn_col = max(1, hidden // tp)
 
-    ns_attn = _ns_pair_flops(h, attn_col, K)
-    ns_moe_ffn = _ns_pair_flops(h, moe_ffn_col, K) if moe_ffn_col else 0
-    ns_dense_ffn = _ns_pair_flops(h, ffn_col, K) if ffn_col else 0
+    ns_attn = _ns_pair_flops(hidden, attn_col, K)
+    ns_moe_ffn = _ns_pair_flops(hidden, moe_ffn_col, K) if moe_ffn_col else 0
+    ns_dense_ffn = _ns_pair_flops(hidden, ffn_col, K) if ffn_col else 0
 
-    # ── Cluster-wide per-layer NS FLOPs ───────────────────────────────
-    n_shared = max(1, getattr(model, "n_shared_experts", 1) or 1)
-
-    # Attention: ~5 NS-eligible weight matrices per layer (V3 MLA / V4
-    # grouped-MQA both fit this envelope: q_a / q_b / k_a-or-wkv / wo_a / wo_b).
+    n_shared = max(1, n_shared_experts or 1)
     attn_layer_full = 5 * ns_attn
 
-    routed_layer_full = 3 * model.num_experts * ns_moe_ffn if ns_moe_ffn else 0
+    routed_layer_full = 3 * num_experts * ns_moe_ffn if ns_moe_ffn else 0
     shared_layer_full = 3 * n_shared * ns_moe_ffn if ns_moe_ffn else 0
     dense_ffn_layer_full = 3 * ns_dense_ffn
 
     # ── Per-rank split ────────────────────────────────────────────────
     # Routed expert work lands on ``ep`` distinct ranks; within an EP rank,
     # remaining DP replicas (``dp // ep``) further parallelize NS.
-    ep_dp_replica = max(1, dp // ep) if ep > 1 else dp
+    ep_dp_replica = dp // ep if ep > 1 else dp
     routed_per_rank_per_layer = routed_layer_full // (ep * ep_dp_replica)
 
-    # Non-routed weights replicate across EP and split across full DP.
-    non_routed_dp_div = dp if strategy.zero_stage >= 1 and dp > 1 else 1
+    non_routed_dp_div = dp if zero_stage >= 1 and dp > 1 else 1
     attn_per_rank_per_layer = attn_layer_full // non_routed_dp_div
     shared_per_rank_per_layer = shared_layer_full // non_routed_dp_div
     dense_ffn_per_rank_per_layer = dense_ffn_layer_full // non_routed_dp_div
@@ -213,8 +222,64 @@ def muon_step_flops_from_arch(
         + n_dense * per_dense_layer
         + n_mtp * per_mtp_layer
     )
-
-    # PP: each rank owns 1/pp layers.
     total //= pp
-
     return int(total * muon_fraction)
+
+
+def moonshot_optimizer_hiding(
+    compute_us: float,
+    ag_us: float,
+    rs_us: float,
+    fwd_window_us: float,
+    rotation: bool,
+) -> tuple[float, float]:
+    """Moonshot rotation overlap arithmetic. Returns (exposed_us, hidden_us).
+
+    AG hides under NS compute + remaining fwd window.
+    RS (when rotation=True) hides under next-iteration fwd window.
+    """
+    if not rotation:
+        return ag_us + rs_us, 0.0
+    rs_hidden = min(rs_us, fwd_window_us)
+    remaining_fwd = max(0.0, fwd_window_us - rs_hidden)
+    ag_hidden = min(ag_us, compute_us + remaining_fwd)
+    hidden_total = ag_hidden + rs_hidden
+    return (ag_us + rs_us) - hidden_total, hidden_total
+
+
+def muon_step_flops_from_arch(
+    model,
+    strategy,
+    K: int,
+    muon_fraction: float = 0.85,
+) -> int:
+    """Architecture-driven per-rank Muon NS FLOPs.
+
+    Thin wrapper around ``muon_flops_from_geometry`` — the mathematical
+    core extracted into primitive-typed parameters so Stack B can call
+    the same function without constructing domain objects.
+
+    Sharding model (matches the rest of the simulator):
+      * Routed experts are placed across the EP dimension; the remaining
+        DP/EP replica factor (``dp // ep``) further splits per-expert NS
+        work after requiring a regular expert-DP layout.
+      * Attention + shared experts + dense FFN replicate across EP and are
+        ZeRO-sharded across the **full** DP group.
+      * All weight matrices are TP-column-sharded (NS still operates on the
+        TP-Gathered row dim = ``hidden``, col dim = sharded).
+      * PP shards layers across the ``pp`` stages.
+    """
+    n_moe = sum(1 for l in model.layers if l.value == "moe")
+    n_dense = sum(1 for l in model.layers if l.value == "dense")
+    n_mtp = sum(1 for l in model.layers if l.value == "mtp")
+    return muon_flops_from_geometry(
+        hidden=model.hidden,
+        ffn=model.ffn or 0,
+        moe_ffn=model.moe_ffn or 0,
+        n_dense=n_dense, n_moe=n_moe, n_mtp=n_mtp,
+        num_experts=model.num_experts,
+        n_shared_experts=getattr(model, "n_shared_experts", 1) or 1,
+        tp=strategy.tp, ep=strategy.ep, pp=strategy.pp, dp=strategy.dp,
+        zero_stage=strategy.zero_stage,
+        K=K, muon_fraction=muon_fraction,
+    )

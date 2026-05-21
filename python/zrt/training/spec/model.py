@@ -93,6 +93,11 @@ class ModelSpec:
     # string is supplied, in which case it syncs to ``Dtype.FP4``. An
     # explicit user value (including ``Dtype.BF16``) always wins.
     routed_expert_weight_dtype: Dtype | None = None  # V4 default: FP4
+    # v2: weight dtype for attention / shared expert projections. ``None``
+    # resolves to ``param_dtype`` in ``__post_init__`` so legacy configs
+    # behave identically to v1.
+    attn_weight_dtype: Dtype | None = None
+    shared_expert_weight_dtype: Dtype | None = None
 
     # === Per-region activation dtype (None → fallback) ===
     attn_act_dtype: Dtype | None = None
@@ -100,6 +105,11 @@ class ModelSpec:
 
     # === Per-component grad dtype ===
     routed_expert_grad_dtype: Dtype = Dtype.FP32
+    # v2: grad dtype for attention / shared expert. Defaults to ``grad_dtype``
+    # via ``__post_init__`` when left as ``None`` so existing anchors keep
+    # their numbers.
+    attn_grad_dtype: Dtype | None = None
+    shared_expert_grad_dtype: Dtype | None = None
 
     # normalization kind: "rmsnorm" (DeepSeek) or "layernorm" (LLaMA variants)
     norm_kind: str = "rmsnorm"
@@ -137,6 +147,20 @@ class ModelSpec:
                     self.routed_expert_weight_dtype = Dtype.BF16
             else:
                 self.routed_expert_weight_dtype = Dtype.BF16
+
+        # v2: per-component weight dtype defaults to param_dtype unless the
+        # user set an explicit value. Mirrors the routed_expert behavior so
+        # BF16 baselines keep identical numbers.
+        if self.attn_weight_dtype is None:
+            self.attn_weight_dtype = self.param_dtype
+        if self.shared_expert_weight_dtype is None:
+            self.shared_expert_weight_dtype = self.param_dtype
+
+        # v2: per-component grad dtype defaults to global grad_dtype.
+        if self.attn_grad_dtype is None:
+            self.attn_grad_dtype = self.grad_dtype
+        if self.shared_expert_grad_dtype is None:
+            self.shared_expert_grad_dtype = self.grad_dtype
 
     @property
     def use_mla(self) -> bool:
@@ -208,6 +232,15 @@ class ModelSpec:
         if self.moe_act_dtype is not None:
             return self.moe_act_dtype
         return self.routed_expert_compute_dtype
+
+    def effective_residual_dtype(self) -> Dtype:
+        """Residual stream dtype — PP P2P + cross-region cast targets.
+
+        V4 keeps the residual stream in ``act_dtype`` (typically BF16) even
+        when MoE/attention internals are FP8/FP4. Exposed as a helper so a
+        future ``residual_dtype`` override field can be added without churn.
+        """
+        return self.act_dtype
 
     # ── Attention parameter helpers ──────────────────────────────────────
 

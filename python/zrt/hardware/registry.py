@@ -22,6 +22,7 @@ from python.zrt.hardware.spec import (
     LinkSpec,
     MemorySpec,
     MemoryTier,
+    TopologyTier,
 )
 
 _CONFIGS_DIR = Path(__file__).parent / "configs"
@@ -112,6 +113,10 @@ def _parse_compute(c: dict[str, Any]) -> ComputeSpec:
         overlap_ratio={k: float(v) for k, v in overlap_raw.items()},
         sram_kb_per_sm=float(c.get("sram_kb_per_sm", 0.0)),
         ep_overlap_waves=int(c.get("ep_overlap_waves", 0)),
+        compute_efficiency=(
+            float(c["compute_efficiency"])
+            if c.get("compute_efficiency") is not None else None
+        ),
     )
 
 
@@ -130,10 +135,47 @@ def _parse_memory(m: dict[str, Any]) -> MemorySpec:
         hbm_bandwidth_gbps=float(m.get("hbm_bandwidth_gbps", 0.0)),
         l2_cache_mb=float(m.get("l2_cache_mb", 0.0)),
         tiers=tiers,
+        mem_bw_efficiency=(
+            float(m["mem_bw_efficiency"])
+            if m.get("mem_bw_efficiency") is not None else None
+        ),
     )
 
 
 def _parse_interconnect(ic: dict[str, Any]) -> InterconnectSpec:
+    """Parse interconnect spec from YAML.
+
+    Two formats are supported:
+
+    1. **Legacy 2-tier** (all existing hardware YAMLs use this)::
+
+         interconnect:
+           intra_node: {type: ..., bandwidth_gbps: ..., num_devices: 8, ...}
+           inter_node: {type: ..., bandwidth_gbps: ..., ...}
+
+    2. **N-tier list** (innermost → outermost; ``num_devices: 0`` for the
+       unbounded outermost tier)::
+
+         interconnect:
+           tiers:
+             - {name: "nvlink",       type: ..., num_devices: 8,  ...}
+             - {name: "nvswitch_rack", type: ..., num_devices: 72, ...}
+             - {name: "ib_rail",      type: ..., num_devices: 576, ...}
+             - {name: "ib_spine",     type: ..., num_devices: 0,  oversubscription: 4.0}
+
+    When both are present the explicit ``tiers`` list wins (this is the
+    forward-compatible form). Mixing them is not supported.
+    """
+    tiers_raw = ic.get("tiers")
+    if tiers_raw:
+        tiers: list[TopologyTier] = []
+        for i, t in enumerate(tiers_raw):
+            name = t.get("name") or f"tier_{i}"
+            # `name` is metadata only; LinkSpec gets the connectivity fields.
+            link_dict = {k: v for k, v in t.items() if k != "name"}
+            tiers.append(TopologyTier(name=name, link=_parse_link(link_dict)))
+        return InterconnectSpec(tiers=tiers)
+
     return InterconnectSpec(
         intra_node=_parse_link(ic.get("intra_node", {})),
         inter_node=_parse_link(ic.get("inter_node", {})),
@@ -165,4 +207,6 @@ def _parse_link(lk: dict[str, Any]) -> LinkSpec:
         latency_us=float(lk.get("latency_us", 0.0)),
         topology=lk.get("topology", "point_to_point"),
         num_devices=int(lk.get("num_devices", 1)),
+        kb_efficiency=float(lk.get("kb_efficiency", 0.7)),
+        oversubscription=float(lk.get("oversubscription", 1.0)),
     )

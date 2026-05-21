@@ -78,8 +78,8 @@ def build_pipeline(*, fusion: str = "v2") -> TransformPipeline:
         v3 requires ``ctx.fx_graphmodule`` to be set before the pipeline runs.
     """
     from python.zrt.transform.parallel import (
-        TensorParallelPass, ExpertParallelPass, CommInserterPass,
-        PipelineParallelPass,
+        TensorParallelPass, ExpertParallelPass, ExpertGroupedMMPass,
+        CommInserterPass, PipelineParallelPass,
     )
     from python.zrt.transform.parallel.context_parallel import ContextParallelPass
     from python.zrt.transform.parallel.data_parallel import DataParallelPass
@@ -107,6 +107,10 @@ def build_pipeline(*, fusion: str = "v2") -> TransformPipeline:
     pipe.add("split", TensorParallelPass(),
              condition=lambda c: c.parallel.tp > 1)
     pipe.add("split", ExpertParallelPass(),
+             condition=lambda c: c.parallel.ep > 1)
+    # ExpertGroupedMMPass consumes ExpertParallelPass ep_needs_a2a annotations
+    # and must run before CommInserterPass so EP A2A wraps fused MoE blocks.
+    pipe.add("split", ExpertGroupedMMPass(),
              condition=lambda c: c.parallel.ep > 1)
     pipe.add("split", ContextParallelPass(),
              condition=lambda c: c.parallel.cp > 1)

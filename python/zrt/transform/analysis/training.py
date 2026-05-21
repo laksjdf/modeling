@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from python.zrt.ir.param_count import count_params
 from python.zrt.transform.base import GraphPass
+from python.zrt.transform.training.recompute import is_external_recompute_node
 
 if TYPE_CHECKING:
     from python.zrt.hardware.spec import HardwareSpec
@@ -97,13 +98,14 @@ class TrainingFlopsPass(GraphPass):
         g.metadata["total_params"] = total_params
         g.metadata["layer_scale"] = layer_scale
 
-        # Recompute overhead: for nodes with recompute annotation, flops_fwd
-        # already includes 2x multiplier (passes.py FlopsPass), so base fwd = flops_fwd / 2
-        # Only fwd-phase nodes can be recomputed (bwd-phase nodes are not recomputed)
+        # External activation-checkpoint replay overhead. FA/SDPA attention
+        # cores may still carry recompute=True for activation memory, but their
+        # backward formula already includes internal recompute and is not charged
+        # as an extra replay here.
         recompute_flops = sum(
             n.annotations.get("flops_fwd", 0) // 2
             for n in g.nodes.values()
-            if n.annotations.get("recompute")
+            if is_external_recompute_node(n)
             and n.annotations.get("phase", "fwd") not in _BWD_PHASES
         )
         if layer_scale != 1.0:
@@ -398,13 +400,24 @@ class PipelineStepMetrics:
     cooldown_steps: int = 0
     steady_steps: int = 0
     bubble_fraction: float = 0.0
+    bubble_time_ms: float = 0.0  # Absolute pipeline bubble time in ms
     mfu: float = 0.0  # Model FLOPs Utilization
     hfu: float = 0.0  # Hardware FLOPs Utilization (includes recompute overhead)
+    compute_time_ms: float = 0.0
+    fwd_compute_ms: float = 0.0
+    bwd_compute_ms: float = 0.0
+    recompute_compute_ms: float = 0.0
     exposed_comm_ms: float = 0.0
     hidden_comm_ms: float = 0.0
     total_comm_ms: float = 0.0
+    dp_exposed_ms: float = 0.0
+    dp_hidden_ms: float = 0.0
+    optimizer_time_ms: float = 0.0
+    optimizer_comm_ms: float = 0.0
 
     def to_dict(self) -> dict[str, float]:
+        # The graph metadata value is the authoritative source used by reports;
+        # this field keeps PipelineStepMetrics self-contained for JSON consumers.
         return {
             "step_time_ms": self.step_time_ms,
             "per_stage_ms": self.per_stage_ms,
@@ -412,11 +425,20 @@ class PipelineStepMetrics:
             "cooldown_steps": self.cooldown_steps,
             "steady_steps": self.steady_steps,
             "bubble_fraction": self.bubble_fraction,
+            "bubble_time_ms": self.bubble_time_ms,
             "mfu": self.mfu,
             "hfu": self.hfu,
+            "compute_time_ms": self.compute_time_ms,
+            "fwd_compute_ms": self.fwd_compute_ms,
+            "bwd_compute_ms": self.bwd_compute_ms,
+            "recompute_compute_ms": self.recompute_compute_ms,
             "exposed_comm_ms": self.exposed_comm_ms,
             "hidden_comm_ms": self.hidden_comm_ms,
             "total_comm_ms": self.total_comm_ms,
+            "dp_exposed_ms": self.dp_exposed_ms,
+            "dp_hidden_ms": self.dp_hidden_ms,
+            "optimizer_time_ms": self.optimizer_time_ms,
+            "optimizer_comm_ms": self.optimizer_comm_ms,
         }
 
 
@@ -440,7 +462,6 @@ class TrainingPipelinePass(GraphPass):
         g = graph.clone()
 
         pp = ctx.parallel.pp if ctx.parallel else 1
-        num_microbatches = ctx.training.num_microbatches if ctx.training else 1
         hw = ctx.hw_spec
         layer_scale = g.metadata.get("layer_scale", 1.0)
 
@@ -583,6 +604,7 @@ class TrainingPipelinePass(GraphPass):
             StageTime(
                 fwd=stage_fwd.get(s, 0.0) / 1e6,
                 bwd=stage_bwd.get(s, 0.0) / 1e6,
+                bwd_dx=(stage_bwd.get(s, 0.0) - stage_bwd_dw.get(s, 0.0)) / 1e6,
                 bwd_dw=stage_bwd_dw.get(s, 0.0) / 1e6,
             )
             for s in range(pp)
@@ -604,12 +626,15 @@ class TrainingPipelinePass(GraphPass):
             optimizer=OPT_MAP.get(opt_str, OptKind.ADAM),
             dp_overlap_in_bubble=ctx.training.dp_overlap_in_bubble if ctx.training else True,
         )
+        # Derive per-device microbatch count from the Strategy (includes DP)
+
+        M = strategy_proxy.num_microbatches()
 
         composer_cls = COMPOSER_BY_SCHED.get(strategy_proxy.pp_schedule)
         if composer_cls is None:
             composer_cls = COMPOSER_BY_SCHED[PP_SCHED_BY_NAME["1f1b"]]
         step_result = composer_cls().compose(
-            stage_times_list, num_microbatches, pp, dp_ar_time_s, strategy_proxy
+            stage_times_list, M, pp, dp_ar_time_s, strategy_proxy
         )
 
         step_time_us = step_result.step_time * 1e6
@@ -668,7 +693,7 @@ class TrainingPipelinePass(GraphPass):
 
         warmup_steps = step_result.warmup_steps
         cooldown_steps = step_result.cooldown_steps
-        steady_steps = num_microbatches
+        steady_steps = M
         training_flops = g.metadata.get("training_flops", 0.0)
         world_size = ctx.parallel.total_devices if ctx.parallel else 1
 
@@ -688,8 +713,46 @@ class TrainingPipelinePass(GraphPass):
         pp = ctx.parallel.pp if ctx.parallel else 1
         model_flops = (training_flops - recompute_flops) / pp
         total_flops_for_hfu = training_flops / pp
-        mfu = util_from_flops(model_flops * num_microbatches, peak_flops_per_gpu, step_time_sec)
-        hfu = util_from_flops(total_flops_for_hfu * num_microbatches, peak_flops_per_gpu, step_time_sec)
+        mfu = util_from_flops(model_flops * M, peak_flops_per_gpu, step_time_sec)
+        hfu = util_from_flops(total_flops_for_hfu * M, peak_flops_per_gpu, step_time_sec)
+
+        def _is_bwd_node(node):
+            return node.annotations.get("phase", "") in _BWD_PHASES
+
+        # Forward latency includes activation-save overhead added by RooflinePass.
+        # External checkpoint nodes are reported in recompute_compute_ms below,
+        # so exclude their base latency here to keep compute_time_ms from
+        # charging the same replay-eligible work twice.
+        fwd_compute_ms = sum(
+            n.annotations.get("latency_us", 0.0)
+            for n in g.nodes.values()
+            if not _is_bwd_node(n)
+            and n.category != "communication"
+            and not is_external_recompute_node(n)
+        ) / 1000.0
+        bwd_compute_ms = sum(
+            n.annotations.get("base_latency_us", n.annotations.get("latency_us", 0.0))
+            for n in g.nodes.values()
+            if _is_bwd_node(n)
+            and n.category != "communication"
+            and not is_external_recompute_node(n)
+        ) / 1000.0
+        recompute_compute_ms = sum(
+            n.annotations.get("base_latency_us", n.annotations.get("latency_us", 0.0))
+            for n in g.nodes.values()
+            if n.category != "communication"
+            and is_external_recompute_node(n)
+        ) / 1000.0
+        if layer_scale != 1.0:
+            fwd_compute_ms *= layer_scale
+            bwd_compute_ms *= layer_scale
+            recompute_compute_ms *= layer_scale
+        # These buckets are mutually exclusive:
+        # - fwd_compute_ms excludes external checkpoint replay nodes
+        # - bwd_compute_ms uses backward base latency and also excludes any
+        #   defensive recompute annotations
+        # - recompute_compute_ms contains external checkpoint replay nodes
+        compute_time_ms = fwd_compute_ms + bwd_compute_ms + recompute_compute_ms
 
         metrics = PipelineStepMetrics(
             step_time_ms=step_time_ms,
@@ -698,29 +761,121 @@ class TrainingPipelinePass(GraphPass):
             cooldown_steps=cooldown_steps,
             steady_steps=steady_steps,
             bubble_fraction=step_result.bubble_fraction,
+            bubble_time_ms=(step_result.warmup + step_result.cooldown) * 1000,
             mfu=min(mfu, 1.0),
             hfu=min(hfu, 1.0),
+            compute_time_ms=compute_time_ms,
+            fwd_compute_ms=fwd_compute_ms,
+            bwd_compute_ms=bwd_compute_ms,
+            recompute_compute_ms=recompute_compute_ms,
             exposed_comm_ms=exposed_comm_ms,
             hidden_comm_ms=hidden_comm_ms,
             total_comm_ms=total_comm_ms,
+            dp_exposed_ms=step_result.dp_exposed * 1000.0,
+            dp_hidden_ms=step_result.dp_hidden * 1000.0,
         )
 
         g.metadata["pipeline_metrics"] = metrics
+        g.metadata["recompute_compute_ms"] = recompute_compute_ms
 
         # Add optimizer step time (per §5.5.2 of design doc)
-        opt_step_time_us = self._compute_optimizer_step_time(g, hw, ctx)
+        opt_compute_us, ag_time_us, rs_time_us, opt_comm_us = self._compute_optimizer_step_time(g, hw, ctx)
+        opt_step_time_us = opt_compute_us + opt_comm_us
         if opt_step_time_us > 0:
             g.metadata["optimizer_step_time_us"] = opt_step_time_us
-            step_time_us += opt_step_time_us
+            g.metadata["optimizer_compute_us"] = opt_compute_us
+            g.metadata["optimizer_comm_us"] = opt_comm_us
+            g.metadata["optimizer_ag_us"] = ag_time_us
+            g.metadata["optimizer_rs_us"] = rs_time_us
+
+            opt_node = g.nodes.get("optimizer_step")
+            ns_rotation = opt_node.attrs.get("ns_rotation", True) if opt_node else True
+
+            muon_ag = g.nodes.get("muon_ag")
+            muon_rs = g.nodes.get("muon_rs")
+
+            rotation_active = ns_rotation and (ag_time_us > 0 or rs_time_us > 0)
+
+            fwd_window_us = 0.0
+            if rotation_active and step_result:
+                fwd_window_s = max(step_result.warmup_fwd, step_result.steady_fwd_per_mb)
+                fwd_window_us = fwd_window_s * 1e6
+
+            from python.zrt.training.models.optimizer import moonshot_optimizer_hiding
+            opt_comm_exposed_us, opt_comm_hidden_us = moonshot_optimizer_hiding(
+                compute_us=opt_compute_us,
+                ag_us=ag_time_us,
+                rs_us=rs_time_us,
+                fwd_window_us=fwd_window_us,
+                rotation=rotation_active,
+            )
+
+            ag_hidden_us = min(ag_time_us, opt_compute_us + max(0.0, fwd_window_us - min(rs_time_us, fwd_window_us))) if rotation_active else 0.0
+            ag_exposed_us = ag_time_us - ag_hidden_us
+            rs_hidden_us = min(rs_time_us, fwd_window_us) if rotation_active else 0.0
+            rs_exposed_us = rs_time_us - rs_hidden_us
+
+            metrics.hidden_comm_ms += opt_comm_hidden_us / 1000.0
+
+            if muon_ag and ag_time_us > 0:
+                muon_ag.annotations["latency_us"] = ag_time_us
+                muon_ag.annotations["comm_time_us"] = ag_time_us
+                muon_ag.annotations["compute_us"] = 0.0
+                muon_ag.annotations["memory_us"] = 0.0
+                muon_ag.annotations["bound"] = "comm"
+                muon_ag.annotations["overlap_type"] = "moonshot_ag" if rotation_active else "none"
+                muon_ag.annotations["overlap_target"] = "compute:optimizer_step+fwd_window" if rotation_active else ""
+                muon_ag.annotations["overlap_exposed_us"] = ag_exposed_us
+                muon_ag.annotations["overlap_hidden_us"] = ag_hidden_us
+                if rotation_active:
+                    muon_ag.annotations["overlap_hide_window_us"] = opt_compute_us + max(0.0, fwd_window_us - rs_hidden_us)
+
+            if muon_rs and rs_time_us > 0:
+                muon_rs.annotations["latency_us"] = rs_time_us
+                muon_rs.annotations["comm_time_us"] = rs_time_us
+                muon_rs.annotations["compute_us"] = 0.0
+                muon_rs.annotations["memory_us"] = 0.0
+                muon_rs.annotations["bound"] = "comm"
+                muon_rs.annotations["overlap_type"] = "moonshot_rs" if rotation_active else "none"
+                muon_rs.annotations["overlap_target"] = "fwd_window" if rotation_active else ""
+                muon_rs.annotations["overlap_exposed_us"] = rs_exposed_us
+                muon_rs.annotations["overlap_hidden_us"] = rs_hidden_us
+                if rotation_active:
+                    muon_rs.annotations["overlap_hide_window_us"] = fwd_window_us
+
+            if opt_node and opt_compute_us > 0:
+                opt_node.annotations["latency_us"] = opt_compute_us
+                opt_node.annotations["compute_us"] = opt_compute_us
+                opt_node.annotations["memory_us"] = 0.0
+                opt_node.annotations["bound"] = "compute"
+                opt_node.annotations["overlap_exposed_us"] = opt_compute_us
+
+            g.metadata["optimizer_ag_exposed_us"] = ag_exposed_us
+
+            metrics.optimizer_comm_ms = opt_comm_exposed_us / 1000.0
+            metrics.optimizer_time_ms = opt_compute_us / 1000.0
+
+            step_time_us += opt_compute_us + opt_comm_exposed_us
             metrics.step_time_ms = step_time_us / 1000.0
+
+            g.metadata["optimizer_ag_hidden_us"] = ag_hidden_us
+            g.metadata["optimizer_rs_exposed_us"] = rs_exposed_us
+            g.metadata["optimizer_rs_hidden_us"] = rs_hidden_us
+            g.metadata["optimizer_comm_exposed_us"] = opt_comm_exposed_us
+            g.metadata["optimizer_comm_hidden_us"] = opt_comm_hidden_us
+            if step_result:
+                g.metadata["optimizer_fwd_window_us"] = max(step_result.warmup_fwd, step_result.steady_fwd_per_mb) * 1e6
 
         return g
 
     @staticmethod
     def _compute_optimizer_step_time(
         g: "OpGraph", hw: "HardwareSpec", ctx: "TransformContext",
-    ) -> float:
+    ) -> tuple[float, float, float, float]:
         """Compute optimizer step time in microseconds.
+
+        Returns:
+            Tuple of (compute_time_us, ag_time_us, rs_time_us, total_comm_us)
 
         Includes:
         1. Optimizer compute FLOPs (Adam: memory-bound; Muon: compute-bound)
@@ -728,24 +883,22 @@ class TrainingPipelinePass(GraphPass):
         """
         opt_node = g.nodes.get("optimizer_step")
         if opt_node is None:
-            return 0.0
-
+            return (0.0, 0.0, 0.0, 0.0)
+ 
         optimizer = opt_node.attrs.get("optimizer", "adam")
         step_flops = float(opt_node.attrs.get("step_flops", 0))
 
         from python.zrt.ir.types import DType
         if optimizer == "muon":
-            # Muon NS is compute-bound (large GEMMs)
             peak_flops = hw.peak_flops(DType.BF16)
             compute_time_us = (step_flops / peak_flops) * 1e6 if peak_flops > 0 else 0.0
         else:
-            # Adam is memory-bound (element-wise ops)
             opt_state_bytes = float(opt_node.attrs.get("state_bytes", 0))
             hbm_bw = hw.memory.hbm_bandwidth_gbps * 1e9 / 8
             compute_time_us = (opt_state_bytes / hbm_bw) * 1e6 if hbm_bw > 0 else 0.0
 
-        # Muon additional communication (AllGather momentum)
-        comm_time_us = 0.0
+        ag_time_us = 0.0
+        rs_time_us = 0.0
         if optimizer == "muon":
             ag_bytes = float(opt_node.attrs.get("muon_ag_bytes", 0))
             ns_rotation = opt_node.attrs.get("ns_rotation", True)
@@ -754,15 +907,13 @@ class TrainingPipelinePass(GraphPass):
                 gpus_per_node = hw.interconnect.intra_node.num_devices
                 link = hw.interconnect.inter_node if dp > gpus_per_node else hw.interconnect.intra_node
                 dp_bw = link.bandwidth_gbps * 1e9 / 8
-                # Ring factor: AG always, RS only when rotation=True
-                # AG: (dp-1)/dp factor; RS: same factor when rotation=True
+                ring_factor = (dp - 1) / dp
+                ag_time_us = (ring_factor * ag_bytes / dp_bw) * 1e6 if dp_bw > 0 else 0.0
                 if ns_rotation:
-                    ring_factor = 2.0 * (dp - 1) / dp  # AG + RS
-                else:
-                    ring_factor = 1.0 * (dp - 1) / dp  # AG only (Moonshot optimization)
-                comm_time_us = (ring_factor * ag_bytes / dp_bw) * 1e6 if dp_bw > 0 else 0.0
+                    rs_time_us = ag_time_us
 
-        return compute_time_us + comm_time_us
+        total_comm_us = ag_time_us + rs_time_us
+        return (compute_time_us, ag_time_us, rs_time_us, total_comm_us)
 
     @staticmethod
     def _estimate_stage_dw_us(

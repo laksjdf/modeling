@@ -53,7 +53,7 @@ The bound column in SimResult tells you which term dominates.
 │   norm_backward│ norm_backward                          │ 同 add_rms_norm                        │
 ├─────────────────────────────────────────────────────────────────────────────────────────────────┤
 │ Softmax                                                                                         │
-│                │ aten._softmax / aten.softmax.int        │ 5·N  (max+sub+exp+sum+div)            │
+│                │ aten._softmax / aten.softmax.int        │ 4·N  (sub+exp+sum+div)                │
 │                │                                        │ R=N·b  W=N·b                          │
 ├─────────────────────────────────────────────────────────────────────────────────────────────────┤
 │ 排序 (Sort / Topk) — O(N log N)                                                                 │
@@ -361,7 +361,7 @@ def _scaled_dot_product_attention(node: "OpNode") -> FMR:
 
     Input layout assumed: Q=(N,H,Sq,D), K=(N,H,Sk,D), V=(N,H,Sk,Dv)
     FLOPs = 4·N·H·Sq·Sk·D        (QK + AV matmuls)
-          + 4·N·H·Sq·Sk           (softmax: max+sub+exp+sum+div)
+          + 4·N·H·Sq·Sk           (softmax: sub+exp+sum+div)
     R = (Q+K+V)·b    W = output·b
     """
     if len(node.inputs) < 3:
@@ -392,7 +392,7 @@ def _paged_attention(node: "OpNode") -> FMR:
     - block_tables: (num_tokens, max_blocks_per_seq) 紧张映射
     - KV cache: (max_num_blocks, H, block_size, D)
 
-    FLOPs = 4*N*H*Sq*Sk*D + 5*N*H*Sq*Sk  (与 FlashAttention 相同)
+    FLOPs = 4*N*H*Sq*Sk*D + 4*N*H*Sq*Sk  (与 FlashAttention 相同)
     R = Q*b + K*b + V*b + block_tables*sizeof(int)  (额外索引开销)
     W = output*b
 
@@ -422,7 +422,7 @@ def _paged_attention(node: "OpNode") -> FMR:
 
     # FLOPs 与 FlashAttention 相同
     flops = 4.0 * N * H * Sq * Sk * D
-    flops += 5.0 * N * H * Sq * Sk
+    flops += 4.0 * N * H * Sq * Sk
 
     # 内存带宽：Q + K + V + block_tables 索引
     q_bytes = N * H * Sq * D * it
@@ -444,7 +444,7 @@ def _sparse_flash_attention(node: "OpNode") -> FMR:
     - sparsity_ratio: 实际计算的注意力位置比例 (0 < ratio <= 1)
     - 可从 node.annotations["sparsity_ratio"] 或 attrs["window_size"]/Sk 估算
 
-    FLOPs = (4*N*H*Sq*Sk*D + 5*N*H*Sq*Sk) * sparsity_ratio
+    FLOPs = (4*N*H*Sq*Sk*D + 4*N*H*Sq*Sk) * sparsity_ratio
     R = (Q + sparsity_ratio*K + sparsity_ratio*V)*b  (只访问稀疏位置的 KV)
     W = output*b
 
@@ -484,7 +484,7 @@ def _sparse_flash_attention(node: "OpNode") -> FMR:
     sparsity_ratio = max(0.01, min(1.0, sparsity_ratio))
 
     # FLOPs 乘以稀疏比例
-    flops = (4.0 * N * H * Sq * Sk * D + 5.0 * N * H * Sq * Sk) * sparsity_ratio
+    flops = (4.0 * N * H * Sq * Sk * D + 4.0 * N * H * Sq * Sk) * sparsity_ratio
 
     # 内存带宽：Q 全部访问，KV 只访问稀疏位置
     q_bytes = N * H * Sq * D * it
@@ -605,7 +605,7 @@ def _rms_norm_gated(node: "OpNode") -> FMR:
 
 def _softmax(node: "OpNode") -> FMR:
     """aten._softmax.default / aten.softmax.int
-    FLOPs ≈ 4·N  (max + sub + exp + sum + div)
+    FLOPs ≈ 4·N  (sub + exp + sum + div)
     R=N·b    W=N·b
     """
     if not node.inputs:
@@ -613,7 +613,7 @@ def _softmax(node: "OpNode") -> FMR:
     inp = node.inputs[0]
     n = _numel(inp.shape)
     it = inp.dtype.itemsize
-    # max(N) + sub(N) + exp(N) + sum(N) + div(N) ≈ 4N
+    # sub(N) + exp(N) + sum(N) + div(N) ≈ 4N
     flops = 4.0 * n
     read  = n * it
     write = n * it
@@ -784,7 +784,7 @@ def _default(node: "OpNode") -> FMR:
 def _fused_attention(node: "OpNode") -> FMR:
     """flash_attn / sdpa / sdpa_backward / npu_fusion_attention / attn / attn_grad / mla_attn
     外部输入按 [Q, K, V, ...] 顺序, 调用 _scaled_dot_product_attention.
-    FLOPs = 4·N·H·Sq·Sk·D + 5·N·H·Sq·Sk
+    FLOPs = 4·N·H·Sq·Sk·D + 4·N·H·Sq·Sk
     R=(Q+K+V)·b    W=output·b
     """
     if len(node.inputs) >= 3:
@@ -908,7 +908,7 @@ def _fused_mlp(node: "OpNode") -> FMR:
 def _fused_moe_gate(node: "OpNode", with_topk: bool = False) -> FMR:
     """moe_gate / npu_moe_gate / moe_gate_topk / npu_moe_gate_topk
     一个小 GEMM (hidden→num_experts) + softmax (+ topk 比较)
-    FLOPs = linear_FLOPs + 5·N_out [+ N_out if with_topk]
+    FLOPs = linear_FLOPs + 4·N_out [+ N_out if with_topk]
     R/W   = same as _linear for the gate matmul
     """
     # Dominant cost: one matmul to compute gate scores
@@ -916,7 +916,7 @@ def _fused_moe_gate(node: "OpNode", with_topk: bool = False) -> FMR:
         flops, read, write = _linear(node) if len(node.inputs[1].shape) >= 2 else _default(node)
         # Add softmax cost
         n_out = sum(_numel(o.shape) for o in node.outputs) if node.outputs else 1
-        flops += 5.0 * n_out
+        flops += 4.0 * n_out
         if with_topk:
             flops += n_out   # topk comparison ops
         return flops, read, write

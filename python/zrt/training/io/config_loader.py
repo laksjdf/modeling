@@ -52,8 +52,8 @@ def _normalize_recompute_categories(layer_kind: str, raw) -> set[str]:
 from zrt.training.spec.dtype import Dtype
 from zrt.training.spec.model import LayerKind, ModelSpec
 from zrt.training.spec.strategy import (
-    CPKind, MuonConfig, OffloadPolicy, OptKind, PPSched, RecomputePolicy, Strategy,
-    TPOverlap,
+    CPKind, MuonConfig, OffloadPolicy, OptKind, PPSched, QuantPolicy, RecomputePolicy,
+    Strategy, TPOverlap,
 )
 from zrt.training.spec.system import GPU, SystemSpec
 
@@ -233,6 +233,8 @@ def _parse_system(d: dict) -> SystemSpec:
         overlap_ratio=dict(hw.compute.overlap_ratio),
         sram_kb_per_sm=hw.compute.sram_kb_per_sm,
         ep_overlap_waves=hw.compute.ep_overlap_waves,
+        compute_efficiency=hw.compute.compute_efficiency,
+        mem_bw_efficiency=hw.memory.mem_bw_efficiency,
     )
     return SystemSpec(
         gpu=gpu,
@@ -272,6 +274,23 @@ def _parse_strategy(d: dict) -> Strategy:
             muon_param_fraction=mc.get("muon_param_fraction", 0.85),
         )
 
+    quant = QuantPolicy()
+    if "quant" in d:
+        q = d["quant"]
+        defaults = QuantPolicy()
+        quant = QuantPolicy(
+            assume_all_casts_fused=bool(q.get(
+                "assume_all_casts_fused", defaults.assume_all_casts_fused)),
+            fuse_ln_epilog=bool(q.get(
+                "fuse_ln_epilog", defaults.fuse_ln_epilog)),
+            fuse_gemm_epilog=bool(q.get(
+                "fuse_gemm_epilog", defaults.fuse_gemm_epilog)),
+            fuse_attn_internal=bool(q.get(
+                "fuse_attn_internal", defaults.fuse_attn_internal)),
+            ln_softmax_promote_fp32=bool(q.get(
+                "ln_softmax_promote_fp32", defaults.ln_softmax_promote_fp32)),
+        )
+
     return Strategy(
         tp=d.get("tp", 1),
         cp=d.get("cp", 1),
@@ -295,6 +314,7 @@ def _parse_strategy(d: dict) -> Strategy:
         dp_grad_buckets=int(d.get("dp_grad_buckets", 25)),
         optimizer=OptKind(d.get("optimizer", "adam")),
         muon_config=muon_config,
+        quant=quant,
     )
 
 
@@ -351,7 +371,7 @@ _QUANT_PRESETS: dict[str, dict[str, str]] = {
         "act_dtype": "bf16",
         "moe_act_dtype": "fp8_e4m3",
     },
-    "deepseek_v4_fp8_fp4": {   # V4 main path
+    "deepseek_v4_fp8_fp4": {   # V4 main path — calibrated against H100/B300 anchors
         "attn_compute_dtype": "bf16",
         "routed_expert_compute_dtype": "fp8_e4m3",
         "routed_expert_weight_dtype": "fp4",
@@ -359,6 +379,12 @@ _QUANT_PRESETS: dict[str, dict[str, str]] = {
         "routed_expert_grad_dtype": "fp32",
         "act_dtype": "bf16",
         "moe_act_dtype": "fp8_e4m3",
+        # v2 per-component fields (explicit BF16 keeps numerics aligned
+        # with the v1-calibrated anchors).
+        "attn_weight_dtype": "bf16",
+        "shared_expert_weight_dtype": "bf16",
+        "attn_grad_dtype": "bf16",
+        "shared_expert_grad_dtype": "bf16",
     },
     "deepseek_v4_full_fp8": {   # V4 with FP8 shared experts
         "attn_compute_dtype": "bf16",
@@ -369,6 +395,24 @@ _QUANT_PRESETS: dict[str, dict[str, str]] = {
         "act_dtype": "bf16",
         "moe_act_dtype": "fp8_e4m3",
         "attn_act_dtype": "bf16",
+        "attn_weight_dtype": "bf16",
+        "shared_expert_weight_dtype": "bf16",
+        "attn_grad_dtype": "bf16",
+        "shared_expert_grad_dtype": "bf16",
+    },
+    "deepseek_v4_paper_fp4": {   # v2 NEW — true V4 paper config (FP4 compute + FP4 weight)
+        "attn_compute_dtype": "bf16",
+        "routed_expert_compute_dtype": "fp4",       # ← FP4 peak, ~4× BF16 on B300
+        "routed_expert_weight_dtype": "fp4",
+        "shared_expert_compute_dtype": "fp8_e4m3",
+        "routed_expert_grad_dtype": "fp32",
+        "act_dtype": "bf16",
+        "moe_act_dtype": "fp8_e4m3",
+        "attn_act_dtype": "bf16",
+        "attn_weight_dtype": "bf16",
+        "shared_expert_weight_dtype": "bf16",
+        "attn_grad_dtype": "bf16",
+        "shared_expert_grad_dtype": "bf16",
     },
 }
 

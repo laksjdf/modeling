@@ -44,7 +44,7 @@ def _ctx(cp=1, cp_kind="ulysses", dp=1, zero_stage=0, dp_overlap=True):
 
 def _attn_node(node_id="attn_0"):
     """Create a minimal attention node that ContextParallelPass will match."""
-    t = TensorMeta(id="t0", shape=(1, 128, 4096), dtype=DType.BF16, mem_bytes=1 * 128 * 4096 * 2)
+    t = TensorMeta(id="t0", shape=(1, 2048, 4096), dtype=DType.BF16, mem_bytes=1 * 2048 * 4096 * 2)
     return OpNode(
         id=node_id,
         op_type="aten._scaled_dot_product_attention",
@@ -94,7 +94,6 @@ def test_cp_ring_annotates_attention():
     ann = result.nodes["attn_0"].annotations.get("cp_split", {})
     assert ann["kind"] == "ring"
     assert ann["cp"] == 2
-    assert ann["p2p_rounds"] == 2
 
 
 def test_cp_pass_skipped_when_cp_1():
@@ -128,9 +127,10 @@ def test_comm_inserter_cp_ring_inserts_p2p_with_overlap_target():
     result = CommInserterPass().run(g, ctx)
 
     p2p_nodes = [n for n in result.nodes.values() if n.op_type == "comm.send_recv"]
-    assert len(p2p_nodes) == cp
+    assert len(p2p_nodes) == 1  # one per-layer P2P node
     for p2p in p2p_nodes:
-        assert p2p.annotations.get("overlap_target") == "fa_tile:attn_0"
+        assert p2p.annotations.get("overlap_target") == "attention_block"
+        assert p2p.attrs["rounds"] == cp
 
 
 # ── Phase 3.2: DataParallelPass ───────────────────────────────────────────────

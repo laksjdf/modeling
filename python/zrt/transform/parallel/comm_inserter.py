@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 def _make_comm_node(node_id: str, collective: str,
                     src_node: OpNode, group_size: int) -> OpNode:
     """Create a comm.* OpNode that wraps src_node's outputs."""
-    return OpNode(
+    node = OpNode(
         id=node_id,
         op_type=f"comm.{collective}",
         inputs=copy.deepcopy(src_node.outputs),
@@ -36,6 +36,15 @@ def _make_comm_node(node_id: str, collective: str,
         layer=src_node.layer,
         category="communication",
     )
+    _propagate_phase(src_node, node)
+    return node
+
+
+def _propagate_phase(src: OpNode, dst: OpNode) -> None:
+    """Copy ``annotations["phase"]`` from src to dst if present."""
+    phase = src.annotations.get("phase", "")
+    if phase:
+        dst.annotations["phase"] = phase
 
 
 def _rewire(g: "OpGraph", src_id: str, comm_node: OpNode) -> None:
@@ -131,7 +140,11 @@ class CommInserterPass(GraphPass):
         micro_batch = ctx.training.micro_batch if ctx.training else 1
         topk = ctx.profile.moe_active if ctx.profile else 8
 
-        ep_msg_bytes = micro_batch * seq_len * hidden * topk * dtype_bytes // ep
+        # Per A2A direction on this EP rank. Dispatch and combine each carry
+        # one BF16 hidden activation stream for the routed top-k tokens. Use
+        # the same ceil token partitioning as ExpertGroupedMMPass.
+        routed_tokens_per_ep_rank = max(1, (micro_batch * seq_len * topk + ep - 1) // ep)
+        ep_msg_bytes = routed_tokens_per_ep_rank * hidden * dtype_bytes
 
         dispatch_tensor = TensorMeta.from_shape_dtype(
             "ep_dispatch_hidden",
@@ -144,15 +157,30 @@ class CommInserterPass(GraphPass):
             dtype=DType.BF16,
         )
 
-        processed_scopes: set[str] = set()
+        processed_scopes: set[tuple[str, str]] = set()
         for node in ep_nodes:
             scope_root = _moe_scope_root(node.scope)
-            if scope_root in processed_scopes:
+            phase = node.annotations.get("phase", "")
+            scope_key = (scope_root, phase)
+            if scope_key in processed_scopes:
                 continue
-            processed_scopes.add(scope_root)
+            processed_scopes.add(scope_key)
 
-            block = [n for n in ep_nodes if _moe_scope_root(n.scope) == scope_root]
+            block = [
+                n for n in ep_nodes
+                if _moe_scope_root(n.scope) == scope_root
+                and n.annotations.get("phase", "") == phase
+            ]
             first, last = block[0], block[-1]
+            # If first node is a GroupedMM gate_up, the block exit is the linked
+            # down node. ExpertGroupedMMPass runs before this pass, so down_id
+            # should still point to a raw fused compute node, not a comm node.
+            down_id = first.annotations.get("ep_block_down_id")
+            if down_id and down_id in g.nodes:
+                last = g.nodes[down_id]
+                assert not last.annotations.get("ep_a2a_inserted"), (
+                    f"EP block exit already has A2A inserted: {down_id}"
+                )
 
             dispatch_id = f"comm_a2a_dispatch_{first.id}"
             combine_id  = f"comm_a2a_combine_{last.id}"
@@ -164,12 +192,15 @@ class CommInserterPass(GraphPass):
                     inputs=[dispatch_tensor],
                     outputs=[dispatch_tensor],
                     attrs={"group_size": ep, "collective": "all_to_all",
-                           "role": "dispatch", "msg_bytes": ep_msg_bytes},
+                           "role": "dispatch", "msg_bytes": ep_msg_bytes,
+                           "msg_bytes_semantics": "per_a2a_direction",
+                           "dtype_bytes": dtype_bytes},
                     scope=first.scope,
                     layer=first.layer,
                     category="communication",
                 )
                 dispatch.annotations["inserted_by"] = "ep_pass"
+                _propagate_phase(first, dispatch)
                 g.add_node(dispatch)
                 _prepend_comm(g, first.id, dispatch)
 
@@ -180,12 +211,15 @@ class CommInserterPass(GraphPass):
                     inputs=[combine_tensor],
                     outputs=[combine_tensor],
                     attrs={"group_size": ep, "collective": "all_to_all",
-                           "role": "combine", "msg_bytes": ep_msg_bytes},
+                           "role": "combine", "msg_bytes": ep_msg_bytes,
+                           "msg_bytes_semantics": "per_a2a_direction",
+                           "dtype_bytes": dtype_bytes},
                     scope=last.scope,
                     layer=last.layer,
                     category="communication",
                 )
                 combine.annotations["inserted_by"] = "ep_pass"
+                _propagate_phase(last, combine)
                 g.add_node(combine)
                 _rewire(g, last.id, combine)
 
@@ -209,7 +243,7 @@ class CommInserterPass(GraphPass):
         seq_len = ctx.training.seq_len if ctx.training else 2048
         hidden = ctx.training.hidden if ctx.training else 7168
         micro_batch = ctx.training.micro_batch if ctx.training else 1
-        
+
         # Resolve cp_kind based on model type
         if ctx.training:
             cp_kind_resolved = ctx.training.resolve_cp_kind(ctx.model_id, cp)
@@ -622,7 +656,11 @@ class CommInserterPass(GraphPass):
 
 
 def _moe_scope_root(scope: str) -> str:
-    """Return the scope prefix up to (not including) the expert index."""
+    """Return the phase-agnostic scope prefix before the expert index.
+
+    Callers that group MoE blocks across training graphs must pair this root
+    with phase, e.g. ``(scope_root, phase)``, so fwd/bwd blocks are not merged.
+    """
     for kw in ("experts.", "expert_"):
         idx = scope.lower().find(kw)
         if idx >= 0:
@@ -632,7 +670,7 @@ def _moe_scope_root(scope: str) -> str:
 
 def _prepend_comm(g: "OpGraph", dst_id: str, comm_node: OpNode) -> None:
     """Insert comm_node between all predecessors of dst_id and dst_id itself.
-    
+
     Handles two cases:
     1. dst has predecessors: reroute preds → comm → dst
     2. dst has no predecessors: add comm as new graph entry node
@@ -641,7 +679,7 @@ def _prepend_comm(g: "OpGraph", dst_id: str, comm_node: OpNode) -> None:
     g.nodes[comm_node.id] = comm_node
     g._succ[comm_node.id] = []
     g._pred[comm_node.id] = []
-    
+
     in_edges = [e for e in g.edges if e.dst == dst_id]
     g.edges = [e for e in g.edges if e.dst != dst_id]
 

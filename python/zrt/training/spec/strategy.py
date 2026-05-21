@@ -108,6 +108,47 @@ class OffloadPolicy:
 
 
 @dataclass
+class QuantPolicy:
+    """Hardware-realization assumptions for cast/dequant ops at dtype boundaries.
+
+    ``assume_all_casts_fused`` is the top-level switch. When True (default),
+    every cast op produced by ``insert_cast_pass`` is marked ``fused`` and
+    contributes 0 bytes / 0 time — matching v1 behaviour where casts were
+    silently absorbed into adjacent kernels.
+
+    When False, the four ``fuse_*`` flags below decide per-site fusion. The
+    defaults align with production V4 stacks (Megatron-Core + cuBLASLt FP8
+    GEMM + FlashAttention-3) so non-experts get a realistic baseline.
+
+    ``ln_softmax_promote_fp32`` is independent of the cast pass — it adds
+    bytes to softmax/LN inputs that arrive in quantized dtypes, accounting
+    for the FP32 reduction that real implementations always perform.
+    """
+    assume_all_casts_fused:  bool = True
+    fuse_ln_epilog:          bool = True
+    fuse_gemm_epilog:        bool = True
+    fuse_attn_internal:      bool = True
+    ln_softmax_promote_fp32: bool = True
+
+    def is_fused_at(self, site: str) -> bool:
+        """Return True when a cast at the given site should be free.
+
+        ``site`` ∈ {"ln_epilog", "gemm_epilog", "attn_internal", "other"}.
+        ``"other"`` (e.g. residual-add boundary) is always honored as
+        unfused unless ``assume_all_casts_fused`` is True.
+        """
+        if self.assume_all_casts_fused:
+            return True
+        if site == "ln_epilog":
+            return self.fuse_ln_epilog
+        if site == "gemm_epilog":
+            return self.fuse_gemm_epilog
+        if site == "attn_internal":
+            return self.fuse_attn_internal
+        return False
+
+
+@dataclass
 class Strategy:
     # parallelism degrees
     tp: int = 1
@@ -152,6 +193,11 @@ class Strategy:
     optimizer: OptKind = OptKind.ADAM
     muon_config: MuonConfig | None = None
 
+    # quantization realization assumptions (cast fusion etc.) — only used
+    # once cast_pass / per-operand byte accounting is wired in (Stage D).
+    # Default reproduces v1 behaviour: all casts assumed fused → 0 cost.
+    quant: QuantPolicy = field(default_factory=QuantPolicy)
+
     def num_microbatches(self) -> int:
         """Number of microbatches per training step."""
         if self.global_batch > 0:
@@ -193,6 +239,16 @@ class Strategy:
             elif model.num_experts % self.ep != 0:
                 errors.append(
                     f"num_experts({model.num_experts}) not divisible by EP({self.ep})"
+                )
+            if self.dp < self.ep:
+                errors.append(
+                    f"dp must be >= ep for expert-DP sharding "
+                    f"(dp={self.dp}, ep={self.ep})"
+                )
+            elif self.dp % self.ep != 0:
+                errors.append(
+                    f"dp must be divisible by ep for expert-DP sharding "
+                    f"(dp={self.dp}, ep={self.ep})"
                 )
 
         if self.zero_stage >= 1 and self.dp <= 1:

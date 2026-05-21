@@ -5,6 +5,7 @@ import math
 from typing import TYPE_CHECKING
 
 from python.zrt.transform.base import GraphPass
+from python.zrt.transform.training.recompute import is_external_recompute_node
 
 if TYPE_CHECKING:
     from python.zrt.ir.graph import OpGraph
@@ -38,6 +39,8 @@ class FlopsPass(GraphPass):
     @staticmethod
     def _is_expert_scope(scope: str) -> bool:
         s = scope.lower()
+        if "shared_expert" in s:
+            return False
         return any(k in s for k in FlopsPass._EXPERT_KEYWORDS)
 
     def run(self, graph: "OpGraph", ctx: "TransformContext") -> "OpGraph":
@@ -47,6 +50,7 @@ class FlopsPass(GraphPass):
 
         is_train = ctx.training is not None
         moe_scale = graph.metadata.get("moe_active_experts", 1)
+        num_experts_total = graph.metadata.get("moe_total_experts", 0)
 
         for node in g.nodes.values():
             # Priority: use sem_flops (from fusion semantics) if available
@@ -67,12 +71,25 @@ class FlopsPass(GraphPass):
                 # Fallback to roofline formula
                 flops, read_b, write_b = sim._fmr(node)
 
-            # MoE expert scaling: captured graph has only 1 expert's ops,
-            # but real model activates moe_active_experts per token.
+            # MoE expert scaling: unfused captures usually contain one routed
+            # expert's ops, while ExpertGroupedMMPass materializes the local
+            # expert group in the GroupedMatMul shape already.
             if moe_scale > 1 and node.scope and self._is_expert_scope(node.scope):
-                flops = int(flops * moe_scale)
-                read_b = int(read_b * moe_scale)
-                write_b = int(write_b * moe_scale)
+                if node.annotations.get("fused_by") == "expert_grouped_mm":
+                    scale = 1.0
+                elif (ep_local := node.annotations.get("ep_experts_local", 0)) > 0 and num_experts_total > 0:
+                    ep_frac = ep_local / num_experts_total
+                    scale = moe_scale * ep_frac
+                elif getattr(ctx.parallel, "ep", 1) > 1:
+                    # With EP enabled, unannotated residual expert-scope helper
+                    # ops are already local to this rank after EP/grouped-MM
+                    # lowering. Active-expert scaling would charge them again.
+                    scale = 1.0
+                else:
+                    scale = moe_scale
+                flops = int(flops * scale)
+                read_b = int(read_b * scale)
+                write_b = int(write_b * scale)
 
             node.annotations["flops"]       = int(flops)
             node.annotations["read_bytes"]  = int(read_b)
@@ -93,10 +110,13 @@ class FlopsPass(GraphPass):
                 else:
                     dx_flops, dw_flops = self._calculate_grad_flops(node, train_flops)
 
-                rec_mult = 2.0 if node.annotations.get("recompute") and not is_bwd else 1.0
-                node.annotations["flops_fwd"] = int(train_flops * rec_mult)
-                node.annotations["flops_dx"]  = int(dx_flops)
-                node.annotations["flops_dw"]  = int(dw_flops)
+                # flops_fwd includes external checkpoint replay overhead (2x).
+                # FA/SDPA attention cores already include internal recompute in
+                # their backward formula and must not be doubled here.
+                rec_mult = 2.0 if is_external_recompute_node(node) and not is_bwd else 1.0
+                node.annotations["flops_fwd"]  = int(train_flops * rec_mult)
+                node.annotations["flops_dx"]   = int(dx_flops)
+                node.annotations["flops_dw"]   = int(dw_flops)
 
         return g
 
@@ -192,17 +212,64 @@ class RooflinePass(GraphPass):
             write_b = node.annotations.get("write_bytes", 0)
             if flops == 0 and read_b == 0:   # FlopsPass didn't run — fall back
                 flops, read_b, write_b = sim._fmr(node)
-            total_b = read_b + write_b
+
+            base_flops = flops
+            base_read_b = read_b
+            base_write_b = write_b
+            recompute_flops = 0
+            recompute_read_b = 0
+            recompute_write_b = 0
+
+            # Add external checkpoint replay overhead from fwd predecessors.
+            # FA/SDPA attention cores already pay internal recompute inside
+            # their backward kernel, so they are excluded from this replay.
+            phase = node.annotations.get("phase", "fwd")
+            is_bwd = phase in ("bwd", "backward", "train_backward")
+            if is_bwd and ctx.training:
+                for e in g.in_edges(node.id):
+                    src_id = e.src
+                    if src_id in g.nodes and is_external_recompute_node(g.nodes[src_id]):
+                        src = g.nodes[src_id]
+                        recompute_flops += src.annotations.get("flops", 0)
+                        recompute_read_b += src.annotations.get("read_bytes", 0)
+                        recompute_write_b += src.annotations.get("write_bytes", 0)
 
             # Use activation input dtype for compute throughput (INT8/FP8 vs BF16)
             dtype = _effective_compute_dtype(node)
             peak  = hw.peak_flops(dtype)   # ops/s
             bw    = hw.hbm_bandwidth()     # bytes/s
 
-            compute_us = (flops / peak  * 1e6) if peak > 0 else 0.0
-            memory_us  = (total_b / bw  * 1e6) if bw   > 0 else 0.0
+            base_total_b = base_read_b + base_write_b
+            base_compute_us = (base_flops / peak * 1e6) if peak > 0 else 0.0
+            base_memory_us = (base_total_b / bw * 1e6) if bw > 0 else 0.0
+            if base_compute_us > 0 or base_memory_us > 0:
+                base_latency_us = max(base_compute_us, base_memory_us, 1e-3)
+            else:
+                base_latency_us = 0.0
+            recompute_total_b = recompute_read_b + recompute_write_b
+            recompute_compute_us = (recompute_flops / peak * 1e6) if peak > 0 else 0.0
+            recompute_memory_us = (recompute_total_b / bw * 1e6) if bw > 0 else 0.0
+            if recompute_compute_us > 0 or recompute_memory_us > 0:
+                recompute_latency_us = max(recompute_compute_us, recompute_memory_us)
+            else:
+                recompute_latency_us = 0.0
 
-            ai = flops / total_b if total_b > 0 else math.inf
+            saved_activation_b = 0
+            if ctx.training and not is_bwd and not node.annotations.get("recompute"):
+                saved_activation_b = sum(t.mem_bytes for t in node.outputs)
+            activation_memory_us = (saved_activation_b / bw * 1e6) if bw > 0 else 0.0
+
+            compute_us = base_compute_us
+            memory_us = base_memory_us + activation_memory_us
+            if is_bwd:
+                final_latency_us = base_latency_us + recompute_latency_us
+            elif base_compute_us > 0 or base_memory_us > 0 or activation_memory_us > 0:
+                final_latency_us = base_latency_us + activation_memory_us
+            else:
+                final_latency_us = 0.0
+
+            total_b = base_total_b + saved_activation_b
+            ai = base_flops / total_b if total_b > 0 else math.inf
 
             if compute_us > 0 or memory_us > 0:
                 bound = "compute" if compute_us >= memory_us else "memory"
@@ -211,11 +278,24 @@ class RooflinePass(GraphPass):
 
             node.annotations["compute_us"]           = compute_us
             node.annotations["memory_us"]            = memory_us
+            node.annotations["base_compute_us"]      = base_compute_us
+            node.annotations["base_memory_us"]       = base_memory_us
+            node.annotations["base_latency_us"]      = base_latency_us
+            node.annotations["saved_activation_bytes"] = saved_activation_b
+            node.annotations["activation_memory_us"] = activation_memory_us
+            node.annotations["checkpoint_activation_bytes"] = 0
+            node.annotations["checkpoint_memory_us"] = 0.0
+            node.annotations["recompute_flops"]      = recompute_flops
+            node.annotations["recompute_read_bytes"] = recompute_read_b
+            node.annotations["recompute_write_bytes"] = recompute_write_b
+            node.annotations["recompute_compute_us"] = recompute_compute_us
+            node.annotations["recompute_memory_us"]  = recompute_memory_us
+            node.annotations["recompute_latency_us"] = recompute_latency_us
             node.annotations["arithmetic_intensity"] = ai
             node.annotations["bound"]                = bound
             # Respect pre-existing latency_us (e.g. from profiling or test injection)
             if "latency_us" not in node.annotations:
-                node.annotations["latency_us"] = max(compute_us, memory_us, 1e-3)
+                node.annotations["latency_us"] = final_latency_us
 
         return g
 

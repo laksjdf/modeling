@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import pytest
 
+from python.zrt.ir.edge import Edge
 from python.zrt.ir.graph import OpGraph
 from python.zrt.ir.node import OpNode
-from python.zrt.transform.analysis.passes import FlopsPass
+from python.zrt.transform.analysis.passes import FlopsPass, RooflinePass
 from python.zrt.transform.analysis.training import (
     TrainingFlopsPass,
     TrainingMemoryPass,
@@ -22,6 +23,10 @@ from python.zrt.transform.context import (
     ParallelConfig,
     TrainingConfig,
     TransformContext,
+)
+from python.zrt.transform.training.recompute import (
+    has_internal_recompute,
+    is_external_recompute_node,
 )
 
 
@@ -235,6 +240,61 @@ def test_steady_steps_equals_num_microbatches():
 
 
 # ── Bug 3: FlopsPass gates _calculate_grad_flops on node phase ───────────
+
+def test_recompute_compute_time_excludes_comm_nodes_defensively():
+    fwd_compute = OpNode(
+        id="fwd_compute",
+        op_type="aten.silu.default",
+        category="compute",
+        annotations={
+            "phase": "fwd",
+            "recompute": True,
+            "latency_us": 100.0,
+            "base_latency_us": 80.0,
+        },
+    )
+    bwd_compute = OpNode(
+        id="bwd_compute",
+        op_type="aten.silu.default",
+        category="compute",
+        annotations={
+            "phase": "bwd",
+            "recompute": True,
+            "latency_us": 90.0,
+            "base_latency_us": 70.0,
+        },
+    )
+    comm = OpNode(
+        id="comm",
+        op_type="comm.all_to_all",
+        category="communication",
+        annotations={
+            "phase": "fwd",
+            "recompute": True,
+            "latency_us": 1000.0,
+            "base_latency_us": 900.0,
+        },
+    )
+    g = _make_graph(
+        [fwd_compute, bwd_compute, comm],
+        {"num_layers": 1, "num_layers_traced": 1, "training_flops": 1e12},
+    )
+    ctx = _make_ctx(pp=1, micro_batch=1, global_batch=1)
+
+    from unittest.mock import MagicMock, patch
+    mock_timeline = MagicMock()
+    mock_timeline.total_latency_us = 100.0
+
+    with patch("python.zrt.executor.scheduler.DAGScheduler") as MockSched:
+        MockSched.return_value.schedule.return_value = mock_timeline
+        result = TrainingPipelinePass().run(g, ctx)
+
+    assert result.metadata["recompute_compute_ms"] == pytest.approx(0.15)
+    metrics = result.metadata["pipeline_metrics"]
+    assert metrics.fwd_compute_ms == 0.0
+    assert metrics.bwd_compute_ms == 0.0
+    assert metrics.compute_time_ms == pytest.approx(metrics.recompute_compute_ms)
+
 
 def test_train_flops_pass_zeros_dx_dw_for_backward_phase_nodes():
     """Bug 3: Bwd-phase nodes should have dx_flops=0 and dw_flops=0.
@@ -461,11 +521,11 @@ def test_recompute_flops_only_for_fwd_phase_nodes():
 
     # Fwd-phase node with recompute
     n1 = OpNode(
-        id="attn_fwd",
-        op_type="aten._scaled_dot_product_attention",
+        id="mm_fwd",
+        op_type="aten.mm.default",
         inputs=[_tm((1, 128, 4096))],
         outputs=[_tm((1, 128, 4096))],
-        scope="model.layers.0.self_attn",
+        scope="model.layers.0.mlp",
         category="compute",
     )
     n1.annotations["phase"] = "fwd"
@@ -474,11 +534,11 @@ def test_recompute_flops_only_for_fwd_phase_nodes():
 
     # Bwd-phase node with recompute tag (should be ignored)
     n2 = OpNode(
-        id="attn_bwd",
-        op_type="aten._scaled_dot_product_attention_backward",
+        id="mm_bwd",
+        op_type="aten.mm.default",
         inputs=[_tm((1, 128, 4096))],
         outputs=[_tm((1, 128, 4096))],
-        scope="model.layers.0.self_attn",
+        scope="model.layers.0.mlp",
         category="compute",
     )
     n2.annotations["phase"] = "bwd"
@@ -608,6 +668,79 @@ def test_integration_recompute_multiplier_not_applied_to_bwd_nodes():
     assert fwd_flops == 2 * bwd_flops, (
         f"Fwd node should have 2x flops due to recompute, got fwd={fwd_flops} bwd={bwd_flops}"
     )
+
+
+def test_flash_attention_internal_recompute_is_not_external_checkpoint_replay():
+    """FA/SDPA backward already includes internal recompute, so do not double it."""
+    from python.zrt.ir.types import DType, TensorMeta
+
+    q = TensorMeta.from_shape_dtype("q", (1, 128, 16, 64), DType.BF16)
+    out = TensorMeta.from_shape_dtype("out", (1, 128, 16, 64), DType.BF16)
+    grad = TensorMeta.from_shape_dtype("grad", (1, 128, 16, 64), DType.BF16)
+
+    fa = OpNode(
+        id="fa",
+        op_type="aten._scaled_dot_product_flash_attention.default",
+        inputs=[q],
+        outputs=[out],
+        category="compute",
+        annotations={
+            "phase": "fwd",
+            "recompute": True,
+            "sem_flops": 1_000_000,
+            "sem_io": {
+                "activation": {"bytes": q.mem_bytes},
+                "output": {"bytes": out.mem_bytes},
+            },
+        },
+    )
+    bwd = OpNode(
+        id="fa_bwd",
+        op_type="aten.mm.default",
+        inputs=[out],
+        outputs=[grad],
+        category="compute",
+        annotations={"phase": "bwd"},
+    )
+    g = OpGraph(
+        name="fa_internal_recompute",
+        phase="train",
+        nodes={fa.id: fa, bwd.id: bwd},
+        edges=[Edge(src="fa", src_idx=0, dst="fa_bwd", dst_idx=0, tensor=out)],
+        metadata={"fwd_bwd_stitched": True},
+    )
+
+    ctx = _make_ctx(recompute_policy="full")
+    g = FlopsPass().run(g, ctx)
+    assert g.nodes["fa"].annotations["flops_fwd"] == g.nodes["fa"].annotations["flops"]
+
+    g = TrainingFlopsPass().run(g, ctx)
+    assert g.metadata["recompute_flops"] == 0
+
+    g = RooflinePass().run(g, ctx)
+    assert g.nodes["fa_bwd"].annotations["recompute_flops"] == 0
+    assert g.nodes["fa_bwd"].annotations["recompute_latency_us"] == 0.0
+
+
+def test_recompute_helper_classifies_internal_attention_kernels():
+    assert has_internal_recompute(OpNode(id="flash", op_type="flash_attn_fwd"))
+    assert has_internal_recompute(OpNode(id="sdpa", op_type="aten.sdpa.default"))
+    assert has_internal_recompute(
+        OpNode(id="scaled_dot", op_type="aten.scaled_dot_product_attention.default")
+    )
+    assert not has_internal_recompute(OpNode(id="mask", op_type="custom_attn_mask_apply"))
+    assert not has_internal_recompute(OpNode(id="mm", op_type="aten.mm.default"))
+    assert not has_internal_recompute(OpNode(id="silu", op_type="aten.silu.default"))
+
+
+def test_recompute_helper_classifies_external_checkpoint_replay():
+    mm = OpNode(id="mm", op_type="aten.mm.default", annotations={"recompute": True})
+    flash = OpNode(id="flash", op_type="flash_attn_fwd", annotations={"recompute": True})
+    plain = OpNode(id="plain", op_type="aten.mm.default")
+
+    assert is_external_recompute_node(mm)
+    assert not is_external_recompute_node(flash)
+    assert not is_external_recompute_node(plain)
 
 
 def test_integration_flops_pass_computes_training_annotations():

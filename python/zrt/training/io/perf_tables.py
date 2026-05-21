@@ -54,6 +54,44 @@ def achieved_bandwidth_efficiency(gpu_name: str, bytes_: float) -> float:
         return 0.85
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Unified effective-throughput entries.
+#
+# Single call site for every compute / memory-bandwidth time calculation.
+# Precedence: explicit per-hardware override (YAML → GPU field) wins; when
+# unset, fall back to the size-bucketed achieved_* heuristic above (which is
+# the pre-existing, MLPerf-calibrated default behavior — preserved on purpose).
+#
+# NOT to be used for the MFU/HFU metric denominator (that is achieved-vs-
+# *theoretical-peak* by definition) nor the structural roofline-knee check.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def effective_flops(gpu, dtype: Dtype, flops: float) -> float:
+    """Effective compute throughput (FLOP/s) = peak × utilization."""
+    peak = peak_tflops_for(gpu, dtype)
+    if peak <= 0 or flops <= 0:
+        return 0.0
+    override = getattr(gpu, "compute_efficiency", None)
+    eff = (
+        override if override is not None
+        else achieved_flops_efficiency(gpu.name, dtype, flops)
+    )
+    return peak * eff
+
+
+def effective_hbm_bw_bps(gpu, bytes_: float) -> float:
+    """Effective HBM bandwidth (bytes/s) = peak × utilization."""
+    bw = gpu.hbm_bw_gbps * 1e9
+    if bw <= 0 or bytes_ <= 0:
+        return 0.0
+    override = getattr(gpu, "mem_bw_efficiency", None)
+    eff = (
+        override if override is not None
+        else achieved_bandwidth_efficiency(gpu.name, bytes_)
+    )
+    return bw * eff
+
+
 _FALLBACK_WARNED: set[str] = set()
 
 

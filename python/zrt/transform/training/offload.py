@@ -91,34 +91,55 @@ class OffloadPass(GraphPass):
 
     def _insert_grads_offload(self, graph: OpGraph, ctx: TransformContext):
         """Insert gradients offload nodes.
-        
-        Args:
-            graph: OpGraph to modify
-            ctx: TransformContext with training config
+
+        Finds DP communication nodes (comm.all_reduce / comm.reduce_scatter),
+        then walks past any div/scale nodes in the same DP chain, and inserts
+        D2H after the chain end so that offloaded gradients are already averaged.
         """
-        # Find gradient reduction nodes
-        grad_nodes = [
+        dp_comm_nodes = [
             node for node in graph.nodes.values()
-            if node.annotations.get("inserted_by") == "data_parallel_pass"
+            if node.annotations.get("dp_comm")
         ]
-        
-        for node in grad_nodes:
-            # Insert D2H after gradient reduction (save to host)
-            d2h_id = f"comm_d2h_grads_{node.id}"
+
+        for node in dp_comm_nodes:
+            last_dp_node = self._find_dp_chain_end(graph, node)
+
+            d2h_id = f"comm_d2h_grads_{last_dp_node.id}"
             d2h_node = OpNode(
                 id=d2h_id,
                 op_type="comm.d2h",
-                inputs=node.outputs.copy(),
-                outputs=node.outputs.copy(),
+                inputs=last_dp_node.outputs.copy(),
+                outputs=last_dp_node.outputs.copy(),
                 attrs={
                     "role": "grads_offload",
                     "pct": ctx.training.offload.pct
                 },
-                scope=node.scope,
+                scope=last_dp_node.scope,
                 category="memory"
             )
             d2h_node.annotations["inserted_by"] = "offload_pass"
-            self._rewire(graph, node.id, d2h_node)
+            self._rewire(graph, last_dp_node.id, d2h_node)
+
+    def _find_dp_chain_end(self, graph: OpGraph, start_node: OpNode) -> OpNode:
+        """Walk past div/scale and other DP post-processing nodes.
+
+        Starting from a DP comm node, follow the single-successor chain
+        as long as the successor was also inserted by data_parallel_pass.
+        Returns the last node in that chain so that D2H is inserted after it.
+        """
+        current = start_node
+        while True:
+            succs = graph.successors(current.id)
+            if len(succs) != 1:
+                break
+            succ = graph.nodes.get(succs[0])
+            if succ is None:
+                break
+            if succ.annotations.get("inserted_by") == "data_parallel_pass":
+                current = succ
+            else:
+                break
+        return current
 
     def _insert_params_offload(self, graph: OpGraph, ctx: TransformContext):
         """Insert parameters offload nodes.
@@ -219,11 +240,27 @@ class OffloadPass(GraphPass):
 
         # src → comm (one edge per output slot of src)
         src_node = g.nodes[src_id]
-        for i, out_tensor in enumerate(src_node.outputs):
+        if src_node.outputs:
+            for i, out_tensor in enumerate(src_node.outputs):
+                g.edges.append(Edge(
+                    src=src_id, src_idx=i,
+                    dst=comm_node.id, dst_idx=i,
+                    tensor=out_tensor,
+                ))
+        elif old_out:
+            sentinel = old_out[0].tensor
             g.edges.append(Edge(
-                src=src_id, src_idx=i,
-                dst=comm_node.id, dst_idx=i,
-                tensor=out_tensor,
+                src=src_id, src_idx=0,
+                dst=comm_node.id, dst_idx=0,
+                tensor=sentinel,
+            ))
+        else:
+            # No outputs and no existing successors — use a control edge
+            # so that graph.successors() still sees the chain.
+            g.edges.append(Edge(
+                src=src_id, src_idx=0,
+                dst=comm_node.id, dst_idx=0,
+                tensor=None,
             ))
 
         # comm → old successors

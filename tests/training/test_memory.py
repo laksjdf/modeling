@@ -207,19 +207,15 @@ def _strat_pp(pp, sched, vpp=1):
 
 
 def test_1f1b_in_flight_at_least_pp_minus_one():
-    """1F1B worst-rank activation ≈ pp microbatches in flight, not pp/2.
-    For pp=4, in-flight should be 4 (rank-0 warmup peak), not 2.
-    """
-    model = _make_model()
-    a_pp1 = _act_only(model, _strat_pp(1, PPSched.ONE_F_ONE_B))   # baseline 1 mb
-    a_pp4 = _act_only(model, _strat_pp(4, PPSched.ONE_F_ONE_B))
-    # Old formula: pp//2 = 2 ⇒ ratio 2.0. New formula: pp = 4 ⇒ ratio ~4.0
-    # (Note: per-rank graph still covers all layers; a_pp4 / a_pp1 isolates
-    # the in-flight multiplier.)
-    assert a_pp4 >= a_pp1 * 3.5, (
-        f"1F1B with pp=4 should multiply activations by ≥ pp-1 (=3); "
-        f"got ratio = {a_pp4 / a_pp1:.2f}"
-    )
+    """1F1B worst-rank in-flight count should be pp (rank-0 warmup peak),
+    not pp//2.  Test _pp_in_flight directly because build_graph shards layers
+    per rank, which cancels the in-flight multiplier in the memory ratio."""
+    from zrt.training.models.memory import _pp_in_flight
+
+    s_pp1 = _strat_pp(1, PPSched.ONE_F_ONE_B)
+    s_pp4 = _strat_pp(4, PPSched.ONE_F_ONE_B)
+    assert _pp_in_flight(s_pp1) == 1
+    assert _pp_in_flight(s_pp4) == 4
 
 
 def test_interleaved_in_flight_scales_with_vpp():

@@ -37,11 +37,19 @@ class TPRule:
 
 def _classify(scope: str) -> TPRule | None:
     s = scope.lower()
+    if _is_routed_expert_scope(s):
+        return None
     if any(k in s for k in _COL_PARALLEL):
         return TPRule(split_dim=-1, comm_after=None, input_split=False)
     if any(k in s for k in _ROW_PARALLEL):
         return TPRule(split_dim=-1, comm_after="all_reduce", input_split=True)
     return None
+
+
+def _is_routed_expert_scope(scope: str) -> bool:
+    if "shared_expert" in scope:
+        return False
+    return "experts." in scope or "expert_" in scope
 
 
 class TensorParallelPass(GraphPass):

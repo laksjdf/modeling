@@ -3,6 +3,7 @@ vendor: "nvidia"
 device_type: "gpu"
 
 compute:
+  # compute_efficiency: 0.5   # uncomment to override the achieved-FLOPs heuristic
   # Dense (no sparsity). With 2:4 sparsity all values double.
   fp16_tflops: 989
   bf16_tflops: 989
@@ -24,6 +25,7 @@ compute:
   ep_overlap_waves: 4   # K-wave EP A2A overlap (CUDA stream-based, DeepSeek-style)
 
 memory:
+  # mem_bw_efficiency: 0.7    # uncomment to override the achieved-bandwidth heuristic
   capacity_gb: 80
   hbm_bandwidth_gbps: 3350    # HBM3
   l2_cache_mb: 50
@@ -38,10 +40,13 @@ interconnect:
     bandwidth_gbps: 900
     latency_us: 1
     topology: "all_to_all"
+    kb_efficiency: 0.7        # bandwidth utilization (effective/peak)
     num_devices: 8
   inter_node:
     type: "InfiniBand_NDR"
     bandwidth_gbps: 400       # NDR IB: 400 Gb/s ≈ 50 GB/s per port; 8-port = 400 GB/s
     latency_us: 2
     topology: "fat_tree"
+    kb_efficiency: 0.7       # bandwidth utilization (effective/peak)
+    # oversubscription: 4.0  # uncomment for an over-subscribed spine (non-clos)
     num_devices: 0

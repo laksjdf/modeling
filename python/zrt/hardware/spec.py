@@ -46,6 +46,11 @@ class ComputeSpec:
     # NVIDIA CUDA-capable hardware: typically 4.
     ep_overlap_waves: int = 0
 
+    # Explicit compute utilization override (achieved/peak FLOPs).
+    # None = fall back to the size-bucketed achieved_flops_efficiency() curve
+    # (MLPerf-calibrated). A YAML-supplied value takes precedence over it.
+    compute_efficiency: float | None = None
+
 
 @dataclass
 class MemoryTier:
@@ -63,6 +68,36 @@ class MemorySpec:
     l2_cache_mb: float = 0.0
     tiers: list[MemoryTier] = field(default_factory=list)
 
+    # Explicit HBM-bandwidth utilization override (achieved/peak).
+    # None = fall back to the size-bucketed achieved_bandwidth_efficiency()
+    # curve. A YAML-supplied value takes precedence over it.
+    mem_bw_efficiency: float | None = None
+
+
+# Topology → cost-law class. Drives both the alpha-beta latency-step count
+# (comm.py) and the bandwidth-derate eligibility (effective_bw_bps below).
+# Unknown topologies fall back to "ring" (conservative: (N-1)-step latency).
+#   switched_full : single-step full connectivity (NVSwitch / full mesh).
+#                   Non-blocking → full per-card bandwidth, no scale derate.
+#   clos          : non-blocking switched fabric. log2(N) latency like a tree,
+#                   but full per-card bandwidth — NEVER scale-derated (the
+#                   "ideal" reference other fabrics are compared against).
+#   switched_tree : over-subscribable switched fabric (fat-tree); log2(N)
+#                   latency, bandwidth derated by domain scale.
+#   ring / torus  : link-local; (N-1)-step latency, scale-derated.
+_TOPO_CLASS = {
+    "nvswitch": "switched_full", "all_to_all": "switched_full",
+    "full_mesh": "switched_full",
+    "clos": "clos",
+    "fat_tree": "switched_tree",
+    "ring": "ring", "torus": "torus", "mesh": "torus",
+}
+
+# Classes whose per-card bandwidth degrades as the parallel domain grows
+# beyond the non-blocking radix. clos / switched_full are non-blocking and
+# excluded by construction.
+_SCALE_DERATED = ("switched_tree", "ring", "torus")
+
 
 @dataclass
 class LinkSpec:
@@ -79,12 +114,176 @@ class LinkSpec:
     latency_us: float
     topology: str = "point_to_point"
     num_devices: int = 1          # devices in the domain (e.g. 8 for a node)
+    # Bandwidth utilization (effective/peak), (0,1]. Applies to ALL topologies
+    # (clos included). Sole knob for the bandwidth-realism derate.
+    kb_efficiency: float = 0.7
+    # Spine over-subscription ratio for non-clos switched fabrics (e.g. 4 = 4:1).
+    # 1.0 = non-blocking (clos / default) → no domain-size derate.
+    oversubscription: float = 1.0
+
+    @property
+    def topology_class(self) -> str:
+        return _TOPO_CLASS.get(self.topology, "ring")
+
+    def effective_bw_bps(self, group_size: int = 1) -> float:
+        """Effective bandwidth in bytes/s.
+
+        = peak × ``kb_efficiency``, then — for the scale-derated classes
+        (fat-tree / ring / torus) — divided by a domain-scale factor::
+
+            s = 1 + (oversubscription - 1) · (1 - R/N)        (N > R)
+
+        where N = ``group_size`` and R = non-blocking radix (``num_devices``
+        if > 0, else 0 → the whole link is the over-subscribed tier, e.g.
+        inter-node fat-tree). s is 1.0 at the radix and rises monotonically
+        toward ``oversubscription`` as the domain grows, so bandwidth falls
+        monotonically with scale. Default ``oversubscription`` = 1.0 → s ≡ 1
+        (no derate, bit-identical to peak × kb_efficiency).
+
+        clos and switched_full are non-blocking by construction: they keep
+        full per-card bandwidth at any scale and are NEVER derated (clos is
+        the ideal reference the scale-derated fabrics are measured against).
+        The algorithmic (N-1)/N data-volume factor lives in comm.py.
+        """
+        base = self.bandwidth_gbps * 1e9 / 8.0 * self.kb_efficiency
+        if base <= 0.0:
+            return 0.0
+        if (
+            self.topology_class in _SCALE_DERATED
+            and self.oversubscription > 1.0
+        ):
+            radix = self.num_devices if self.num_devices > 0 else 0
+            if group_size > radix:
+                s = 1.0 + (self.oversubscription - 1.0) * (1.0 - radix / group_size)
+                return base / s
+        return base
 
 
 @dataclass
+class TopologyTier:
+    """One level of the interconnect hierarchy.
+
+    Tiers are ordered innermost → outermost. The innermost tier is the
+    smallest, fastest scale-up domain (NVLink island / HCCS super-node);
+    the outermost tier is the largest, slowest scale-out fabric (IB
+    spine), typically with ``link.num_devices == 0`` to mark "unbounded".
+
+    ``link.num_devices`` semantics: number of GPUs in **one instance** of
+    this tier (so 8 for a per-node NVLink island, 72 for an NVL72 rack,
+    0 for the outermost unbounded fabric). Cumulative coverage grows
+    monotonically from innermost to outermost.
+    """
+    name: str
+    link: LinkSpec
+
+
 class InterconnectSpec:
-    intra_node: LinkSpec
-    inter_node: LinkSpec
+    """N-tier interconnect description (innermost → outermost).
+
+    Two construction modes — kept compatible so existing YAMLs and test
+    fixtures continue to work:
+
+    1. **New**: ``InterconnectSpec(tiers=[t0, t1, t2, ...])`` for N ≥ 1
+       tiers, ordered innermost to outermost.
+    2. **Legacy**: ``InterconnectSpec(intra_node=L, inter_node=L2)`` —
+       equivalent to ``tiers=[TopologyTier("intra_node", L),
+                              TopologyTier("inter_node", L2)]``.
+
+    The ``intra_node`` / ``inter_node`` *properties* always read
+    ``tiers[0]`` / ``tiers[-1]`` respectively, so call sites that read
+    by either name keep working regardless of how the object was built.
+    """
+
+    __slots__ = ("tiers",)
+
+    def __init__(
+        self,
+        tiers: list[TopologyTier] | None = None,
+        *,
+        intra_node: LinkSpec | None = None,
+        inter_node: LinkSpec | None = None,
+    ) -> None:
+        if tiers is not None and (intra_node is not None or inter_node is not None):
+            raise ValueError(
+                "InterconnectSpec: pass either `tiers` or "
+                "`intra_node`/`inter_node`, not both"
+            )
+        if tiers is not None:
+            self.tiers: list[TopologyTier] = list(tiers)
+        else:
+            tlist: list[TopologyTier] = []
+            if intra_node is not None:
+                tlist.append(TopologyTier(name="intra_node", link=intra_node))
+            if inter_node is not None:
+                tlist.append(TopologyTier(name="inter_node", link=inter_node))
+            self.tiers = tlist
+        self._validate_tiers()
+
+    def _validate_tiers(self) -> None:
+        """Validate tier ordering invariants shared by direct/YAML construction."""
+        last_idx = len(self.tiers) - 1
+        for i, tier in enumerate(self.tiers):
+            if tier.link.num_devices == 0 and i != last_idx:
+                raise ValueError(
+                    "InterconnectSpec: only outermost tier may be unbounded "
+                    f"(num_devices=0); got tier {i} {tier.name!r}"
+                )
+
+    # ── Back-compat accessors ─────────────────────────────────────────
+    @property
+    def intra_node(self) -> LinkSpec:
+        if not self.tiers:
+            raise ValueError("InterconnectSpec has no tiers configured")
+        return self.tiers[0].link
+
+    @property
+    def inter_node(self) -> LinkSpec:
+        if not self.tiers:
+            raise ValueError("InterconnectSpec has no tiers configured")
+        return self.tiers[-1].link
+
+    # ── N-tier helpers ────────────────────────────────────────────────
+    def innermost_tier_for(self, group_size: int) -> TopologyTier:
+        """Smallest tier whose per-instance domain still contains the group.
+
+        Iterates tiers innermost → outermost; returns the first tier
+        whose ``link.num_devices`` is ≥ ``group_size`` (or the outermost
+        tier, treated as unbounded, when none fit).
+
+        A tier with ``link.num_devices == 0`` is treated as unbounded
+        and matches any group size — appropriate for the outermost IB
+        spine where the domain is the whole cluster.
+        """
+        if not self.tiers:
+            raise ValueError("InterconnectSpec has no tiers configured")
+        for tier in self.tiers:
+            n = tier.link.num_devices
+            if n == 0 or group_size <= n:
+                return tier
+        return self.tiers[-1]
+
+    def __repr__(self) -> str:
+        return f"InterconnectSpec(tiers={self.tiers!r})"
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, InterconnectSpec):
+            return NotImplemented
+        return self.tiers == other.tiers
+
+    def __hash__(self) -> int:  # type: ignore[override]
+        return hash(tuple(
+            (
+                t.name,
+                t.link.type,
+                t.link.bandwidth_gbps,
+                t.link.latency_us,
+                t.link.topology,
+                t.link.num_devices,
+                t.link.kb_efficiency,
+                t.link.oversubscription,
+            )
+            for t in self.tiers
+        ))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
